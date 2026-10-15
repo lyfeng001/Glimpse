@@ -1,0 +1,17 @@
+# local configuration and secrets
+config.json
+data/
+*.key
+*.pem
+
+# environments / tooling
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+node_modules/
+.DS_Store
+
+# local scratch
+scratch/
+instruction.md

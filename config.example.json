@@ -1,0 +1,43 @@
+{
+  "hub": {
+    "listen": [
+      {"host": "auto", "port": 8443},
+      {"host": "127.0.0.1", "port": 8443}
+    ],
+    "tailscale_hostname": "auto",
+    "caffeinate": true,
+    "push_subject": "mailto:you@example.com",
+    "approval_wait_seconds": 600
+  },
+  "keys": {
+    "env": {"claude": "ANTHROPIC_AUTH_TOKEN", "codex": "OPENAI_API_KEY"},
+    "profiles": [
+      {"name": "key1", "value": "sk-..."},
+      {"name": "key2", "value": "sk-..."}
+    ]
+  },
+  "machines": [
+    {
+      "id": "M1",
+      "name": "mac",
+      "type": "local",
+      "default_cwd": "~/code",
+      "presets": {
+        "claude": {"argv": ["claude", "--settings", "~/.claude/my-settings.json"], "key": null},
+        "codex": {"argv": ["codex"], "key": null},
+        "shell": {"argv": []}
+      }
+    },
+    {
+      "id": "M2",
+      "name": "devbox",
+      "type": "ssh",
+      "host": "devbox",
+      "default_cwd": "~",
+      "presets": {
+        "claude": {"argv": ["claude"]},
+        "codex": {"argv": ["codex"]}
+      }
+    }
+  ]
+}

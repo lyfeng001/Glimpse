@@ -1,0 +1,886 @@
+#!/usr/bin/env python3
+"""Glimpse hub: serves the phone web app and relays between phones and machine agents."""
+import argparse
+import asyncio
+import hmac
+import json
+import logging
+import copy
+import os
+import re
+import ssl
+import subprocess
+import sys
+import time
+from urllib.parse import urlsplit
+
+import aiohttp
+from aiohttp import web
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import config as C  # noqa: E402
+import webpush  # noqa: E402
+from machines import Machine  # noqa: E402
+
+ROOT = C.ROOT
+WEB = os.path.join(ROOT, "web")
+DATA = C.DATA
+VERSION = "0.3.0"
+log = logging.getLogger("glimpse.hub")
+PHONE_QUEUE_MAX = 4000       # messages; a phone that falls this far behind is disconnected
+VISIBLE_FRESH = 15           # s; a "visible" phone that has been silent longer is treated as gone (push again)
+CERT_RETRY = 600             # s between certificate attempts while serving without one
+CERT_RENEW = 12 * 3600
+HOST_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
+ARG_RE = re.compile(r"^[A-Za-z0-9_.:/\[\]@+=-]{1,120}$")   # model / effort / mode values that go on argv
+RESUME_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+CONTROL_ACTIONS = ("mode", "model", "effort", "goal", "approval", "sandbox")
+RUNTIME = {}                 # resolved hub.listen / tailscale_hostname ("auto" -> tailscale), never saved
+
+
+def build_argv(kind, base, msg):
+    """argv for a new session: preset argv + phone extras + flags for the advanced create fields."""
+    args = msg.get("args")
+    if isinstance(args, list) and args:
+        argv = [str(a) for a in args][:60]        # full argv from an older client
+    else:
+        argv = list(base) + [str(a) for a in (msg.get("extra") or [])][:50]
+
+    def val(name):
+        v = msg.get(name)
+        if v is None or v == "":
+            return None
+        if not isinstance(v, str) or not ARG_RE.match(v):
+            raise ValueError("无效的 %s: %s" % (name, str(v)[:40]))
+        return v
+    if kind == "claude":
+        if val("model"):
+            argv += ["--model", val("model")]
+        if val("effort"):
+            argv += ["--effort", val("effort")]
+        if val("mode") and val("mode") != "default":    # "default" = keep the settings file's defaultMode
+            argv += ["--permission-mode", val("mode")]
+    elif kind == "codex":
+        if val("model"):
+            argv += ["-m", val("model")]
+        if val("effort"):
+            argv += ["-c", 'model_reasoning_effort="%s"' % val("effort")]
+        if val("approval"):
+            argv += ["-a", val("approval")]
+        if val("sandbox"):
+            argv += ["-s", val("sandbox")]
+    return argv
+
+
+def origin_ok(request):
+    """Cross-site websocket hijacking guard: browsers always send Origin, it must name this host."""
+    origin = request.headers.get("Origin")
+    if not origin:
+        return True                  # non-browser clients (./glimpse attach, tests)
+    try:
+        return urlsplit(origin).netloc.lower() == (request.host or "").lower()
+    except ValueError:
+        return False
+
+
+def check_host(host):
+    host = str(host or "").strip()
+    if not HOST_RE.match(host) or host.startswith("-"):
+        raise ValueError("主机格式不对：只能是 ~/.ssh/config 里的 Host 名或 user@host")
+    return host
+
+
+def check_port(port):
+    if port in (None, ""):
+        return None
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        raise ValueError("端口必须是数字")
+    if not 0 < port < 65536:
+        raise ValueError("端口超出范围")
+    return port
+
+
+def check_name(name):
+    name = str(name or "").strip()
+    if not name or len(name) > 40:
+        raise ValueError("名称不能为空（最多 40 个字符）")
+    return name
+
+
+def check_cwd(cwd):
+    cwd = str(cwd or "~").strip() or "~"
+    if len(cwd) > 300 or "\n" in cwd or "\0" in cwd:
+        raise ValueError("默认目录无效")
+    return cwd
+
+
+def next_machine_id(mcs):
+    used = [int(x["id"][1:]) for x in mcs if re.match(r"^M\d+$", str(x.get("id") or ""))]
+    return "M%d" % (max(used + [0]) + 1)
+
+
+async def ssh_test(host, port=None):
+    """Can the hub reach `host` with its own keys, without prompts, and is there a python3?"""
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"] + (["-p", str(port)] if port else []) + \
+        [host, 'python3 -c "import sys;print(sys.version_info[:2])"']
+    try:
+        proc = await asyncio.create_subprocess_exec(*argv, stdin=asyncio.subprocess.DEVNULL,
+                                                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    except OSError as e:
+        return False, "无法运行 ssh: %s" % e
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), 20)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return False, "连接超时"
+    out = out.decode("utf-8", "replace").strip()
+    err = "; ".join(ln for ln in err.decode("utf-8", "replace").strip().splitlines()[-3:] if ln)
+    if proc.returncode != 0:
+        return False, err or "ssh 退出码 %s" % proc.returncode
+    m = re.search(r"\((\d+), (\d+)\)", out)
+    if not m:
+        return False, "没有找到 python3: %s" % (out or err)[:200]
+    if (int(m.group(1)), int(m.group(2))) < (3, 8):
+        return False, "python3 版本太旧 (%s.%s)，需要 3.8+" % m.groups()
+    return True, "连接成功，python %s.%s" % m.groups()
+
+
+class Phone:
+    """One websocket. Messages go through a queue so a slow phone never stalls the machines."""
+
+    def __init__(self, ws):
+        self.ws = ws
+        self.subs = set()          # (m, sid)
+        self.visible = True
+        self.last_seen = time.time()
+        self.q = asyncio.Queue()
+        self.task = asyncio.ensure_future(self._pump())
+
+    def send(self, obj):
+        if self.ws.closed:
+            return
+        if self.q.qsize() > PHONE_QUEUE_MAX:
+            log.warning("phone too slow, closing")
+            asyncio.ensure_future(self.ws.close())
+            return
+        self.q.put_nowait(obj)
+
+    async def _pump(self):
+        while True:
+            obj = await self.q.get()
+            try:
+                await self.ws.send_str(json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+                                       .encode("utf-8", "replace").decode("utf-8"))
+            except (ConnectionError, RuntimeError):
+                return
+
+    def close(self):
+        self.task.cancel()
+
+    def on_screen(self):
+        return self.visible and time.time() - self.last_seen < VISIBLE_FRESH
+
+
+class Hub:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.token = C.token()
+        self.vapid = webpush.Vapid(os.path.join(DATA, "vapid.json"))
+        self.push_path = os.path.join(DATA, "push_subs.json")
+        self.push_subs = self._load_push()
+        self.phones = set()
+        self.machines = {}
+        self.order = []
+        self.sub_count = {}        # (m, sid) -> number of phones subscribed
+        self.reply_to = {}         # (m, req) -> (phone, {"op", "sid"}) for routing the agent's reply
+        self.state_dirty = asyncio.Event()
+        self.recent_push = {}
+        self.http = None
+        self.bg = []
+        for mc in cfg.get("machines", []):
+            if mc.get("enabled", True) is False:
+                continue
+            self.add_machine(mc)
+
+    def add_machine(self, mc):
+        m = Machine(mc, self.on_machine_msg, self.on_machine_state)
+        self.machines[m.id] = m
+        self.order.append(m.id)
+        return m
+
+    # --- push subscriptions
+    def _load_push(self):
+        try:
+            with open(self.push_path) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return []
+
+    def _save_push(self):
+        C.write_secret(self.push_path, json.dumps(self.push_subs))
+
+    async def push_all(self, payload):
+        if not self.push_subs:
+            return
+        gone = []
+
+        async def one(sub):
+            try:
+                status, text = await webpush.send(self.http, self.vapid, sub, payload, self.cfg["hub"]["push_subject"])
+                if status in (404, 410):
+                    gone.append(sub["endpoint"])
+                elif status >= 300:
+                    log.warning("push %s -> %s %s", sub["endpoint"][:40], status, text)
+            except Exception as e:
+                log.warning("push error: %s", e)
+        await asyncio.gather(*(one(s) for s in list(self.push_subs)))
+        if gone:
+            self.push_subs = [s for s in self.push_subs if s["endpoint"] not in gone]
+            self._save_push()
+
+    # --- presets / keys (secrets never leave the hub)
+    def preset(self, m, kind):
+        p = (m.cfg.get("presets") or {}).get(kind)
+        if isinstance(p, list):
+            p = {"argv": p}
+        return p or {}
+
+    def presets_view(self, m):
+        out = {}
+        for kind in ("claude", "codex", "shell"):
+            p = self.preset(m, kind)
+            out[kind] = {"key": p.get("key")}
+        return out
+
+    def keys_view(self):
+        return [{"name": p["name"]} for p in self.cfg["keys"].get("profiles") or [] if p.get("name")]
+
+    def env_for(self, kind, key_name):
+        if kind not in ("claude", "codex") or not key_name:
+            return None
+        p = C.profile(self.cfg, key_name)
+        if not p:
+            raise ValueError("没有名为 %s 的 Key" % key_name)
+        return C.key_env(self.cfg, kind, p.get("value"))
+
+    # --- machine side
+    def options(self):
+        """Choices for model / effort / mode pickers: DEFAULTS["options"] overridden per list by config.json."""
+        out = copy.deepcopy(C.DEFAULTS["options"])
+        for kind, lists in (self.cfg.get("options") or {}).items():
+            if isinstance(lists, dict):
+                out.setdefault(kind, {}).update({k: v for k, v in lists.items() if isinstance(v, list)})
+        return out
+
+    def state(self):
+        return {"t": "state", "hub": {"version": VERSION}, "keys": self.keys_view(), "options": self.options(),
+                "machines": [self.machines[k].info(self.presets_view(self.machines[k])) for k in self.order]}
+
+    def on_machine_state(self, m):
+        self.state_dirty.set()
+
+    async def state_loop(self):
+        while True:
+            await self.state_dirty.wait()
+            await asyncio.sleep(0.15)
+            self.state_dirty.clear()
+            st = self.state()
+            for p in list(self.phones):
+                p.send(st)
+
+    async def on_machine_msg(self, m, msg):
+        t = msg.get("t")
+        if t == "resync":
+            # new daemon connection: restore daemon-side subscriptions, phones re-request replays
+            for (mid, sid), n in self.sub_count.items():
+                if mid == m.id and n > 0:
+                    m.write({"op": "sub", "sid": sid})
+            for p in list(self.phones):
+                p.send({"t": "resync", "m": m.id})
+            return
+        if t in ("out", "chat"):
+            key = (m.id, msg.get("sid"))
+            out = dict(msg, m=m.id)
+            for p in list(self.phones):
+                if key in p.subs:
+                    p.send(out)
+        elif t == "event":
+            await self.on_event(m, msg["sid"], msg["ev"])
+        elif t in ("replay", "error", "restarted", "ok", "history"):
+            r = self.reply_to.pop((m.id, msg.get("req")), None)
+            if r is None:
+                return               # unsolicited errors are not broadcast to everyone
+            p, info = r
+            if t == "ok":
+                # confirmations the phone waits for; other ops ("in", "resize", ...) stay silent
+                name = {"approve": "approved", "control": "control_ok", "delete": "delete_ok"}.get(info.get("op"))
+                if name:
+                    p.send({"t": name, "m": m.id, "sid": info.get("sid")})
+                return
+            if t == "history":
+                p.send({"t": "history", "m": m.id, "req": msg.get("req"), "kind": info.get("kind"),
+                        "items": msg.get("items") or []})
+                return
+            p.send(dict(msg, m=m.id))
+
+    async def on_event(self, m, sid, ev):
+        s = m.sessions.get(sid) or {}
+        name = s.get("name") or sid
+        title = "%s · %s" % (name, ev.get("title", ""))
+        body = ev.get("body") or ""
+        k = (m.id, sid, ev.get("kind"), body)
+        t = time.time()
+        if t - self.recent_push.get(k, 0) < 5:
+            return
+        self.recent_push = {kk: v for kk, v in self.recent_push.items() if t - v < 60}
+        self.recent_push[k] = t
+        for p in list(self.phones):
+            p.send({"t": "event", "m": m.id, "sid": sid, "ev": ev, "title": title})
+        if any(p.on_screen() for p in self.phones):
+            return                   # the app is open on screen: in-app banner only
+        await self.push_all({"title": title, "body": body[:300] or ev.get("title", ""),
+                             "subtitle": "%s %s" % (m.id, m.name),
+                             "tag": "%s:%s" % (m.id, sid), "url": "/#%s/%s" % (m.id, sid),
+                             "kind": ev.get("kind")})
+
+    # --- phone side
+    def _sub(self, m, sid):
+        k = (m.id, sid)
+        self.sub_count[k] = self.sub_count.get(k, 0) + 1
+        if self.sub_count[k] == 1:
+            m.write({"op": "sub", "sid": sid})
+
+    def _unsub(self, m, sid):
+        k = (m.id, sid)
+        n = self.sub_count.get(k, 0) - 1
+        if n <= 0:
+            self.sub_count.pop(k, None)
+            try:
+                m.write({"op": "unsub", "sid": sid})
+            except ConnectionError:
+                pass
+        else:
+            self.sub_count[k] = n
+
+    def forward(self, p, m, obj):
+        """Send an op to a machine; its error/reply comes back only to this phone."""
+        req = m.next_req()
+        self.reply_to[(m.id, req)] = (p, {"op": obj.get("op"), "sid": obj.get("sid"), "kind": obj.get("kind")})
+        if len(self.reply_to) > 5000:
+            for k in list(self.reply_to)[:1000]:
+                del self.reply_to[k]
+        m.write(dict(obj, req=req))
+
+    async def phone_op(self, p, msg):
+        op = msg.get("op")
+        if op == "ping":
+            p.send({"t": "pong", "ts": msg.get("ts")})
+            return
+        if op == "visible":
+            p.visible = bool(msg.get("v"))
+            return
+        if op in ("machine_test", "machine_add", "machine_update", "machine_remove"):
+            try:
+                await self.machine_op(p, op, msg)
+            except ValueError as e:
+                p.send({"t": "error", "op": op, "msg": str(e)})
+            return
+        m = self.machines.get(msg.get("m")) if isinstance(msg.get("m"), str) else None
+        if m is None:
+            p.send({"t": "error", "msg": "未知机器 %s" % msg.get("m")})
+            return
+        sid = msg.get("sid")
+        if sid is not None and not isinstance(sid, str):
+            return
+        try:
+            if op == "sub":
+                k = (m.id, sid)
+                if k not in p.subs:
+                    p.subs.add(k)
+                    self._sub(m, sid)
+                self.forward(p, m, {"op": "replay", "sid": sid, "off": msg.get("off"),
+                                    "chat_from": msg.get("chat_from")})
+            elif op == "unsub":
+                if (m.id, sid) in p.subs:
+                    p.subs.discard((m.id, sid))
+                    self._unsub(m, sid)
+            elif op in ("in", "text", "resize", "kill", "forget", "ack", "rename"):
+                fwd = {k: v for k, v in msg.items() if k in ("op", "sid", "d", "text", "cols", "rows", "name")}
+                self.forward(p, m, fwd)
+            elif op == "approve":
+                self.forward(p, m, {"op": "approve", "sid": sid, "id": msg.get("id"),
+                                    "decision": msg.get("decision"), "message": msg.get("message")})
+            elif op == "history":
+                kind = msg.get("kind") if msg.get("kind") in ("claude", "codex") else None
+                self.forward(p, m, {"op": "history", "kind": kind, "limit": 30})
+            elif op == "control":
+                action, value = msg.get("action"), msg.get("value")
+                if action not in CONTROL_ACTIONS or not isinstance(value, str) or len(value) > 500:
+                    raise ValueError("无效的操作")
+                if action != "goal" and value and not ARG_RE.match(value):
+                    raise ValueError("无效的值: %s" % value[:40])
+                self.forward(p, m, {"op": "control", "sid": sid, "action": action, "value": value})
+            elif op == "delete":
+                self.forward(p, m, {"op": "delete", "sid": sid})
+            elif op == "clean_exited":
+                for xs in list(m.sessions.values()):
+                    if xs.get("status") in ("exited", "error"):
+                        self.forward(p, m, {"op": "forget", "sid": xs["sid"]})
+            elif op == "create":
+                await self.create(p, m, msg)
+            elif op == "restart":
+                await self.restart(p, m, msg)
+            elif op == "reconnect":
+                m.reconnect_now()
+            else:
+                p.send({"t": "error", "msg": "unknown op %s" % op})
+        except (ConnectionError, asyncio.TimeoutError) as e:
+            p.send({"t": "error", "m": m.id, "sid": sid, "msg": "%s: %s" % (m.name, str(e) or "超时")})
+        except ValueError as e:
+            p.send({"t": "error", "m": m.id, "sid": sid, "msg": str(e)})
+
+    async def create(self, p, m, msg):
+        kind = msg.get("kind") if msg.get("kind") in ("claude", "codex", "shell") else "claude"
+        preset = self.preset(m, kind)
+        base = list(preset.get("argv") or ([] if kind == "shell" else [kind]))
+        argv = build_argv(kind, base, msg)
+        resume_id = msg.get("resume_id")
+        if resume_id is not None and (kind == "shell" or not isinstance(resume_id, str) or not RESUME_RE.match(resume_id)):
+            raise ValueError("无效的会话 id")
+        key = msg.get("key") or preset.get("key")
+        env = self.env_for(kind, key) if key else None
+        r = await m.call({"op": "create", "kind": kind, "cwd": msg.get("cwd") or m.cfg.get("default_cwd"),
+                          "name": msg.get("name") or None, "args": argv or None, "env": env,
+                          "key": key if env else None, "cols": msg.get("cols") or 80, "rows": msg.get("rows") or 30,
+                          "resume_id": resume_id or None})
+        if r.get("t") == "created":
+            p.send({"t": "created", "m": m.id, "s": r["s"]})
+        else:
+            p.send({"t": "error", "m": m.id, "msg": r.get("msg") or "创建失败"})
+
+    async def restart(self, p, m, msg):
+        sid = msg.get("sid")
+        s = m.sessions.get(sid)
+        if not s:
+            raise ValueError("会话不存在")
+        kind = s.get("kind")
+        env, key = None, None
+        nk = msg.get("new_key")
+        if isinstance(nk, dict) and str(nk.get("value") or "").strip():
+            value = str(nk["value"]).strip()
+            name = str(nk.get("save_as") or "").strip()
+            if name:
+                profs = [x for x in self.cfg["keys"].get("profiles") or [] if x.get("name") != name]
+                profs.append({"name": name, "value": value})
+                self.cfg["keys"]["profiles"] = profs
+                C.save(self.cfg)
+                self.state_dirty.set()
+            key = name or "自定义"
+            env = C.key_env(self.cfg, kind, value)
+        elif msg.get("key"):
+            key = msg["key"]
+            env = self.env_for(kind, key)
+        r = await m.call({"op": "restart", "sid": sid, "env": env, "key": key,
+                          "resume": bool(msg.get("resume", True))}, timeout=30)
+        if r.get("t") == "restarted":
+            p.send({"t": "restarted", "m": m.id, "sid": sid})
+        else:
+            p.send({"t": "error", "m": m.id, "sid": sid, "msg": r.get("msg") or "重启失败"})
+
+    # --- machines managed from the phone
+    async def machine_op(self, p, op, msg):
+        if op == "machine_test":
+            ok, text = await ssh_test(check_host(msg.get("host")), check_port(msg.get("port")))
+            p.send({"t": "machine_test", "ok": ok, "msg": text})
+            return
+        mcs = self.cfg.setdefault("machines", [])
+        if op == "machine_add":
+            mc = {"id": next_machine_id(mcs), "name": check_name(msg.get("name")), "type": "ssh",
+                  "host": check_host(msg.get("host")), "default_cwd": check_cwd(msg.get("default_cwd"))}
+            port = check_port(msg.get("port"))
+            if port:
+                mc["port"] = port
+            local = next((x for x in mcs if x.get("type") == "local"), None)
+            if local and local.get("presets"):
+                # same launch presets as this computer (argv, default key); editable later in config.json
+                mc["presets"] = {k: v for k, v in copy.deepcopy(local["presets"]).items()
+                                 if k in ("claude", "codex", "shell")}
+            mcs.append(mc)
+            C.save(self.cfg)
+            self.add_machine(mc).start()
+        else:
+            mid = msg.get("m")
+            mc = next((x for x in mcs if x.get("id") == mid), None) if isinstance(mid, str) else None
+            if mc is None:
+                raise ValueError("未知机器 %s" % mid)
+            m = self.machines.get(mid)
+            if op == "machine_update":
+                if "name" in msg:
+                    mc["name"] = check_name(msg.get("name"))
+                if "default_cwd" in msg:
+                    mc["default_cwd"] = check_cwd(msg.get("default_cwd"))
+                reconnect = False
+                if mc.get("type") == "ssh":
+                    if "host" in msg:
+                        host = check_host(msg.get("host"))
+                        reconnect |= host != mc.get("host")
+                        mc["host"] = host
+                    if "port" in msg:
+                        port = check_port(msg.get("port"))
+                        reconnect |= port != mc.get("port")
+                        if port:
+                            mc["port"] = port
+                        else:
+                            mc.pop("port", None)
+                elif "host" in msg or "port" in msg:
+                    raise ValueError("本机不能改成 ssh 主机")
+                C.save(self.cfg)
+                if m:
+                    m.name = mc.get("name") or m.id
+                    if reconnect:
+                        m.reconnect_fresh()
+            else:
+                if mc.get("type") == "local":
+                    raise ValueError("本机不能删除")
+                mcs.remove(mc)
+                C.save(self.cfg)
+                if m:
+                    await self.drop_machine(m)
+        self.state_dirty.set()
+        p.send({"t": "machines_ok", "op": op})
+
+    async def drop_machine(self, m):
+        self.machines.pop(m.id, None)
+        if m.id in self.order:
+            self.order.remove(m.id)
+        for k in [k for k in self.sub_count if k[0] == m.id]:
+            del self.sub_count[k]
+        for k in [k for k in self.reply_to if k[0] == m.id]:
+            del self.reply_to[k]
+        for ph in list(self.phones):
+            ph.subs = {k for k in ph.subs if k[0] != m.id}
+        await m.stop()
+
+    def phone_gone(self, p):
+        self.phones.discard(p)
+        p.close()
+        for (mid, sid) in list(p.subs):
+            m = self.machines.get(mid)
+            if m:
+                self._unsub(m, sid)
+        p.subs.clear()
+        for k, v in list(self.reply_to.items()):
+            if v[0] is p:
+                del self.reply_to[k]
+
+    # --- http
+    def authed(self, request):
+        tok = request.cookies.get("glimpse") or ""
+        if request.path == "/ws" and request.query.get("t"):
+            tok = request.query["t"]
+        h = request.headers.get("Authorization", "")
+        if h.startswith("Bearer "):
+            tok = h[7:]
+        return bool(tok) and hmac.compare_digest(tok.encode(), self.token.encode())
+
+    def set_cookie(self, resp):
+        resp.set_cookie("glimpse", self.token, max_age=365 * 86400, httponly=True, secure=True,
+                        samesite="Strict", path="/")
+
+    def static_file(self, name):
+        path = os.path.realpath(os.path.join(WEB, name))
+        if not path.startswith(os.path.realpath(WEB) + os.sep) or not os.path.isfile(path):
+            raise web.HTTPNotFound()
+        resp = web.FileResponse(path)
+        resp.headers["Cache-Control"] = "no-cache"
+        if name.endswith(".webmanifest"):
+            resp.content_type = "application/manifest+json"
+        if name == "sw.js":
+            resp.headers["Service-Worker-Allowed"] = "/"
+        return resp
+
+    async def index(self, request):
+        resp = self.static_file("index.html")
+        resp.headers["Content-Security-Policy"] = (
+            "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "
+            "script-src 'self'; connect-src 'self' wss: ws:; frame-ancestors 'none'")
+        return resp
+
+    async def static(self, request):
+        return self.static_file(request.match_info["path"])
+
+    async def root_file(self, request):
+        return self.static_file(request.path.lstrip("/"))
+
+    async def manifest(self, request):
+        with open(os.path.join(WEB, "manifest.webmanifest")) as f:
+            man = json.load(f)
+        # Home Screen apps on iOS do not share Safari's cookies: carry the token in the start URL
+        # (only when the request that adds the app is already authenticated)
+        if self.authed(request):
+            man["start_url"] = "/?t=" + self.token
+        resp = web.json_response(man, content_type="application/manifest+json")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    async def json_body(self, request):
+        try:
+            body = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            raise web.HTTPBadRequest(text="invalid json")
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest(text="invalid json")
+        return body
+
+    async def login(self, request):
+        body = await self.json_body(request)
+        tok = str(body.get("token") or "").strip()
+        if not tok or not hmac.compare_digest(tok.encode(), self.token.encode()):
+            await asyncio.sleep(1)
+            raise web.HTTPUnauthorized(text="bad token")
+        resp = web.json_response({"ok": True})
+        self.set_cookie(resp)
+        return resp
+
+    async def logout(self, request):
+        resp = web.json_response({"ok": True})
+        resp.del_cookie("glimpse", path="/")
+        return resp
+
+    @web.middleware
+    async def auth_mw(self, request, handler):
+        p = request.path
+        if (p.startswith("/api/") and p not in ("/api/login", "/api/logout")) or p == "/ws":
+            if not self.authed(request):
+                raise web.HTTPUnauthorized(text="login required")
+        resp = await handler(request)
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("Referrer-Policy", "no-referrer")
+        return resp
+
+    async def me(self, request):
+        return web.json_response({"ok": True, "version": VERSION})
+
+    async def vapid_key(self, request):
+        return web.json_response({"publicKey": self.vapid.public_b64})
+
+    async def push_subscribe(self, request):
+        sub = await self.json_body(request)
+        keys = sub.get("keys") if isinstance(sub.get("keys"), dict) else {}
+        if not str(sub.get("endpoint", "")).startswith("https://") or not keys.get("p256dh") or not keys.get("auth"):
+            raise web.HTTPBadRequest(text="invalid subscription")
+        sub = {"endpoint": sub["endpoint"], "keys": {"p256dh": keys["p256dh"], "auth": keys["auth"]}}
+        self.push_subs = [s for s in self.push_subs if s["endpoint"] != sub["endpoint"]] + [sub]
+        self._save_push()
+        return web.json_response({"ok": True, "count": len(self.push_subs)})
+
+    async def push_unsubscribe(self, request):
+        body = await self.json_body(request)
+        self.push_subs = [s for s in self.push_subs if s["endpoint"] != body.get("endpoint")]
+        self._save_push()
+        return web.json_response({"ok": True})
+
+    async def push_test(self, request):
+        await self.push_all({"title": "Glimpse 测试通知", "body": "通知已经可以正常工作", "tag": "test", "url": "/"})
+        return web.json_response({"ok": True, "count": len(self.push_subs)})
+
+    async def ws(self, request):
+        if not origin_ok(request):
+            raise web.HTTPForbidden(text="bad origin")
+        ws = web.WebSocketResponse(heartbeat=20, max_msg_size=8 * 1024 * 1024, compress=True)
+        await ws.prepare(request)
+        p = Phone(ws)
+        self.phones.add(p)
+        p.send(self.state())
+        try:
+            async for msg in ws:
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    continue
+                try:
+                    data = json.loads(msg.data)
+                except ValueError:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                p.last_seen = time.time()
+                if data.get("op") in ("create", "restart", "machine_test", "machine_add", "machine_update",
+                                      "machine_remove"):
+                    asyncio.ensure_future(self.phone_op(p, data))
+                else:
+                    await self.phone_op(p, data)
+        finally:
+            self.phone_gone(p)
+        return ws
+
+    def app(self):
+        app = web.Application(middlewares=[self.auth_mw], client_max_size=4 * 1024 * 1024)
+        app.router.add_get("/", self.index)
+        app.router.add_get("/sw.js", self.root_file)
+        app.router.add_get("/manifest.webmanifest", self.manifest)
+        app.router.add_get("/static/{path:.+}", self.static)
+        app.router.add_post("/api/login", self.login)
+        app.router.add_post("/api/logout", self.logout)
+        app.router.add_get("/api/me", self.me)
+        app.router.add_get("/api/vapid", self.vapid_key)
+        app.router.add_post("/api/push/subscribe", self.push_subscribe)
+        app.router.add_post("/api/push/unsubscribe", self.push_unsubscribe)
+        app.router.add_post("/api/push/test", self.push_test)
+        app.router.add_get("/ws", self.ws)
+        app.on_startup.append(self.startup)
+        app.on_cleanup.append(self.cleanup)
+        return app
+
+    async def startup(self, app):
+        self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
+        self.bg = [asyncio.ensure_future(self.state_loop())]
+        for m in self.machines.values():
+            m.start()
+
+    async def cleanup(self, app):
+        for t in self.bg:
+            t.cancel()
+        for m in self.machines.values():
+            await m.stop()
+        await self.http.close()
+
+
+def cert_paths():
+    return os.path.join(DATA, "certs", "ts.crt"), os.path.join(DATA, "certs", "ts.key")
+
+
+def ssl_context():
+    cert, key = cert_paths()
+    if not (os.path.isfile(cert) and os.path.isfile(key)):
+        return None
+    ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ctx.load_cert_chain(cert, key)
+    return ctx
+
+
+def renew_cert(cfg):
+    """Get / refresh the Tailscale (Let's Encrypt) certificate; tailscale only re-issues near expiry."""
+    host = resolve_hub(cfg)[1]
+    if not host:
+        return False
+    cert, key = cert_paths()
+    os.makedirs(os.path.dirname(cert), mode=0o700, exist_ok=True)
+    try:
+        subprocess.run(["tailscale", "cert", "--cert-file", cert, "--key-file", key, host],
+                       check=True, capture_output=True, timeout=120)
+        os.chmod(key, 0o600)
+        return True
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("tailscale cert failed: %s", getattr(e, "stderr", b"") or e)
+        return False
+
+
+def detect_tailscale():
+    """(ip, MagicDNS name) of this machine on the tailnet, or (None, None)."""
+    try:
+        out = subprocess.run(["tailscale", "status", "--json"], capture_output=True, timeout=10, check=True).stdout
+        me = json.loads(out)["Self"]
+        return (me.get("TailscaleIPs") or [None])[0], (me.get("DNSName") or "").rstrip(".") or None
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+        return None, None
+
+
+def resolve_hub(cfg):
+    """hub.listen hosts / tailscale_hostname set to "auto" (or listen empty) -> ask tailscale. Cached per process."""
+    if RUNTIME:
+        return RUNTIME["listen"], RUNTIME["hostname"]
+    h = cfg["hub"]
+    listen = [dict(x) for x in h.get("listen") or []] or [{"host": "auto", "port": 8443},
+                                                          {"host": "127.0.0.1", "port": 8443}]
+    name = h.get("tailscale_hostname") or ""
+    ip = dns = None
+    if name == "auto" or any(x.get("host") in ("auto", "", None) for x in listen):
+        ip, dns = detect_tailscale()
+    out = []
+    for x in listen:
+        if x.get("host") in ("auto", "", None):
+            if not ip:
+                log.warning("hub.listen host \"auto\": tailscale IP not found, skipping")
+                continue
+            x["host"] = ip
+        if x not in out:
+            out.append(x)
+    if name == "auto":
+        name = dns or ""
+    RUNTIME.update(listen=out, hostname=name)
+    return out, name
+
+
+def login_url(cfg, mask=False):
+    listen, name = resolve_hub(cfg)
+    first = listen[0] if listen else {"host": "127.0.0.1", "port": 8443}
+    return "https://%s:%s/?t=%s" % (name or first["host"], first["port"],
+                                    "<run ./glimpse url>" if mask else C.token())
+
+
+async def serve(cfg, hub):
+    runner = web.AppRunner(hub.app(), access_log=None)
+    await runner.setup()
+    ctx = ssl_context()
+    if ctx is None:
+        log.warning("no TLS certificate: serving plain HTTP (iPhone push notifications need HTTPS)")
+    sites = 0
+    for ls in resolve_hub(cfg)[0]:
+        try:
+            await web.TCPSite(runner, ls["host"], ls["port"], ssl_context=ctx).start()
+            sites += 1
+            log.info("listening on %s://%s:%s", "https" if ctx else "http", ls["host"], ls["port"])
+        except OSError as e:
+            log.error("cannot listen on %s:%s: %s", ls["host"], ls["port"], e)
+    if not sites:
+        raise SystemExit("no listen address available")
+    log.info("open on the phone: %s", login_url(cfg, mask=True))
+    caf = None
+    if cfg["hub"].get("caffeinate", True) and sys.platform == "darwin":
+        try:
+            caf = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
+        except OSError:
+            pass
+    try:
+        while True:
+            await asyncio.sleep(CERT_RENEW if ctx else CERT_RETRY)
+            if not await asyncio.get_running_loop().run_in_executor(None, renew_cert, cfg):
+                continue
+            if ctx:
+                ctx.load_cert_chain(*cert_paths())
+            elif ssl_context():
+                # the listening sockets are plain HTTP: let launchd / the user restart us with TLS
+                log.warning("certificate obtained, restarting")
+                raise SystemExit(0)
+    finally:
+        if caf:
+            caf.terminate()
+        await runner.cleanup()
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Glimpse hub")
+    ap.add_argument("--print-url", action="store_true", help="print the phone login URL and exit")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    a = ap.parse_args()
+    logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    cfg = C.load()
+    if a.print_url:
+        print(login_url(cfg))
+        return
+    os.environ["GLIMPSE_APPROVAL_WAIT"] = str(int(cfg["hub"].get("approval_wait_seconds") or 600))
+    renew_cert(cfg)
+
+    async def run():
+        await serve(cfg, Hub(cfg))
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

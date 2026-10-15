@@ -1,0 +1,2756 @@
+#!/usr/bin/env python3
+"""glimpse agent: runs on every machine. Python 3.8+, standard library only.
+
+Sub-commands
+  daemon              PTY session daemon (auto-started by the other commands)
+  bridge              stdio <-> daemon socket; the hub runs this locally or over ssh
+  hook                Claude Code hook relay (hook JSON on stdin -> daemon)
+  ls                  list sessions on this machine
+  run [opts] [-- cmd] create a session and attach this terminal to it
+  run KIND --resume ID  continue an existing claude / codex conversation in a new session
+  attach [SID]        attach this terminal to a session, default the most recent live one (detach: Ctrl-])
+  adopt [claude|codex] pick a recent conversation on this machine and continue it in a session
+  history [KIND]      list recent claude / codex conversations on this machine
+  kill SID            terminate a session
+"""
+import base64
+import calendar
+import fcntl
+import glob
+import hashlib
+import json
+import os
+import pty
+import re
+import select
+import selectors
+import shlex
+import signal
+import socket
+import struct
+import sys
+import termios
+import time
+
+VERSION = "0.3.0"
+RING_MAX = 2 * 1024 * 1024        # raw terminal bytes kept per session
+DEFAULT_REPLAY = 256 * 1024       # bytes replayed to a subscriber that has no offset
+CHAT_MAX = 3000                   # parsed transcript items kept per session
+EVENTS_MAX = 300
+EXITED_MAX = 30
+STRIP_ENV = ("CLAUDECODE", "CLAUDE_CODE_", "CLAUDE_PID", "CLAUDE_EFFORT", "CLAUDE_PROJECT_DIR", "GLIMPSE_")
+CLAUDE_HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification",
+                      "PermissionRequest", "Stop", "StopFailure", "SessionEnd")
+CODEX_FLAGS = ["-c", "tui.notifications=true", "-c", 'tui.notification_method="osc9"',
+               "-c", 'tui.notification_condition="always"']
+DEFAULT_PRESETS = {"claude": {"argv": ["claude"]}, "codex": {"argv": ["codex"]}, "shell": {"argv": []}}
+DETACH_KEY = b"\x1d"              # Ctrl-]
+HISTORY_ACTIVE = 120              # a transcript written this recently is probably still open elsewhere
+HISTORY_DAYS = 14                 # codex rollouts older than this are not offered for adoption
+RESUME_IMPORT = 200               # chat items imported from a resumed codex rollout
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")       # resume ids end up in argv
+VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,99}$")  # model names etc.
+CLAUDE_MODES = ("default", "acceptEdits", "auto", "plan", "bypass", "manual")
+CLAUDE_MODE_ALIAS = {"bypassPermissions": "bypass"}
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+CODEX_OVERRIDES = ("model", "effort", "approval", "sandbox")
+SHIFT_TAB = b"\x1b[Z"
+
+
+def project_dir():
+    if "__file__" not in globals():
+        return os.path.expanduser("~/.glimpse")
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def state_dir():
+    # all local state lives inside the project directory (data/agent)
+    d = os.environ.get("GLIMPSE_STATE") or os.path.join(project_dir(), "data", "agent")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return d
+
+
+def sock_path():
+    return os.environ.get("GLIMPSE_SOCK") or os.path.join(state_dir(), "agent.sock")
+
+
+def now():
+    return time.time()
+
+
+def b64e(b):
+    return base64.b64encode(b).decode("ascii")
+
+
+def set_nonblock(fd):
+    fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
+
+
+def set_cloexec(fd):
+    fcntl.fcntl(fd, fcntl.F_SETFD, fcntl.fcntl(fd, fcntl.F_GETFD) | fcntl.FD_CLOEXEC)
+
+
+def clip(s, n):
+    if not isinstance(s, str):
+        s = json.dumps(s, ensure_ascii=False)
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def shrink(o, n=1000, depth=0):
+    """Bound the size of hook payloads (tool inputs can be huge file contents)."""
+    if isinstance(o, str):
+        return clip(o, n)
+    if depth > 4:
+        return clip(o, n)
+    if isinstance(o, dict):
+        return {k: shrink(v, n, depth + 1) for k, v in list(o.items())[:50]}
+    if isinstance(o, list):
+        return [shrink(v, n, depth + 1) for v in o[:50]]
+    return o
+
+
+# --------------------------------------------------------------------------- terminal parsing
+
+OSC_RE = re.compile(rb"\x1b\](\d+);([^\x07\x1b]*)(?:\x07|\x1b\\)")
+QUERY_RE = re.compile(rb"\x1b\[6n|\x1b\[0?c|\x1b\]1[01];\?(?:\x07|\x1b\\)")
+# responses a terminal emulator sends back for the queries above; stripped from phone input
+RESPONSE_RE = re.compile(rb"\x1b\[\d+;\d+R|\x1b\[\?[\d;]*c|\x1b\]1[01];rgb:[^\x07\x1b]*(?:\x07|\x1b\\)")
+TITLE_JUNK_RE = re.compile(r"^[^\w(\[{<\"'`]+", re.U)
+
+
+def query_reply(q):
+    if q == b"\x1b[6n":
+        return b"\x1b[1;1R"
+    if q.startswith(b"\x1b[") and q.endswith(b"c"):
+        return b"\x1b[?62;22c"
+    if q.startswith(b"\x1b]10"):
+        return b"\x1b]10;rgb:e6e6/e6e6/e6e6\x1b\\"
+    if q.startswith(b"\x1b]11"):
+        return b"\x1b]11;rgb:1414/1414/1818\x1b\\"
+    return b""
+
+
+def clean_title(t):
+    t = TITLE_JUNK_RE.sub("", t.strip())
+    return t.strip()
+
+
+# terminal reports (focus in/out, SGR mouse) the emulator sends on its own; not a sign of a user at the keys
+REPORT_RE = re.compile(rb"\x1b\[[IO]|\x1b\[<\d+;\d+;\d+[Mm]")
+VT_TOKEN_RE = re.compile(r"\x1b\[([0-9;?<>=]*)[ -/]*([@-~])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|"
+                         r"\x1b[P^_X][^\x1b]*\x1b\\|\x1b[()*+].|\x1b[^\[\]P^_X()*+]|[\x00-\x1f\x7f]|[^\x00-\x1f\x7f\x1b]+")
+def is_user_keys(data):
+    """Input that means someone is typing (Enter, Esc, arrows, Ctrl-C); terminal reports don't count."""
+    data = REPORT_RE.sub(b"", RESPONSE_RE.sub(b"", data))
+    return b"\r" in data or data[:1] == b"\x1b" or b"\x03" in data
+
+
+MODE_RE = re.compile(r"(plan mode|accept edits|auto mode|bypass permissions|manual mode) on", re.I)
+MODE_NAMES = {"plan mode": "plan", "accept edits": "acceptEdits", "auto mode": "auto",
+              "bypass permissions": "bypass", "manual mode": "manual"}
+
+
+class Screen:
+    """Minimal VT screen (text only) so the claude footer can be read even when the TUI
+    redraws it with cell-level diffs. Handles cursor movement, erase, scrolling; ignores colours."""
+
+    def __init__(self, cols, rows):
+        import codecs
+        self.dec = codecs.getincrementaldecoder("utf-8")("replace")
+        self.rest = ""
+        self.cols, self.rows = cols, rows
+        self.x = self.y = 0
+        self.saved = (0, 0)
+        self.grid = [[" "] * cols for _ in range(rows)]
+
+    def resize(self, cols, rows):
+        g = [[" "] * cols for _ in range(rows)]
+        for i, row in enumerate(self.grid[-rows:]):
+            g[i][:min(cols, len(row))] = row[:cols]
+        self.grid, self.cols, self.rows = g, cols, rows
+        self.x, self.y = min(self.x, cols - 1), min(self.y, rows - 1)
+
+    def lines(self):
+        return ["".join(r).rstrip() for r in self.grid]
+
+    def _lf(self):
+        if self.y >= self.rows - 1:
+            del self.grid[0]
+            self.grid.append([" "] * self.cols)
+        else:
+            self.y += 1
+
+    def _put(self, text):
+        import unicodedata
+        for ch in text:
+            w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+            if self.x + w > self.cols:
+                self.x = 0
+                self._lf()
+            self.grid[self.y][self.x] = ch
+            if w == 2 and self.x + 1 < self.cols:
+                self.grid[self.y][self.x + 1] = ""
+            self.x += w
+
+    def _csi(self, params, final):
+        priv = params.startswith(("?", "<", ">", "="))
+        nums = [int(p) if p.isdigit() else 0 for p in params.lstrip("?<>=").split(";")] if params else []
+        n = (nums[0] if nums else 0) or 1
+        if priv:
+            if final in "hl" and nums and nums[0] in (47, 1047, 1049):
+                self.grid = [[" "] * self.cols for _ in range(self.rows)]   # alternate screen switch
+            return
+        if final == "A":
+            self.y = max(0, self.y - n)
+        elif final in "Be":
+            self.y = min(self.rows - 1, self.y + n)
+        elif final in "Ca":
+            self.x = min(self.cols - 1, self.x + n)
+        elif final == "D":
+            self.x = max(0, self.x - n)
+        elif final in "EF":
+            self.y = min(self.rows - 1, self.y + n) if final == "E" else max(0, self.y - n)
+            self.x = 0
+        elif final in "G`":
+            self.x = min(self.cols - 1, n - 1)
+        elif final == "d":
+            self.y = min(self.rows - 1, n - 1)
+        elif final in "Hf":
+            self.y = min(self.rows - 1, (nums[0] if nums else 1) - 1 if nums and nums[0] else 0)
+            self.x = min(self.cols - 1, (nums[1] - 1) if len(nums) > 1 and nums[1] else 0)
+        elif final == "K":
+            row, m = self.grid[self.y], nums[0] if nums else 0
+            a, b = (self.x, self.cols) if m == 0 else (0, self.x + 1) if m == 1 else (0, self.cols)
+            row[a:b] = [" "] * (b - a)
+        elif final == "J":
+            m = nums[0] if nums else 0
+            if m == 0:
+                self._csi("0", "K")
+                rng = range(self.y + 1, self.rows)
+            elif m == 1:
+                self._csi("1", "K")
+                rng = range(0, self.y)
+            else:
+                rng = range(self.rows)
+            for i in rng:
+                self.grid[i] = [" "] * self.cols
+        elif final in "LM":
+            for _ in range(min(n, self.rows - self.y)):
+                if final == "L":
+                    self.grid.insert(self.y, [" "] * self.cols)
+                    del self.grid[self.rows]
+                else:
+                    del self.grid[self.y]
+                    self.grid.append([" "] * self.cols)
+        elif final in "ST":
+            for _ in range(min(n, self.rows)):
+                if final == "S":
+                    del self.grid[0]
+                    self.grid.append([" "] * self.cols)
+                else:
+                    self.grid.insert(0, [" "] * self.cols)
+                    del self.grid[self.rows]
+        elif final == "P":
+            row = self.grid[self.y]
+            del row[self.x:self.x + n]
+            row.extend([" "] * (self.cols - len(row)))
+        elif final == "X":
+            row = self.grid[self.y]
+            row[self.x:self.x + n] = [" "] * len(row[self.x:self.x + n])
+        elif final == "s":
+            self.saved = (self.x, self.y)
+        elif final == "u":
+            self.x, self.y = self.saved
+
+    def feed(self, data):
+        text = self.rest + self.dec.decode(data)
+        self.rest = ""
+        i = text.rfind("\x1b")
+        if i >= 0 and len(text) - i < 256:
+            m = VT_TOKEN_RE.match(text, i)
+            if not m or m.group(0) == "\x1b" or (m.end() == len(text) and text[i + 1:i + 2] == "]" and
+                                                  not text.endswith(("\x07", "\x1b\\"))):
+                text, self.rest = text[:i], text[i:]     # incomplete escape sequence: wait for more
+        for m in VT_TOKEN_RE.finditer(text):
+            tok = m.group(0)
+            c = tok[0]
+            if c == "\x1b":
+                if m.group(2):
+                    self._csi(m.group(1) or "", m.group(2))
+                elif tok == "\x1b7":
+                    self.saved = (self.x, self.y)
+                elif tok == "\x1b8":
+                    self.x, self.y = self.saved
+                elif tok == "\x1bM":
+                    if self.y == 0:
+                        self.grid.insert(0, [" "] * self.cols)
+                        del self.grid[self.rows]
+                    else:
+                        self.y -= 1
+                elif tok == "\x1bc":
+                    self.grid = [[" "] * self.cols for _ in range(self.rows)]
+                    self.x = self.y = 0
+            elif c == "\r":
+                self.x = 0
+            elif c == "\n" or c in "\x0b\x0c":
+                self._lf()
+            elif c == "\b":
+                self.x = max(0, self.x - 1)
+            elif c == "\t":
+                self.x = min(self.cols - 1, (self.x // 8 + 1) * 8)
+            elif c >= " " and c != "\x7f":
+                self._put(tok)
+
+    def claude_mode(self):
+        """Permission mode shown in claude's footer: plan/acceptEdits/auto/bypass/manual/default, None = not visible."""
+        for ln in reversed(self.lines()):
+            m = MODE_RE.search(ln)
+            if m:
+                return MODE_NAMES[m.group(1).lower()]
+            if "for shortcuts" in ln:
+                return "default"
+        return None
+
+
+# --------------------------------------------------------------------------- claude transcript
+
+def summarize_tool(name, inp):
+    if not isinstance(inp, dict):
+        return name
+    for k in ("command", "file_path", "path", "pattern", "url", "query", "description", "prompt"):
+        v = inp.get(k)
+        if isinstance(v, str) and v:
+            return "%s: %s" % (name, clip(v.replace("\n", " "), 200))
+    if name == "AskUserQuestion":
+        qs = inp.get("questions") or []
+        if qs and isinstance(qs[0], dict):
+            return "Question: " + clip(qs[0].get("question", ""), 300)
+    return name
+
+
+def block_text(c):
+    """tool_result content -> plain text"""
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        out = []
+        for b in c:
+            if isinstance(b, dict):
+                if b.get("type") == "text":
+                    out.append(b.get("text", ""))
+                elif b.get("type") == "image":
+                    out.append("[image]")
+            elif isinstance(b, str):
+                out.append(b)
+        return "\n".join(out)
+    return "" if c is None else str(c)
+
+
+def parse_claude_line(d):
+    """One transcript JSON object -> list of (role, text, extra) tuples."""
+    t = d.get("type")
+    if t not in ("user", "assistant") or d.get("isSidechain") or d.get("isMeta"):
+        return []
+    msg = d.get("message") or {}
+    content = msg.get("content")
+    out = []
+    if t == "user":
+        if isinstance(content, str):
+            s = content.strip()
+            if s.startswith("<local-command-caveat>") or s.startswith("<system-reminder>"):
+                return []
+            m = re.match(r"<command-name>(.*?)</command-name>", s, re.S)
+            if m:
+                args = re.search(r"<command-args>(.*?)</command-args>", s, re.S)
+                cmd = m.group(1).strip() + ((" " + args.group(1).strip()) if args and args.group(1).strip() else "")
+                return [("system", cmd, {})]
+            m = re.match(r"<local-command-stdout>(.*?)</local-command-stdout>", s, re.S)
+            if m:
+                return [("system", clip(m.group(1).strip(), 1500), {})] if m.group(1).strip() else []
+            if s:
+                out.append(("user", s, {}))
+        elif isinstance(content, list):
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_result":
+                    txt = clip(block_text(b.get("content")).strip(), 1500)
+                    out.append(("result", txt, {"error": bool(b.get("is_error"))}))
+                elif b.get("type") == "text":
+                    s = (b.get("text") or "").strip()
+                    if s and not s.startswith("<system-reminder>"):
+                        out.append(("user", s, {}))
+    else:
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        for b in content or []:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text" and (b.get("text") or "").strip():
+                out.append(("assistant", b["text"].strip(), {}))
+            elif b.get("type") == "tool_use":
+                out.append(("tool", summarize_tool(b.get("name", "tool"), b.get("input")), {"tool": b.get("name")}))
+    return out
+
+
+class Tail:
+    """Incrementally reads appended JSONL lines from a file."""
+
+    def __init__(self, path, from_start=True):
+        self.path = path
+        self.pos = 0
+        self.buf = b""
+        self.ino = None
+        if not from_start:
+            try:
+                self.pos = os.path.getsize(path)
+            except OSError:
+                pass
+
+    def read(self):
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return []
+        if self.ino is not None and st.st_ino != self.ino or st.st_size < self.pos:
+            self.pos, self.buf = 0, b""
+        self.ino = st.st_ino
+        if st.st_size == self.pos:
+            return []
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self.pos)
+                data = f.read(8 * 1024 * 1024)
+        except OSError:
+            return []
+        self.pos += len(data)
+        self.buf += data
+        lines = self.buf.split(b"\n")
+        self.buf = lines.pop()
+        out = []
+        for ln in lines:
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                out.append(json.loads(ln))
+            except ValueError:
+                pass
+        return out
+
+
+# --------------------------------------------------------------------------- hooks
+
+# Runs inside claude's hook. PermissionRequest blocks until the phone answers (or the wait
+# expires / someone types in the terminal) and then prints claude's decision JSON.
+HOOK_RELAY = r'''
+import json,os,socket,sys
+try:
+    ev=json.loads(sys.stdin.read() or "{}")
+    p=os.environ.get("GLIMPSE_SOCK","");sid=os.environ.get("GLIMPSE_SID","")
+    if p and sid:
+        w=ev.get("hook_event_name")=="PermissionRequest"
+        s=socket.socket(socket.AF_UNIX);s.settimeout(float(os.environ.get("GLIMPSE_APPROVAL_WAIT","600"))+10 if w else 5)
+        s.connect("\0"+p[1:] if p.startswith("@") else p)
+        if p.startswith("@") and hasattr(socket,"SO_PEERCRED"):
+            import struct
+            if struct.unpack("3i",s.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))[1]!=os.getuid():
+                raise RuntimeError("foreign daemon")
+        s.sendall((json.dumps({"op":"hook","sid":sid,"ev":ev,"wait":w})+"\n").encode("utf-8","replace"))
+        b=b""
+        while b"\n" not in b:
+            c=s.recv(65536)
+            if not c:break
+            b+=c
+        r=json.loads(b.split(b"\n")[0] or b"{}")
+        if r.get("out"):sys.stdout.write(json.dumps(r["out"]))
+except Exception:
+    pass
+'''
+
+
+def hook_command():
+    py = sys.executable or "python3"
+    return "%s -c %s" % (shlex.quote(py), shlex.quote(HOOK_RELAY.strip()))
+
+
+def claude_hook_settings(approval_wait):
+    out = {}
+    for ev in CLAUDE_HOOK_EVENTS:
+        t = int(approval_wait) + 30 if ev == "PermissionRequest" else 10
+        out[ev] = [{"hooks": [{"type": "command", "command": hook_command(), "timeout": t}]}]
+    return out
+
+
+def private_dir():
+    """0700 directory for per-session files (settings with tokens). In bootstrap mode a temp dir."""
+    global _PRIV
+    try:
+        return _PRIV
+    except NameError:
+        pass
+    if BOOTSTRAP:
+        import tempfile
+        _PRIV = tempfile.mkdtemp(prefix="glimpse-")
+    else:
+        _PRIV = state_dir()
+    return _PRIV
+
+
+def prepare_claude_argv(argv, sid, sdir, env_extra=None, approval_wait=600):
+    """Merge our hooks into the --settings file the user launches claude with.
+
+    claude only honours the last --settings flag, so the user's file (which carries
+    their API endpoint/token env) is merged with our hooks into one settings file.
+    """
+    argv = list(argv)
+    base, idx = {}, None
+    for i, a in enumerate(argv):
+        if a == "--settings" and i + 1 < len(argv):
+            idx = i
+        elif a.startswith("--settings="):
+            idx = i
+            argv[i:i + 1] = ["--settings", a.split("=", 1)[1]]
+    if idx is not None:
+        src = os.path.expanduser(argv[idx + 1])
+        try:
+            if src.lstrip().startswith("{"):
+                base = json.loads(src)
+            else:
+                with open(src) as f:
+                    base = json.load(f)
+        except (OSError, ValueError) as e:
+            raise RuntimeError("cannot read claude settings %s: %s" % (src, e))
+        del argv[idx:idx + 2]
+    merged = dict(base)
+    hooks = {k: list(v) for k, v in (base.get("hooks") or {}).items()}
+    for ev, entry in claude_hook_settings(approval_wait).items():
+        hooks.setdefault(ev, []).extend(entry)
+    merged["hooks"] = hooks
+    if env_extra:
+        # settings env wins over the process env in claude, so a key swap must go here too
+        merged["env"] = dict(merged.get("env") or {}, **env_extra)
+    # always a 0600 file: the settings may carry API tokens and argv is world-readable via ps
+    path = os.path.join(sdir or private_dir(), "claude-%s.json" % sid)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(merged, f)
+    return argv[:1] + ["--settings", path] + argv[1:], path
+
+
+# --------------------------------------------------------------------------- codex rollout
+
+def parse_codex_line(d):
+    """One codex rollout JSON object -> list of (role, text, extra) plus optional ("@done"/"@error", text)."""
+    if d.get("type") != "event_msg":
+        return []
+    p = d.get("payload") or {}
+    pt = p.get("type")
+    if pt == "item_completed":
+        it = p.get("item") or {}
+        t = it.get("type")
+        if t == "UserMessage":
+            txt = "\n".join(c.get("text", "") for c in it.get("content") or [] if isinstance(c, dict))
+            return [("user", txt.strip(), {})] if txt.strip() else []
+        if t == "AgentMessage":
+            c = it.get("content")
+            txt = "\n".join(x.get("text", "") for x in c if isinstance(x, dict)) if isinstance(c, list) else str(c or "")
+            return [("assistant", txt.strip(), {})] if txt.strip() else []
+        if t == "CommandExecution":
+            cmd = it.get("command")
+            if isinstance(cmd, list):
+                cmd = cmd[-1] if len(cmd) >= 3 and cmd[1] in ("-lc", "-c") else " ".join(cmd)
+            out = [("tool", "Shell: " + clip(str(cmd).replace("\n", " "), 200), {"tool": "Shell"})]
+            res = it.get("aggregated_output") or it.get("formatted_output") or ""
+            ec = it.get("exit_code")
+            if res or ec not in (None, 0):
+                out.append(("result", clip(str(res).strip() + ("" if ec in (None, 0) else "\n[exit %s]" % ec), 1500),
+                            {"error": ec not in (None, 0)}))
+            return out
+        if t == "FileChange":
+            files = list((it.get("changes") or {}).keys())
+            return [("tool", "Edit: " + clip(", ".join(os.path.basename(f) for f in files), 200), {"tool": "Edit"})]
+        if t == "McpToolCall":
+            return [("tool", "%s.%s" % (it.get("server"), it.get("tool")), {"tool": "Mcp"})]
+        return []
+    if pt == "user_message":
+        m = (p.get("message") or "").strip()
+        return [("user", m, {})] if m else []
+    if pt == "agent_message":
+        m = (p.get("message") or "").strip()
+        return [("assistant", m, {})] if m else []
+    if pt == "task_complete":
+        err = p.get("error")
+        if err:
+            return [("@error", (err.get("message") if isinstance(err, dict) else str(err)) or "turn failed", {})]
+        return [("@done", p.get("last_agent_message") or "", {})]
+    if pt == "turn_aborted":
+        return [("@aborted", p.get("reason") or "", {})]
+    return []
+
+
+def iso_ts(s):
+    """'2026-10-06T12:53:28.476Z' (UTC) -> epoch seconds, None if unparsable."""
+    if not isinstance(s, str) or len(s) < 19:
+        return None
+    try:
+        t = calendar.timegm(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return None
+    m = re.match(r"\.(\d+)", s[19:])
+    return t + (float("0." + m.group(1)) if m else 0.0)
+
+
+ROLLOUT_NAME_RE = re.compile(r"rollout-(\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d)")
+
+
+def rollout_start(path, meta):
+    """When a rollout began: session_meta.payload.timestamp, else the (local time) file name."""
+    t = iso_ts(meta.get("timestamp"))
+    if t is None:
+        m = ROLLOUT_NAME_RE.search(os.path.basename(path))
+        if m:
+            try:
+                t = time.mktime(time.strptime(m.group(1), "%Y-%m-%dT%H-%M-%S"))
+            except (ValueError, OverflowError):
+                t = None
+    return t
+
+
+def rollout_meta(path):
+    """session_meta payload of a rollout file ({} if unreadable), None for subagent rollouts."""
+    try:
+        with open(path, "rb") as f:
+            meta = json.loads(f.readline() or b"{}").get("payload") or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+    src = meta.get("source")
+    if isinstance(src, dict) or meta.get("thread_source") == "subagent":
+        return None
+    return meta
+
+
+def codex_day_dirs(since, days):
+    root = os.path.expanduser("~/.codex/sessions")
+    out = []
+    for back in range(days):
+        day = time.localtime(since - back * 86400)
+        out.append(os.path.join(root, "%04d" % day.tm_year, "%02d" % day.tm_mon, "%02d" % day.tm_mday))
+    return out
+
+
+def find_codex_rollout(cwd, since, taken):
+    """The rollout a freshly started codex writes: same cwd, started (not just modified) after spawn."""
+    cands = []
+    for d in codex_day_dirs(since, 2):
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for n in names:
+            p = os.path.join(d, n)
+            if not n.endswith(".jsonl") or p in taken:
+                continue
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            if st.st_mtime < since - 2:
+                continue
+            meta = rollout_meta(p)
+            if not meta:
+                continue
+            if os.path.realpath(meta.get("cwd") or "") != os.path.realpath(cwd):
+                continue
+            start = rollout_start(p, meta)
+            if start is None or start < since - 2:
+                continue     # an older conversation still being written by another codex
+            cands.append((st.st_mtime, p))
+    return max(cands)[1] if cands else None
+
+
+def codex_override_argv(argv, ov):
+    """Apply phone-chosen model / effort / approval / sandbox to a codex argv (replacing preset flags)."""
+    drop = {"model": ("-m", "--model"), "approval": ("-a", "--ask-for-approval"), "sandbox": ("-s", "--sandbox")}
+    out, i = list(argv[:1]), 1
+    while i < len(argv):
+        a = argv[i]
+        hit = False
+        for k, flags in drop.items():
+            if ov.get(k) and a in flags:
+                hit, i = True, i + 2
+            elif ov.get(k) and any(a.startswith(f + "=") for f in flags if f.startswith("--")):
+                hit, i = True, i + 1
+            if hit:
+                break
+        if not hit and ov.get("effort") and a in ("-c", "--config") and i + 1 < len(argv) and \
+                argv[i + 1].replace(" ", "").startswith("model_reasoning_effort="):
+            hit, i = True, i + 2
+        if not hit:
+            out.append(a)
+            i += 1
+    if ov.get("model"):
+        out += ["-m", ov["model"]]
+    if ov.get("effort"):
+        out += ["-c", 'model_reasoning_effort="%s"' % ov["effort"]]
+    if ov.get("approval"):
+        out += ["-a", ov["approval"]]
+    if ov.get("sandbox"):
+        out += ["-s", ov["sandbox"]]
+    return out
+
+
+def codex_mode(p, prev=None):
+    """turn_context payload -> {"model", "effort", "approval", "sandbox"} (strings, "" if unknown)."""
+    out = dict(prev or {})
+    if p.get("model"):
+        out["model"] = str(p["model"])
+    if p.get("effort"):
+        out["effort"] = str(p["effort"])
+    ap = p.get("approval_policy")
+    if isinstance(ap, str):
+        out["approval"] = ap
+    elif isinstance(ap, dict) and ap:
+        out["approval"] = next(iter(ap))          # {"granular": {...}} -> "granular"
+    sp = p.get("sandbox_policy")
+    if isinstance(sp, dict) and sp.get("type"):
+        out["sandbox"] = str(sp["type"])
+    elif isinstance(sp, str):
+        out["sandbox"] = sp
+    return out
+
+
+def read_jsonl_end(path, max_bytes=16 * 1024 * 1024):
+    """Parse the last max_bytes of a JSONL file. Returns (objects, offset just after the last full line)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            start = max(0, size - max_bytes)
+            f.seek(start)
+            data = f.read(size - start)
+    except OSError:
+        return [], 0
+    if start:
+        nl = data.find(b"\n")
+        data, start = (data[nl + 1:], start + nl + 1) if nl >= 0 else (b"", size)
+    cut = data.rfind(b"\n") + 1
+    out = []
+    for ln in data[:cut].split(b"\n"):
+        if ln.strip():
+            try:
+                out.append(json.loads(ln))
+            except ValueError:
+                pass
+    return out, start + cut
+
+
+def find_codex_rollout_by_id(tid):
+    """Newest rollout file of a codex thread id, any date (resumed conversations)."""
+    if not tid or not ID_RE.match(tid):
+        return None
+    root = os.path.expanduser("~/.codex/sessions")
+    cands = []
+    for p in glob.glob(os.path.join(glob.escape(root), "*", "*", "*", "rollout-*%s.jsonl" % tid)):
+        try:
+            cands.append((os.stat(p).st_mtime, p))
+        except OSError:
+            pass
+    return max(cands)[1] if cands else None
+
+
+# --------------------------------------------------------------------------- conversation history
+
+def claude_title(d):
+    """First real user prompt of a claude transcript line, or None."""
+    if d.get("type") != "user" or d.get("isSidechain") or d.get("isMeta"):
+        return None
+    for role, text, _ in parse_claude_line(d):
+        if role == "user" and not text.startswith("<"):
+            return clip(text.replace("\n", " ").strip(), 80)
+    return None
+
+
+def scan_head(path, fn, max_lines=400, max_bytes=4 * 1024 * 1024):
+    """Feed the first lines of a JSONL file to fn(obj) until it returns True."""
+    try:
+        with open(path, "rb") as f:
+            n = 0
+            for ln in f:
+                n += len(ln)
+                if n > max_bytes or max_lines <= 0:
+                    return
+                max_lines -= 1
+                try:
+                    d = json.loads(ln)
+                except ValueError:
+                    continue
+                if isinstance(d, dict) and fn(d):
+                    return
+    except OSError:
+        pass
+
+
+_HIST_CACHE = {}     # path -> ((size, mtime), item)
+
+
+def _cached(path, st, build):
+    key = (st.st_size, st.st_mtime)
+    hit = _HIST_CACHE.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    item = build()
+    _HIST_CACHE[path] = (key, item)
+    return item
+
+
+def claude_history():
+    out = []
+    for p in glob.glob(os.path.join(glob.escape(os.path.expanduser("~/.claude/projects")), "*", "*.jsonl")):
+        if os.path.basename(p).startswith("agent-"):
+            continue      # sidechain files of older claude versions
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+
+        def build(p=p):
+            info = {"cwd": None, "title": None}
+
+            def see(d):
+                if info["cwd"] is None and isinstance(d.get("cwd"), str):
+                    info["cwd"] = d["cwd"]
+                if info["title"] is None:
+                    info["title"] = claude_title(d)
+                return info["cwd"] is not None and info["title"] is not None
+            scan_head(p, see)
+            if info["title"] is None:
+                return None   # nothing was ever asked: not worth resuming
+            return {"kind": "claude", "id": os.path.basename(p)[:-6], "cwd": info["cwd"] or "",
+                    "title": info["title"]}
+        it = _cached(p, st, build)
+        if it:
+            out.append(dict(it, updated=st.st_mtime))
+    return out
+
+
+def codex_title(d):
+    rows = parse_codex_line(d)
+    for role, text, _ in rows:
+        if role == "user":
+            return clip(text.replace("\n", " ").strip(), 80)
+    return None
+
+
+def codex_history(t=None):
+    out = []
+    t = now() if t is None else t
+    for d in codex_day_dirs(t, HISTORY_DAYS):
+        for p in glob.glob(os.path.join(glob.escape(d), "rollout-*.jsonl")):
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+
+            def build(p=p):
+                info = {"meta": None, "title": None}
+
+                def see(obj):
+                    if info["meta"] is None:
+                        if obj.get("type") != "session_meta":
+                            return True
+                        pl = obj.get("payload") or {}
+                        src = pl.get("source")
+                        if isinstance(src, dict) or pl.get("thread_source") == "subagent":
+                            return True
+                        info["meta"] = pl
+                        return False
+                    info["title"] = codex_title(obj)
+                    return info["title"] is not None
+                scan_head(p, see, max_lines=2000, max_bytes=16 * 1024 * 1024)
+                m = info["meta"]
+                if not m or not m.get("id") or not info["title"]:
+                    return None
+                return {"kind": "codex", "id": str(m["id"]), "cwd": m.get("cwd") or "", "title": info["title"]}
+            it = _cached(p, st, build)
+            if it:
+                out.append(dict(it, updated=st.st_mtime))
+    # a resumed conversation can have several files: keep the newest
+    best = {}
+    for it in out:
+        if it["id"] not in best or it["updated"] > best[it["id"]]["updated"]:
+            best[it["id"]] = it
+    return list(best.values())
+
+
+def list_history(kind=None, limit=30, owned=()):
+    """Recent claude / codex conversations on this machine, newest first."""
+    items = []
+    if kind in (None, "claude"):
+        items += claude_history()
+    if kind in (None, "codex"):
+        items += codex_history()
+    t = now()
+    owned = set(owned)
+    items = [dict(it, active=t - it["updated"] < HISTORY_ACTIVE) for it in items if it["id"] not in owned]
+    items.sort(key=lambda it: -it["updated"])
+    return items[:max(1, min(int(limit or 30), 200))]
+
+
+# --------------------------------------------------------------------------- daily usage
+
+def day_start(t=None):
+    """Local midnight of the day containing t."""
+    lt = time.localtime(now() if t is None else t)
+    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+
+
+class UsageToday:
+    """Per-machine token totals of today across ALL claude / codex transcripts.
+
+    Each file is parsed incrementally: an entry per path keeps the read offset and that
+    file's running numbers, so a rescan only reads appended bytes (and skips untouched files
+    by (size, mtime)). The cache resets at local midnight."""
+
+    def __init__(self):
+        self.day = None
+        self.files = {}      # path -> state dict
+
+    def _reset(self, t):
+        self.day = day_start(t)
+        self.files = {}
+
+    @staticmethod
+    def _read(path, st, needles):
+        """New complete lines of a file since st["pos"] (only lines containing one of needles are parsed)."""
+        try:
+            with open(path, "rb") as f:
+                f.seek(st["pos"])
+                data = f.read(64 * 1024 * 1024)
+        except OSError:
+            return []
+        cut = data.rfind(b"\n") + 1
+        st["pos"] += cut
+        out = []
+        for ln in data[:cut].split(b"\n"):
+            if any(n in ln for n in needles):
+                try:
+                    out.append(json.loads(ln))
+                except ValueError:
+                    pass
+        return out
+
+    def _claude(self, path, st, d0, d1):
+        for d in self._read(path, st, (b'"usage"',)):
+            if not isinstance(d, dict) or d.get("type") != "assistant":
+                continue
+            t = iso_ts(d.get("timestamp"))
+            if t is None or not d0 <= t < d1:
+                continue
+            msg = d.get("message") or {}
+            us = msg.get("usage") or {}
+            mid = msg.get("id") or d.get("uuid")
+            if not us or not mid or mid in st["seen"]:
+                continue
+            st["seen"].add(mid)
+            st["rows"].append((mid, msg.get("model") or "", int(us.get("input_tokens") or 0),
+                               int(us.get("output_tokens") or 0), int(us.get("cache_read_input_tokens") or 0),
+                               int(us.get("cache_creation_input_tokens") or 0)))
+
+    def _codex(self, path, st, d0, d1):
+        for d in self._read(path, st, (b"token_count", b"turn_context")):
+            if not isinstance(d, dict):
+                continue
+            p = d.get("payload") or {}
+            if d.get("type") == "turn_context" and p.get("model"):
+                st["model"] = str(p["model"])
+                continue
+            if d.get("type") != "event_msg" or p.get("type") != "token_count" or not p.get("info"):
+                continue
+            tot = (p["info"] or {}).get("total_token_usage") or {}
+            if not tot:
+                continue
+            t = iso_ts(d.get("timestamp"))
+            if t is None or t >= d1:
+                continue
+            v = (int(tot.get("input_tokens") or 0), int(tot.get("cached_input_tokens") or 0),
+                 int(tot.get("output_tokens") or 0))
+            if t < d0:
+                st["before"] = v           # last total before today
+            else:
+                st["last"] = v             # last total today
+                if st["model"]:
+                    st["model_last"] = st["model"]
+
+    def scan(self, t=None):
+        t = now() if t is None else t
+        if self.day is None or day_start(t) != self.day:
+            self._reset(t)
+        d0, d1 = self.day, self.day + 86400 + 3600     # +1 h: DST days are 25 h long
+        seen = set()
+        paths = [("claude", p) for p in glob.glob(os.path.join(
+            glob.escape(os.path.expanduser("~/.claude/projects")), "*", "**", "*.jsonl"), recursive=True)]
+        paths += [("codex", p) for d in codex_day_dirs(t, HISTORY_DAYS)
+                  for p in glob.glob(os.path.join(glob.escape(d), "rollout-*.jsonl"))]
+        for kind, p in paths:
+            try:
+                fs = os.stat(p)
+            except OSError:
+                continue
+            if fs.st_mtime < d0:
+                continue                   # not written today
+            seen.add(p)
+            st = self.files.get(p)
+            if st is None or fs.st_size < st["pos"]:
+                st = self.files[p] = {"kind": kind, "pos": 0, "key": None, "seen": set(), "rows": [],
+                                      "model": "", "model_last": "", "before": None, "last": None}
+            if st["key"] == (fs.st_size, fs.st_mtime):
+                continue
+            st["key"] = (fs.st_size, fs.st_mtime)
+            (self._claude if kind == "claude" else self._codex)(p, st, d0, d1)
+        for p in [p for p in self.files if p not in seen]:
+            del self.files[p]
+        return self.totals()
+
+    def totals(self):
+        cl = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+        cx = {"input": 0, "output": 0, "cache_read": 0}
+        by = {}
+        mids = set()      # one message can show up in several files (forks / sidechains)
+
+        def add_model(m, i, o):
+            e = by.setdefault(m or "unknown", {"input": 0, "output": 0})
+            e["input"] += i
+            e["output"] += o
+        for st in self.files.values():
+            if st["kind"] == "claude":
+                for mid, model, i, o, cr, cw in st["rows"]:
+                    if mid in mids:
+                        continue
+                    mids.add(mid)
+                    cl["input"] += i
+                    cl["output"] += o
+                    cl["cache_read"] += cr
+                    cl["cache_write"] += cw
+                    add_model(model, i + cr + cw, o)
+            elif st["last"]:
+                b = st["before"] or (0, 0, 0)
+                inp, cached, out = (max(0, x - y) for x, y in zip(st["last"], b))
+                cx["input"] += max(0, inp - cached)
+                cx["cache_read"] += cached
+                cx["output"] += out
+                add_model(st["model_last"], inp, out)
+        return {"day": time.strftime("%Y-%m-%d", time.localtime(self.day)), "claude": cl, "codex": cx,
+                "by_model": by}
+
+
+# --------------------------------------------------------------------------- session
+
+class Session:
+    def __init__(self, daemon, sid, kind, name, cwd, argv, cols, rows):
+        self.d = daemon
+        self.sid, self.kind, self.name, self.cwd, self.argv = sid, kind, name, cwd, argv
+        self.cols, self.rows = cols, rows
+        self.title = ""
+        self.status, self.detail, self.attention = "starting", "", None
+        self.created = self.activity = now()
+        self.pid, self.fd, self.exit_code = None, None, None
+        self.ring = bytearray()
+        self.ring_start = 0
+        self.chat = []
+        self.chat_seq = 0
+        self.preview = ""
+        self.subs = set()
+        self.tail = None
+        self.tail_kind = None
+        self.transcript = None
+        self.settings_file = None
+        self.last_event = {}
+        self.dirty = True
+        self.last_bcast = 0.0
+        self.qbuf = b""
+        self.paste_mode = False
+        self.last_key = None
+        self.killed = False
+        self.env = {}                  # extra env (API key swaps); never sent to clients
+        self.key = None                # key profile name shown in the UI
+        self.agent_session_id = None   # claude session id / codex thread id, for resume
+        self.restarts = 0
+        self.restart_req = None        # (resume, callback) while a restart is in progress
+        self.usage = None
+        # approvals by id, oldest first: {"id", "tool", "summary", "detail", "can_always", "ts", "suggestions",
+        # "waiter" (daemon Client blocked in the PermissionRequest hook), "match" (tool name + input hash)}
+        self.pendings = {}
+        self.question = None
+        self.last_rollout_scan = 0.0
+        self.spawned_at = self.created
+        self.resumed_at = None
+        self.overrides = {}            # codex launch overrides: model / effort / approval / sandbox
+        self.cx_mode = {}              # codex settings from the rollout turn_context
+        self.cmode = None              # claude permission mode read from the footer
+        self.hook_mode = None          # claude permission_mode reported by hooks (fallback)
+        self.effort = None             # claude effort level from the transcript
+        self.screen = Screen(cols, rows) if kind == "claude" else None
+        self.screen_dirty = False
+        self.delete_req = None         # callback(ok) while a delete waits for the process to exit
+
+    # --- info
+    @property
+    def end(self):
+        return self.ring_start + len(self.ring)
+
+    @property
+    def pending(self):
+        """The oldest open approval (the one the UI shows)."""
+        for p in self.pendings.values():
+            return p
+        return None
+
+    @property
+    def pending_waiter(self):
+        p = self.pending
+        return p["waiter"] if p else None
+
+    def mode(self):
+        if self.kind == "claude":
+            return {"mode": self.cmode or CLAUDE_MODE_ALIAS.get(self.hook_mode, self.hook_mode) or "default",
+                    "model": (self.usage or {}).get("model") or "", "effort": self.effort or ""}
+        if self.kind == "codex":
+            return dict({"model": "", "effort": "", "approval": "", "sandbox": ""}, **self.cx_mode)
+        return {}
+
+    def info(self):
+        p = self.pending
+        return {"sid": self.sid, "kind": self.kind, "name": self.name, "title": self.title, "cwd": self.cwd,
+                "argv0": os.path.basename(self.argv[0]) if self.argv else "",
+                "status": self.status, "detail": self.detail, "attention": self.attention,
+                "created": self.created, "activity": self.activity, "pid": self.pid, "exit_code": self.exit_code,
+                "cols": self.cols, "rows": self.rows, "end": self.end, "chat_seq": self.chat_seq,
+                "preview": self.preview, "usage": self.usage,
+                "pending": {k: v for k, v in p.items() if k not in ("suggestions", "waiter", "match")} if p else None,
+                "pending_count": len(self.pendings),
+                "question": self.question, "agent_session_id": self.agent_session_id,
+                "can_resume": bool(self.agent_session_id) and self.kind in ("claude", "codex"),
+                "key": self.key, "restarts": self.restarts, "mode": self.mode(), "overrides": dict(self.overrides)}
+
+    def touch(self):
+        self.dirty = True
+
+    def set_status(self, status, detail=None, attention="keep"):
+        if status is not None:
+            self.status = status
+        if detail is not None:
+            self.detail = detail
+        if attention != "keep":
+            self.attention = attention
+        self.touch()
+
+    # --- process
+    def launch_argv(self, resume=False):
+        """Program argv: preset + codex overrides + resume + codex notification flags (claude settings added later).
+        --no-daemon etc. are NOT forced: the preset argv carries whatever the user's codex needs."""
+        argv = list(self.argv)
+        if self.kind == "codex" and self.overrides:
+            argv = codex_override_argv(argv, self.overrides)
+        if resume and self.agent_session_id:
+            if self.kind == "claude":
+                argv = argv[:1] + ["--resume", self.agent_session_id] + argv[1:]
+            elif self.kind == "codex":
+                argv = argv[:1] + ["resume", self.agent_session_id] + argv[1:]
+        if self.kind == "codex":
+            argv = argv[:1] + CODEX_FLAGS + argv[1:]
+        return argv
+
+    def spawn(self, resume=False):
+        env = {k: v for k, v in os.environ.items() if not k.startswith(STRIP_ENV)}
+        env.update({"TERM": "xterm-256color", "COLORTERM": "truecolor", "GLIMPSE_SID": self.sid,
+                    "GLIMPSE_SOCK": self.d.sock_name, "TERM_PROGRAM": "glimpse",
+                    "GLIMPSE_APPROVAL_WAIT": str(int(self.d.approval_wait))})
+        if "LANG" not in env:
+            env["LANG"] = "en_US.UTF-8" if sys.platform == "darwin" else "C.UTF-8"
+        if self.kind != "claude":
+            env.update(self.env)     # codex: export OPENAI_API_KEY=... ; claude: key goes into the settings file only
+        argv = self.launch_argv(resume)
+        if self.kind == "claude":
+            argv, self.settings_file = prepare_claude_argv(argv, self.sid, self.d.sdir, self.env,
+                                                           self.d.approval_wait)
+        shell = env.get("SHELL")
+        if not shell:
+            try:
+                import pwd
+                shell = pwd.getpwuid(os.getuid()).pw_shell
+            except (ImportError, KeyError):
+                shell = "/bin/sh"
+            env["SHELL"] = shell
+        if argv:
+            # login+interactive shell so PATH/aliases match the user's terminal; key env is exported again
+            # after the rc files ran (a `export OPENAI_API_KEY=...` in ~/.bashrc must not override the chosen key)
+            pre = ""
+            if self.kind != "claude":
+                for k in self.env:
+                    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", k):
+                        env["GLIMPSE_KEY_" + k] = self.env[k]
+                        pre += 'export %s="$GLIMPSE_KEY_%s"; unset GLIMPSE_KEY_%s; ' % (k, k, k)
+            full = [shell, "-l", "-i", "-c", pre + 'exec "$@"', "glimpse"] + argv
+        else:
+            full = [shell, "-l"]
+        cwd = self.cwd if os.path.isdir(self.cwd) else os.path.expanduser("~")
+        if os.environ.get("GLIMPSE_DEBUG"):
+            sys.stderr.write("spawn %s %s\n" % (self.sid, " ".join(a if len(a) < 80 else a[:20] + "…" for a in argv)))
+            sys.stderr.flush()
+        pid, fd = pty.fork()
+        if pid == 0:
+            try:
+                for sig in (signal.SIGPIPE, signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGCHLD):
+                    signal.signal(sig, signal.SIG_DFL)
+                os.chdir(cwd)
+                os.execvpe(full[0], full, env)
+            except Exception as e:  # pragma: no cover
+                os.write(2, ("glimpse: exec failed: %s\n" % e).encode())
+            os._exit(127)
+        self.pid, self.fd = pid, fd
+        self.spawned_at = now()
+        self.resumed_at = self.spawned_at if resume and self.agent_session_id else None
+        self.cmode = None
+        if self.screen is not None:
+            self.screen = Screen(self.cols, self.rows)
+        if self.kind == "codex":
+            self.tail = None       # a fresh codex writes a new rollout file (found by poll_tail)
+            self.transcript = None
+            if resume and self.agent_session_id:
+                # `codex resume` appends to the conversation's existing rollout
+                p = find_codex_rollout_by_id(self.agent_session_id)
+                if p:
+                    self.attach_rollout(p, import_history=not self.chat)
+        set_nonblock(fd)
+        set_cloexec(fd)
+        self._winsz()
+        self.set_status("idle" if self.kind == "shell" else "starting")
+
+    def _winsz(self):
+        if self.fd is not None:
+            try:
+                fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", self.rows, self.cols, 0, 0))
+            except OSError:
+                pass
+
+    def resize(self, cols, rows):
+        cols, rows = max(20, min(int(cols), 500)), max(5, min(int(rows), 300))
+        if (cols, rows) != (self.cols, self.rows):
+            self.cols, self.rows = cols, rows
+            if self.screen is not None:
+                self.screen.resize(cols, rows)
+            self._winsz()
+            if self.pid:
+                try:
+                    os.kill(self.pid, signal.SIGWINCH)
+                except OSError:
+                    pass
+            self.touch()
+
+    def write(self, data):
+        if self.fd is None or not data:
+            return
+        self.d.pty_write(self, data)
+
+    def user_input(self):
+        if self.attention:
+            self.attention = None
+            self.touch()
+        if self.pendings:
+            # someone is at a keyboard: hand the decisions back to claude's own dialog
+            self.release_pendings()
+            return
+        if self.status == "waiting":
+            self.set_status("running", "")
+        self.question = None
+
+    # --- approvals (claude PermissionRequest hook blocks until resolve_pending)
+    @staticmethod
+    def tool_match(tool, inp):
+        raw = json.dumps(inp, sort_keys=True, ensure_ascii=False, default=str)
+        return "%s:%s" % (tool, hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest())
+
+    def set_pending(self, ev, waiter):
+        """Parallel tool calls can each wait for approval: requests are kept by id, the oldest is shown."""
+        tool = ev.get("tool_name") or ""
+        inp = ev.get("tool_input") or {}
+        match = self.tool_match(tool, inp)
+        detail = inp.get("command") or inp.get("file_path") or inp.get("url") or ""
+        if isinstance(inp, dict) and inp.get("content") and isinstance(inp["content"], str):
+            detail = (detail + "\n\n" if detail else "") + inp["content"]
+        elif isinstance(inp, dict) and inp.get("new_string"):
+            detail = (detail + "\n\n" if detail else "") + "- " + str(inp.get("old_string", ""))[:1500] + \
+                "\n+ " + str(inp["new_string"])[:1500]
+        if not detail:
+            detail = json.dumps(inp, ensure_ascii=False, indent=1)
+        sugg = ev.get("permission_suggestions") or []
+        for old in [p for p in self.pendings.values() if p["match"] == match]:
+            self.resolve_pending(None, pid=old["id"])     # the same call asked again: the old hook is stale
+        pid = os.urandom(4).hex()
+        while pid in self.pendings:
+            pid = os.urandom(4).hex()
+        p = {"id": pid, "tool": tool, "summary": summarize_tool(tool, inp), "detail": clip(detail, 4000),
+             "can_always": bool(sugg), "ts": now(), "suggestions": sugg, "waiter": waiter, "match": match}
+        self.pendings[pid] = p
+        self.set_status("waiting", clip(self.pending["summary"], 200), "question")
+        self.event("question", "需要你确认", p["summary"])
+        if waiter is not None:
+            self.d.later(self.d.approval_wait, lambda: pid in self.pendings and self.resolve_pending(None, pid=pid))
+
+    def release_pendings(self, waiter=None):
+        """Hand every open approval (or only those of one hook client) back to the terminal."""
+        for p in list(self.pendings.values()):
+            if waiter is None or p["waiter"] is waiter:
+                self.resolve_pending(None, pid=p["id"], notify=waiter is None)
+
+    def resolve_pending(self, decision, message=None, pid=None, notify=True):
+        """decision: allow | always | deny | None (= let the terminal prompt handle it).
+        pid: which request (default the oldest). notify=False: the waiter is gone, nothing to send."""
+        p = self.pendings.get(pid) if pid else self.pending
+        if not p:
+            return False
+        out = None
+        if decision in ("allow", "always"):
+            dec = {"behavior": "allow"}
+            if decision == "always" and p.get("suggestions"):
+                dec["updatedPermissions"] = p["suggestions"]
+            out = {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": dec}}
+        elif decision == "deny":
+            out = {"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+                                          "decision": {"behavior": "deny", "message": message or "用户在手机上拒绝了"}}}
+        self.pendings.pop(p["id"], None)
+        w = p["waiter"]
+        if w is not None and notify:
+            self.d.send(w, {"t": "ok", "out": out})
+        if self.pendings:
+            nxt = self.pending
+            self.set_status("waiting", clip(nxt["summary"], 200), "question")
+        elif decision is not None:
+            self.attention = None
+            self.set_status("running", "")
+        self.touch()
+        return True
+
+    def resolve_tool_done(self, tool, inp):
+        """PostToolUse: the call ran (approved in the terminal) -> release only the matching request."""
+        match = self.tool_match(tool or "", inp or {})
+        for p in list(self.pendings.values()):
+            if p["match"] == match:
+                self.resolve_pending(None, pid=p["id"])
+                return True
+        return False
+
+    def restart(self, env, key, resume, done):
+        """Kill the process, swap env (API key), start again (optionally resuming the conversation)."""
+        if env is not None:
+            self.env = dict(env)
+            self.key = key
+        if self.fd is not None:
+            self.restart_req = (resume, done)
+            self.d.kill(self)
+        else:
+            self._respawn(resume, done)
+
+    def _respawn(self, resume, done):
+        self.restart_req = None
+        self.killed = False
+        self.exit_code = None
+        self.restarts += 1
+        self.release_pendings()
+        self.question = None
+        it = self.add_chat("system", "—— 进程已重启%s ——" % ("，恢复原对话" if resume and self.agent_session_id else ""))
+        if it:
+            self.d.send_subs(self, {"t": "chat", "sid": self.sid, "items": [it]})
+        try:
+            self.spawn(resume=resume)
+            self.d.sel.register(self.fd, selectors.EVENT_READ, ("pty", self))
+            done(None)
+        except Exception as e:
+            self.set_status("error", "重启失败: %s" % e, "error")
+            done(str(e))
+
+    def on_output(self, data):
+        self.activity = now()
+        self.ring += data
+        if len(self.ring) > RING_MAX:
+            cut = len(self.ring) - RING_MAX + 64 * 1024
+            del self.ring[:cut]
+            self.ring_start += cut
+        off = self.end - len(data)
+        # answer terminal queries (cursor position, DA, colours) if no real terminal is attached
+        scan = self.qbuf + data
+        fresh = len(self.qbuf)   # only act on sequences that end inside the new data
+        for m in QUERY_RE.finditer(scan):
+            if m.end() > fresh and not self.d.has_terminal(self):
+                self.write(query_reply(m.group(0)))
+        self.qbuf = scan[-256:]
+        i_on, i_off = scan.rfind(b"\x1b[?2004h"), scan.rfind(b"\x1b[?2004l")
+        if i_on != i_off:
+            self.paste_mode = i_on > i_off
+        for m in OSC_RE.finditer(scan):
+            if m.end() > fresh:
+                self.on_osc(m.group(1), m.group(2).decode("utf-8", "replace"))
+        self.d.send_subs(self, {"t": "out", "sid": self.sid, "off": off, "d": b64e(data)})
+        if self.screen is not None:
+            self.screen.feed(data)
+            self.screen_dirty = True     # footer re-read once per tick (output bursts)
+        if self.status == "starting" and self.kind != "claude":
+            self.set_status("idle")
+        self.touch()
+
+    def on_osc(self, code, text):
+        if code in (b"0", b"2"):
+            t = clean_title(text)
+            if t and t != self.title:
+                self.title = t
+                self.touch()
+        elif code == b"9" and not text.startswith("4;"):
+            self.on_desktop_notify(text)
+        elif code == b"777" and text.startswith("notify;"):
+            parts = text.split(";", 2)
+            self.on_desktop_notify(parts[-1] if len(parts) > 2 else "")
+
+    def on_desktop_notify(self, text):
+        if self.kind == "claude":
+            return  # hooks are authoritative for claude
+        low = text.lower()
+        if "approval" in low or "question" in low or "plan mode" in low or "wants to" in low:
+            self.set_status("waiting", clip(text, 200), "question")
+            self.event("question", "需要你确认", text)
+        elif self.kind != "codex" or self.tail is None:
+            self.set_status("idle", "", "done")
+            self.event("done", "已完成本轮", text)
+
+    def check_mode(self):
+        """Re-read claude's permission mode from the footer after an output burst."""
+        if self.screen is None or not self.screen_dirty:
+            return
+        self.screen_dirty = False
+        m = self.screen.claude_mode()
+        if m is not None and m != self.cmode:
+            self.cmode = m
+            self.touch()
+
+    def on_exit(self, code):
+        self.exit_code = code
+        self.fd = None
+        self.release_pendings()
+        if self.settings_file:
+            try:
+                os.unlink(self.settings_file)
+            except OSError:
+                pass
+            self.settings_file = None
+        if self.restart_req:
+            self.poll_tail()
+            resume, done = self.restart_req
+            self._respawn(resume, done)
+            return
+        if self.resumed_at and code not in (0, None) and not self.killed and now() - self.resumed_at < 20:
+            # `--resume` / `codex resume` failed right away (conversation not found, ...): start fresh instead
+            self.resumed_at = None
+            it = self.add_chat("system", "—— 无法恢复原对话，已开始新对话 ——")
+            if it:
+                self.d.send_subs(self, {"t": "chat", "sid": self.sid, "items": [it]})
+            self.agent_session_id = None
+            self._respawn(False, lambda err: None)
+            return
+        bad = code not in (0, None) and not self.killed
+        self.set_status("error" if bad else "exited", "exit code %s" % code, "error" if bad else "done")
+        self.poll_tail()
+        if self.delete_req:
+            # deleted while running: no exit event, just forget it once it is gone
+            cb, self.delete_req = self.delete_req, None
+            cb(self.d.forget(self.sid))
+            return
+        self.event("error" if bad else "exit", "进程异常退出 (code %s)" % code if bad else "进程已退出",
+                   self.preview or self.name)
+        # attached terminals learn about the exit right away (they are not hub clients)
+        self.d.send_subs(self, {"t": "session", "s": self.info()})
+
+    # --- chat / events
+    def add_chat(self, role, text, extra=None):
+        if not text and role not in ("tool",):
+            return None
+        self.chat_seq += 1
+        it = {"seq": self.chat_seq, "role": role, "text": clip(text, 20000), "ts": now()}
+        if extra:
+            it.update({k: v for k, v in extra.items() if v})
+        self.chat.append(it)
+        if len(self.chat) > CHAT_MAX:
+            del self.chat[: len(self.chat) - CHAT_MAX]
+        if role == "assistant":
+            self.preview = clip(text.replace("\n", " "), 300)
+        return it
+
+    def event(self, kind, title, body):
+        body = clip((body or "").strip(), 400)
+        key = (kind, body)
+        t = now()
+        if t - self.last_event.get(key, 0) < 8:
+            return
+        self.last_event[key] = t
+        self.d.broadcast({"t": "event", "sid": self.sid,
+                          "ev": {"kind": kind, "title": title, "body": body, "ts": t}})
+
+    def track_usage(self, d):
+        """Token / context usage from transcript lines (claude assistant usage, codex token_count)."""
+        if not isinstance(d, dict):
+            return
+        u = self.usage or {"model": "", "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+                           "context_used": 0, "context_window": 0, "turns": 0, "rate": None}
+        if self.tail_kind == "claude" and d.get("type") == "assistant" and not d.get("isSidechain"):
+            msg = d.get("message") or {}
+            us = msg.get("usage") or {}
+            mid = msg.get("id")
+            if not us or mid == getattr(self, "_last_mid", None):
+                return     # claude writes one line per content block with the same usage
+            self._last_mid = mid
+            if isinstance(d.get("effort"), str) and d["effort"] != self.effort:
+                self.effort = d["effort"]
+            u["model"] = msg.get("model") or u["model"]
+            u["input"] += int(us.get("input_tokens") or 0)
+            u["output"] += int(us.get("output_tokens") or 0)
+            u["cache_read"] += int(us.get("cache_read_input_tokens") or 0)
+            u["cache_write"] += int(us.get("cache_creation_input_tokens") or 0)
+            u["context_used"] = int(us.get("input_tokens") or 0) + int(us.get("cache_read_input_tokens") or 0) + \
+                int(us.get("cache_creation_input_tokens") or 0)
+            u["context_window"] = 1000000 if "[1m]" in (u["model"] or "") or u["context_used"] > 200000 else 200000
+            u["turns"] += 1
+        elif self.tail_kind == "codex":
+            p = d.get("payload") or {}
+            if d.get("type") == "session_meta":
+                self.agent_session_id = p.get("id") or p.get("session_id") or self.agent_session_id
+                return
+            if d.get("type") == "turn_context":
+                u["model"] = p.get("model") or u["model"]
+                self.cx_mode = codex_mode(p, self.cx_mode)
+            elif d.get("type") == "event_msg" and p.get("type") == "token_count" and p.get("info"):
+                info = p["info"]
+                tot = info.get("total_token_usage") or {}
+                last = info.get("last_token_usage") or {}
+                u["input"] = int(tot.get("input_tokens") or 0) - int(tot.get("cached_input_tokens") or 0)
+                u["cache_read"] = int(tot.get("cached_input_tokens") or 0)
+                u["output"] = int(tot.get("output_tokens") or 0)
+                u["context_used"] = int(last.get("input_tokens") or 0) + int(last.get("output_tokens") or 0)
+                u["context_window"] = int(info.get("model_context_window") or 0)
+                rl = p.get("rate_limits") or {}
+                prim, sec = rl.get("primary") or {}, rl.get("secondary") or {}
+                if prim or sec:
+                    u["rate"] = {"primary": prim.get("used_percent"), "secondary": sec.get("used_percent")}
+                u["turns"] += 1
+            elif d.get("type") == "event_msg" and p.get("type") == "thread_settings_applied":
+                u["model"] = (p.get("thread_settings") or {}).get("model") or u["model"]
+                return
+            else:
+                return
+        else:
+            return
+        self.usage = u
+        self.touch()
+
+    def attach_rollout(self, path, import_history=False):
+        """Follow an existing codex rollout (resumed conversation) from its current end.
+        import_history: show the last RESUME_IMPORT chat items and the usage so far, without events."""
+        self.transcript = path
+        self.tail_kind = "codex"
+        objs, end = read_jsonl_end(path) if import_history else ([], None)
+        self.tail = Tail(path, from_start=False)
+        if end is not None:
+            self.tail.pos = end      # lines written after our read are picked up by the tail
+        if not objs:
+            return
+        rows = []
+        for d in objs:
+            if isinstance(d, dict):
+                self.track_usage(d)
+                rows += [r for r in parse_codex_line(d) if not r[0].startswith("@")]
+        new = [it for it in (self.add_chat(role, text, extra) for role, text, extra in rows[-RESUME_IMPORT:]) if it]
+        if new:
+            self.d.send_subs(self, {"t": "chat", "sid": self.sid, "items": new})
+            self.touch()
+
+    def is_history(self, d):
+        """A transcript line written before this process started (claude replays the resumed file)."""
+        t = iso_ts(d.get("timestamp"))
+        return t is not None and t < self.spawned_at - 1
+
+    def poll_tail(self):
+        if self.tail is None:
+            if self.kind == "codex" and self.fd is not None and now() - self.last_rollout_scan > 2:
+                self.last_rollout_scan = now()
+                if self.resumed_at and self.agent_session_id:
+                    p = find_codex_rollout_by_id(self.agent_session_id)
+                    if p:
+                        self.attach_rollout(p, import_history=not self.chat)
+                else:
+                    p = find_codex_rollout(self.cwd, self.spawned_at, self.d.taken_rollouts())
+                    if p:
+                        self.transcript = p
+                        self.tail = Tail(p)
+                        self.tail_kind = "codex"
+            if self.tail is None:
+                return
+        new = []
+        for d in self.tail.read():
+            if not isinstance(d, dict):
+                continue
+            self.track_usage(d)
+            rows = parse_claude_line(d) if self.tail_kind == "claude" else parse_codex_line(d)
+            old = self.is_history(d)
+            if self.tail_kind == "codex" and d.get("type") == "event_msg" and not old and \
+                    (d.get("payload") or {}).get("type") == "task_started":
+                self.set_status("running", "", None)
+            for role, text, extra in rows:
+                if old and role.startswith("@"):
+                    continue          # history replay: chat and usage only, no status changes / events
+                if role.startswith("@") and new:
+                    # deliver the turn's messages before its done/error event
+                    self.d.send_subs(self, {"t": "chat", "sid": self.sid, "items": new})
+                    new = []
+                if role == "@done":
+                    self.set_status("idle", "", "done")
+                    self.event("done", "已完成本轮", text or self.preview)
+                elif role == "@error":
+                    self.set_status("error", clip(text, 200), "error")
+                    self.event("error", "出错停止", text)
+                elif role == "@aborted":
+                    self.set_status("idle", "已中断")
+                else:
+                    it = self.add_chat(role, text, extra)
+                    if it:
+                        new.append(it)
+        if new:
+            self.d.send_subs(self, {"t": "chat", "sid": self.sid, "items": new})
+            self.touch()
+
+    def set_transcript(self, path):
+        if not path or path == self.transcript:
+            return
+        if self.transcript:
+            it = self.add_chat("system", "—— 新对话 ——")
+            if it:
+                self.d.send_subs(self, {"t": "chat", "sid": self.sid, "items": [it]})
+        self.transcript = path
+        self.tail = Tail(path)
+        self.tail_kind = "claude"
+
+    def on_hook(self, ev, waiter=None):
+        """Returns True if the hook client must wait for a decision (PermissionRequest)."""
+        name = ev.get("hook_event_name")
+        if ev.get("session_id"):
+            self.agent_session_id = ev["session_id"]
+        if isinstance(ev.get("permission_mode"), str) and ev["permission_mode"] != self.hook_mode:
+            self.hook_mode = ev["permission_mode"]
+            self.touch()
+        self.set_transcript(ev.get("transcript_path"))
+        wait = False
+        if name == "SessionStart":
+            self.set_status("idle", "", None)
+        elif name == "UserPromptSubmit":
+            self.question = None
+            self.set_status("running", "", None)
+        elif name in ("PreToolUse", "PostToolUse"):
+            tool = ev.get("tool_name") or ""
+            if name == "PreToolUse" and tool == "AskUserQuestion":
+                inp = ev.get("tool_input") or {}
+                qs = inp.get("questions") or []
+                q0 = qs[0] if qs and isinstance(qs[0], dict) else {}
+                self.question = {"question": clip(q0.get("question", ""), 600), "header": q0.get("header", ""),
+                                 "options": [{"label": clip(o.get("label", ""), 120),
+                                              "description": clip(o.get("description", ""), 300)}
+                                             for o in (q0.get("options") or []) if isinstance(o, dict)][:9],
+                                 "multi": bool(q0.get("multiSelect"))}
+                q = summarize_tool(tool, inp)
+                self.set_status("waiting", clip(q, 200), "question")
+                self.event("question", "有问题需要回答", q)
+            else:
+                if name == "PostToolUse" and tool == "AskUserQuestion":
+                    self.question = None
+                if self.pendings and name == "PostToolUse":
+                    self.resolve_tool_done(tool, ev.get("tool_input"))    # answered in the terminal
+                if self.pendings:
+                    pass           # other parallel calls still wait for a decision: stay "waiting"
+                else:
+                    self.set_status("running", summarize_tool(tool, ev.get("tool_input")) if name == "PreToolUse"
+                                    else self.detail, None if self.status == "waiting" else "keep")
+        elif name == "PermissionRequest":
+            if ev.get("tool_name") == "AskUserQuestion":
+                pass   # shown as a question card; the terminal prompt handles it
+            else:
+                self.set_pending(ev, waiter)
+                wait = waiter is not None
+        elif name == "Notification":
+            nt = ev.get("notification_type") or ""
+            msg = ev.get("message") or ""
+            if nt in ("permission_prompt", "elicitation_dialog"):
+                if self.status != "waiting":
+                    self.set_status("waiting", clip(msg, 200), "question")
+                    self.event("question", "需要你确认", msg)
+        elif name == "Stop":
+            self.release_pendings()
+            self.question = None
+            self.poll_tail()
+            msg = ev.get("last_assistant_message") or self.preview
+            if msg:
+                self.preview = clip(msg.replace("\n", " "), 300)
+            self.set_status("idle", "", "done")
+            self.event("done", "已完成本轮", msg)
+        elif name == "StopFailure":
+            err = ev.get("error") or "unknown"
+            det = ev.get("error_details") or ""
+            if not isinstance(det, str):
+                det = json.dumps(det, ensure_ascii=False)
+            self.set_status("error", clip("%s %s" % (err, det), 200), "error")
+            self.event("error", "出错停止: %s" % err, det or ev.get("last_assistant_message") or "")
+        self.poll_tail()
+        return wait
+
+
+# --------------------------------------------------------------------------- daemon
+
+def peer_ok(sock):
+    """Only the same uid may talk to the daemon (Linux abstract sockets have no file permissions)."""
+    so_peercred = getattr(socket, "SO_PEERCRED", None)
+    if so_peercred is None:
+        return True      # macOS: path socket in a 0700 dir, mode 0600
+    try:
+        _pid, uid, _gid = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, so_peercred, struct.calcsize("3i")))
+    except OSError:
+        return False
+    return uid == os.getuid()
+
+
+def sys_stats(prev):
+    """load, cpu count, memory %, NIC byte rates. Returns (stats, state)."""
+    st = {"load": list(os.getloadavg()) if hasattr(os, "getloadavg") else None, "ncpu": os.cpu_count() or 1,
+          "mem_pct": None, "rx_bps": None, "tx_bps": None, "ts": now()}
+    rx = tx = None
+    try:
+        if sys.platform.startswith("linux"):
+            with open("/proc/meminfo") as f:
+                mi = dict((ln.split(":")[0], int(ln.split()[1])) for ln in f if len(ln.split()) >= 2)
+            if mi.get("MemTotal"):
+                st["mem_pct"] = round(100.0 * (1 - mi.get("MemAvailable", 0) / mi["MemTotal"]), 1)
+            rx = tx = 0
+            with open("/proc/net/dev") as f:
+                for ln in f.readlines()[2:]:
+                    name, data = ln.split(":", 1)
+                    if name.strip() == "lo":
+                        continue
+                    v = data.split()
+                    rx += int(v[0])
+                    tx += int(v[8])
+        elif sys.platform == "darwin":
+            import subprocess
+            out = subprocess.run(["netstat", "-ibn"], capture_output=True, text=True, timeout=3).stdout
+            rx = tx = 0
+            seen = set()
+            for ln in out.splitlines()[1:]:
+                v = ln.split()
+                if len(v) >= 10 and v[2].startswith("<Link") and not v[0].startswith("lo") and v[0] not in seen:
+                    seen.add(v[0])
+                    rx += int(v[6])
+                    tx += int(v[9])
+            vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=3).stdout
+            pg = 16384
+            m = re.search(r"page size of (\d+)", vm)
+            if m:
+                pg = int(m.group(1))
+            vals = dict((k.strip(), int(v.strip().rstrip("."))) for k, v in
+                        (ln.split(":", 1) for ln in vm.splitlines()[1:] if ":" in ln) if v.strip().rstrip(".").isdigit())
+            total = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True,
+                                       timeout=3).stdout.strip() or 0)
+            used = (vals.get("Pages active", 0) + vals.get("Pages wired down", 0) +
+                    vals.get("Pages occupied by compressor", 0)) * pg
+            if total:
+                st["mem_pct"] = round(100.0 * used / total, 1)
+    except Exception:
+        pass
+    if rx is not None and prev and prev[0] is not None:
+        dt = st["ts"] - prev[2]
+        if dt > 0:
+            st["rx_bps"] = max(0, (rx - prev[0]) / dt)
+            st["tx_bps"] = max(0, (tx - prev[1]) / dt)
+    return st, (rx, tx, st["ts"])
+
+
+class Client:
+    def __init__(self, sock):
+        self.sock = sock
+        self.rbuf = b""
+        self.wbuf = bytearray()
+        self.kind = None
+        self.subs = set()
+
+
+class Daemon:
+    def __init__(self, sock_name, sdir):
+        self.sock_name = sock_name     # "@name" = linux abstract socket
+        self.sdir = sdir               # None = keep no files
+        self.sessions = {}
+        self.order = []
+        self.clients = set()
+        self.sel = selectors.DefaultSelector()
+        self.timers = []
+        self.pty_wbuf = {}
+        self.idle_since = now()
+        self.host = socket.gethostname()
+        self.approval_wait = float(os.environ.get("GLIMPSE_APPROVAL_WAIT") or 600)
+        self.net_prev = None
+        self.usage_today = UsageToday()
+
+    # --- plumbing
+    def listen(self):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if self.sock_name.startswith("@"):
+            s.bind("\0" + self.sock_name[1:])
+        else:
+            # never steal the socket of a live daemon (two clients racing to start one)
+            try:
+                connect(self.sock_name, timeout=1).close()
+                raise RuntimeError("daemon already running")
+            except OSError:
+                pass
+            try:
+                os.unlink(self.sock_name)
+            except OSError:
+                pass
+            old = os.umask(0o177)
+            try:
+                s.bind(self.sock_name)
+            finally:
+                os.umask(old)
+        s.listen(16)
+        s.setblocking(False)
+        set_cloexec(s.fileno())
+        self.lsock = s
+        self.sel.register(s, selectors.EVENT_READ, ("listen", None))
+
+    def _mask(self, c):
+        return selectors.EVENT_READ | (selectors.EVENT_WRITE if c.wbuf else 0)
+
+    def send(self, c, obj):
+        if c not in self.clients:
+            return
+        # "replace": transcripts can contain lone surrogates (strings cut mid-emoji)
+        c.wbuf += (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8", "replace")
+        if len(c.wbuf) > 32 * 1024 * 1024:
+            self.drop(c)
+            return
+        self._flush(c)
+
+    def _flush(self, c):
+        try:
+            while c.wbuf:
+                n = c.sock.send(c.wbuf[:262144])
+                del c.wbuf[:n]
+        except (BlockingIOError, InterruptedError):
+            pass
+        except OSError:
+            self.drop(c)
+            return
+        try:
+            self.sel.modify(c.sock, self._mask(c), ("client", c))
+        except (KeyError, ValueError):
+            pass
+
+    def drop(self, c):
+        if c not in self.clients:
+            return
+        self.clients.discard(c)
+        for sid in c.subs:
+            s = self.sessions.get(sid)
+            if s:
+                s.subs.discard(c)
+        for s in self.sessions.values():
+            if s.pendings:
+                s.release_pendings(waiter=c)   # its hook process died (claude timeout, Ctrl-C ...)
+        try:
+            self.sel.unregister(c.sock)
+        except (KeyError, ValueError):
+            pass
+        c.sock.close()
+
+    def broadcast(self, obj):
+        for c in list(self.clients):
+            if c.kind == "hub":
+                self.send(c, obj)
+
+    def send_subs(self, s, obj):
+        for c in list(s.subs):
+            self.send(c, obj)
+
+    def has_terminal(self, s):
+        return any(c.kind == "attach" for c in s.subs)
+
+    def taken_rollouts(self):
+        return {s.transcript for s in self.sessions.values() if s.transcript}
+
+    def pty_write(self, s, data):
+        buf = self.pty_wbuf.setdefault(s.sid, bytearray())
+        buf += data
+        self._pty_flush(s)
+
+    def _pty_flush(self, s):
+        buf = self.pty_wbuf.get(s.sid)
+        if s.fd is None:
+            self.pty_wbuf.pop(s.sid, None)
+            return
+        try:
+            while buf:
+                n = os.write(s.fd, bytes(buf[:4096]))
+                del buf[:n]
+        except (BlockingIOError, InterruptedError):
+            pass
+        except OSError:
+            buf.clear()
+        try:
+            self.sel.modify(s.fd, selectors.EVENT_READ | (selectors.EVENT_WRITE if buf else 0), ("pty", s))
+        except (KeyError, ValueError):
+            pass
+
+    def later(self, delay, fn):
+        self.timers.append((now() + delay, fn))
+
+    # --- sessions
+    def session_list(self):
+        return [self.sessions[k].info() for k in self.order if k in self.sessions]
+
+    def create(self, kind, cwd, name, args, cols, rows, env=None, key=None, resume_id=None):
+        if kind not in DEFAULT_PRESETS:
+            raise RuntimeError("unknown kind %r" % kind)
+        if resume_id is not None:
+            if kind not in ("claude", "codex") or not isinstance(resume_id, str) or not ID_RE.match(resume_id):
+                raise RuntimeError("无效的对话 id")
+            for o in self.sessions.values():
+                if o.agent_session_id == resume_id and o.fd is not None:
+                    raise RuntimeError("这个对话已经在会话 %s 中运行" % o.sid)
+        argv = list(args) if args else list(DEFAULT_PRESETS[kind]["argv"])
+        argv = [os.path.expanduser(a) if a.startswith("~/") else a for a in argv]
+        if args and kind != "shell" and argv[0] != kind and not os.path.isabs(argv[0]):
+            argv = DEFAULT_PRESETS[kind]["argv"] + argv   # args given without the program name
+        cwd = os.path.abspath(os.path.expanduser(cwd or "~"))
+        if not os.path.isdir(cwd):
+            raise RuntimeError("目录不存在: %s" % cwd)
+        sid = os.urandom(3).hex()
+        while sid in self.sessions:
+            sid = os.urandom(3).hex()
+        nm = name or "%s · %s" % (kind, os.path.basename(cwd) or cwd)
+        s = Session(self, sid, kind, nm, cwd, argv, int(cols or 100), int(rows or 32))
+        if env:
+            s.env = {str(k): str(v) for k, v in env.items()}
+        s.key = key
+        if resume_id:
+            s.agent_session_id = resume_id
+        self.sessions[sid] = s          # before spawn: a resumed rollout is imported with send_subs etc.
+        try:
+            s.spawn(resume=bool(resume_id))
+        except Exception:
+            del self.sessions[sid]
+            raise
+        self.order.append(sid)
+        self.sel.register(s.fd, selectors.EVENT_READ, ("pty", s))
+        self.gc_exited()
+        return s
+
+    def gc_exited(self):
+        dead = [k for k in self.order if self.sessions[k].fd is None]
+        for k in dead[:-EXITED_MAX] if len(dead) > EXITED_MAX else []:
+            self.forget(k)
+
+    def forget(self, sid):
+        s = self.sessions.get(sid)
+        if not s or s.fd is not None:
+            return False
+        del self.sessions[sid]
+        self.order.remove(sid)
+        self.broadcast({"t": "gone", "sid": sid})
+        return True
+
+    def kill(self, s):
+        if s.pid and s.fd is not None:
+            s.killed = True
+            for sig in (signal.SIGHUP, signal.SIGTERM):
+                try:
+                    os.killpg(os.getpgid(s.pid), sig)
+                except OSError:
+                    try:
+                        os.kill(s.pid, sig)
+                    except OSError:
+                        pass
+
+            def hard(pid=s.pid, ss=s):
+                if ss.fd is not None and ss.pid == pid:
+                    try:
+                        os.killpg(os.getpgid(pid), signal.SIGKILL)
+                    except OSError:
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except OSError:
+                            pass
+            self.later(3, hard)
+
+    def type_text(self, s, text):
+        text = text.replace("\r\n", "\n")
+        if s.paste_mode:
+            s.write(b"\x1b[200~" + text.encode() + b"\x1b[201~")
+            self.later(0.35, lambda: s.write(b"\r"))
+        else:
+            s.write(text.replace("\n", "\r").encode())
+            self.later(0.15, lambda: s.write(b"\r"))
+
+    def delete(self, s, done):
+        """Forget a session; a running one is killed first and forgotten once it exited."""
+        if s.fd is None:
+            done(self.forget(s.sid))
+            return
+        s.restart_req = None             # a pending restart must not bring it back
+        s.delete_req = done
+        self.kill(s)
+
+    def control(self, s, action, value, done):
+        """Session controls from the phone: claude mode / model / effort / goal, codex launch overrides."""
+        value = "" if value is None else value
+        if not isinstance(value, str):
+            raise RuntimeError("bad value")
+        value = value.strip()
+        if s.kind == "claude":
+            if s.fd is None:
+                raise RuntimeError("会话没有在运行")
+            if action == "mode":
+                target = CLAUDE_MODE_ALIAS.get(value, value)
+                if target not in CLAUDE_MODES:
+                    raise RuntimeError("未知模式 %s" % value)
+                self.cycle_mode(s, target, done)
+                return
+            if action == "model":
+                if not VALUE_RE.match(value):
+                    raise RuntimeError("无效的模型名")
+                cmd = "/model " + value
+            elif action == "effort":
+                if value not in CLAUDE_EFFORTS:
+                    raise RuntimeError("无效的推理强度 %s" % value)
+                cmd = "/effort " + value
+            elif action == "goal":
+                goal = clip(re.sub(r"[\x00-\x1f\x7f]+", " ", value).strip(), 2000)
+                cmd = "/goal " + (goal or "clear")
+            else:
+                raise RuntimeError("未知操作 %s" % action)
+            # one slash command at a time: the next one waits until the previous Enter was sent
+            t = now()
+            wait = max(0.0, getattr(s, "type_busy", 0) - t)
+            s.type_busy = t + wait + 0.8
+            if wait:
+                self.later(wait, lambda: s.fd is not None and self.type_text(s, cmd))
+            else:
+                self.type_text(s, cmd)
+            done(None)
+        elif s.kind == "codex":
+            if action not in CODEX_OVERRIDES:
+                raise RuntimeError("未知操作 %s" % action)
+            if value and not VALUE_RE.match(value):
+                raise RuntimeError("无效的值")
+            if value:
+                s.overrides[action] = value
+            else:
+                s.overrides.pop(action, None)   # back to the preset / config.toml default
+            s.touch()
+            s.restart(None, None, True, done)   # codex reads these at start: restart and resume
+        else:
+            raise RuntimeError("只有 Claude / Codex 会话支持")
+
+    def cycle_mode(self, s, target, done, tries=6, gap=0.3):
+        """Press Shift+Tab until claude's footer shows the target mode (best effort)."""
+        def step(left):
+            s.check_mode()
+            if s.fd is None:
+                done("会话已退出")
+            elif (s.cmode or "default") == target:
+                done(None)
+            elif left <= 0:
+                done("没能切换到 %s（当前 %s），请在终端里按 Shift+Tab" % (target, s.cmode or "未知"))
+            else:
+                s.write(SHIFT_TAB)
+                self.later(gap, lambda: step(left - 1))
+        step(tries)
+
+    def replay(self, s, off, chat_from):
+        if off is None or off < s.ring_start or off > s.end:
+            reset = True
+            start = max(s.ring_start, s.end - DEFAULT_REPLAY) if off is None or off > s.end else s.ring_start
+        else:
+            reset, start = False, off
+        data = bytes(s.ring[start - s.ring_start:])
+        if chat_from is None or (s.chat and chat_from < s.chat[0]["seq"] and chat_from <= s.chat_seq - len(s.chat)) \
+                or chat_from > s.chat_seq + 1:
+            chat, creset = s.chat[-400:], True
+        else:
+            chat, creset = [c for c in s.chat if c["seq"] >= chat_from], False
+        return {"t": "replay", "sid": s.sid, "off": start, "end": s.end, "reset": reset, "d": b64e(data),
+                "chat": chat, "chat_reset": creset}
+
+    # --- requests
+    def handle(self, c, m):
+        if not isinstance(m, dict):
+            return
+        op = m.get("op")
+        req = m.get("req")
+        sid = m.get("sid")
+        s = self.sessions.get(sid) if isinstance(sid, str) else None
+        try:
+            if op == "hello":
+                c.kind = m.get("client") or "cli"
+                self.send(c, {"t": "hello", "version": VERSION, "host": self.host, "pid": os.getpid(),
+                              "sessions": self.session_list()})
+            elif op == "list":
+                self.send(c, {"t": "list", "req": req, "sessions": self.session_list()})
+            elif op == "ping":
+                self.send(c, {"t": "pong", "req": req})
+            elif op == "history":
+                kind = m.get("kind") if m.get("kind") in ("claude", "codex") else None
+                owned = [o.agent_session_id for o in self.sessions.values() if o.agent_session_id and o.fd is not None]
+                self.send(c, {"t": "history", "req": req, "items": list_history(kind, m.get("limit") or 30, owned)})
+            elif op == "usage_today":
+                self.send(c, dict(self.usage_today.scan(), t="usage_today", req=req))
+            elif op == "create":
+                ns = self.create(m.get("kind") or "claude", m.get("cwd"), m.get("name"), m.get("args"),
+                                 m.get("cols"), m.get("rows"), m.get("env"), m.get("key"), m.get("resume_id") or None)
+                self.send(c, {"t": "created", "req": req, "s": ns.info()})
+                self.broadcast({"t": "session", "s": ns.info()})
+                ns.dirty = False
+            elif op == "hook":
+                if os.environ.get("GLIMPSE_DEBUG"):
+                    ev = m.get("ev") or {}
+                    sys.stderr.write("hook %s %s %s\n" % (sid, ev.get("hook_event_name"), ev.get("tool_name") or ""))
+                    sys.stderr.flush()
+                waiting = False
+                if s:
+                    waiting = s.on_hook(m.get("ev") or {}, c if m.get("wait") else None)
+                if not waiting:
+                    self.send(c, {"t": "ok"})
+            elif op == "stats":
+                st, self.net_prev = sys_stats(self.net_prev)
+                self.send(c, {"t": "stats", "req": req, "stats": st})
+            elif s is None:
+                if op in ("sub", "unsub", "in", "text", "resize", "kill", "forget", "rename", "ack", "replay",
+                          "approve", "restart", "control", "delete"):
+                    self.send(c, {"t": "error", "req": req, "sid": sid, "msg": "no such session %s" % sid})
+                else:
+                    self.send(c, {"t": "error", "req": req, "msg": "unknown op %r" % op})
+            elif op == "sub":
+                s.subs.add(c)
+                c.subs.add(sid)
+            elif op == "unsub":
+                s.subs.discard(c)
+                c.subs.discard(sid)
+            elif op == "replay":
+                r = self.replay(s, m.get("off"), m.get("chat_from"))
+                r["req"] = req
+                self.send(c, r)
+            elif op == "in":
+                if m.get("cols") and m.get("rows"):
+                    s.resize(m["cols"], m["rows"])
+                data = base64.b64decode(m.get("d") or "")
+                if c.kind != "attach":
+                    data = RESPONSE_RE.sub(b"", data)
+                if data:
+                    s.write(data)
+                    if is_user_keys(data):
+                        s.user_input()
+            elif op == "text":
+                self.type_text(s, m.get("text") or "")
+                s.user_input()
+            elif op == "resize":
+                s.resize(m.get("cols") or s.cols, m.get("rows") or s.rows)
+            elif op == "kill":
+                self.kill(s)
+            elif op == "forget":
+                if not self.forget(sid):
+                    self.send(c, {"t": "error", "req": req, "msg": "session still running"})
+            elif op == "delete":
+                def deleted(ok, c=c, req=req, sid=sid):
+                    self.send(c, {"t": "ok", "req": req, "sid": sid} if ok else
+                              {"t": "error", "req": req, "sid": sid, "msg": "删除失败"})
+                self.delete(s, deleted)
+            elif op == "control":
+                def controlled(err, c=c, req=req, sid=sid):
+                    self.send(c, {"t": "error", "req": req, "sid": sid, "msg": err} if err else
+                              {"t": "ok", "req": req, "sid": sid})
+                self.control(s, m.get("action"), m.get("value"), controlled)
+            elif op == "rename":
+                s.name = clip(m.get("name") or s.name, 80)
+                s.touch()
+            elif op == "ack":
+                s.attention = None
+                s.touch()
+            elif op == "approve":
+                dec = m.get("decision")
+                pid = m.get("id") if isinstance(m.get("id"), str) else (s.pending or {}).get("id")
+                if not pid or pid not in s.pendings:
+                    self.send(c, {"t": "error", "req": req, "sid": sid, "msg": "这个授权请求已经处理过了"})
+                elif dec == "terminal":
+                    s.resolve_pending(None, pid=pid)
+                    self.send(c, {"t": "ok", "req": req})
+                elif dec in ("allow", "always", "deny"):
+                    s.resolve_pending(dec, m.get("message"), pid=pid)
+                    self.send(c, {"t": "ok", "req": req})
+                else:
+                    self.send(c, {"t": "error", "req": req, "msg": "bad decision"})
+            elif op == "restart":
+                if s.kind not in ("claude", "codex"):
+                    raise RuntimeError("只有 Claude / Codex 会话可以更换 Key 重启")
+                env = m.get("env")
+                if env is not None and not isinstance(env, dict):
+                    raise RuntimeError("bad env")
+
+                def done(err, c=c, req=req, sid=sid):
+                    self.send(c, {"t": "error", "req": req, "sid": sid, "msg": err} if err else
+                              {"t": "restarted", "req": req, "sid": sid})
+                s.restart(env, m.get("key"), bool(m.get("resume", True)), done)
+            else:
+                self.send(c, {"t": "error", "req": req, "msg": "unknown op %r" % op})
+        except Exception as e:
+            self.send(c, {"t": "error", "req": req, "msg": str(e)})
+
+    # --- loop
+    def reap(self):
+        while True:
+            try:
+                pid, st = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                return
+            if pid == 0:
+                return
+            code = os.waitstatus_to_exitcode(st) if hasattr(os, "waitstatus_to_exitcode") else (st >> 8)
+            for s in list(self.sessions.values()):     # on_exit may forget a deleted session
+                if s.pid == pid and s.fd is not None:
+                    self._close_pty(s)
+                    s.on_exit(code)
+                    s.pid_exit = True
+
+    def _close_pty(self, s):
+        if s.fd is None:
+            return
+        # drain anything left
+        try:
+            while True:
+                d = os.read(s.fd, 65536)
+                if not d:
+                    break
+                s.on_output(d)
+        except OSError:
+            pass
+        try:
+            self.sel.unregister(s.fd)
+        except (KeyError, ValueError):
+            pass
+        try:
+            os.close(s.fd)
+        except OSError:
+            pass
+        s.fd = None
+        self.pty_wbuf.pop(s.sid, None)
+
+    def tick(self):
+        t = now()
+        due = [x for x in self.timers if x[0] <= t]
+        self.timers = [x for x in self.timers if x[0] > t]
+        for _, fn in due:
+            try:
+                fn()
+            except Exception as e:
+                sys.stderr.write("glimpse timer error: %s\n" % e)
+        for s in list(self.sessions.values()):
+            try:
+                s.poll_tail()
+                s.check_mode()
+            except Exception as e:
+                sys.stderr.write("glimpse tail error: %s\n" % e)
+            if s.dirty and t - s.last_bcast >= 0.25:
+                info = s.info()
+                key = json.dumps({k: v for k, v in info.items() if k not in ("activity", "end", "chat_seq")},
+                                 sort_keys=True)
+                # pure activity updates are rate limited harder than real state changes
+                if key == s.last_key and t - s.last_bcast < 2:
+                    continue
+                s.dirty = False
+                s.last_bcast = t
+                s.last_key = key
+                self.broadcast({"t": "session", "s": info})
+                for c in list(s.subs):
+                    if c.kind == "attach":      # hub clients got it from broadcast already
+                        self.send(c, {"t": "session", "s": info})
+
+    def run(self, idle_exit=None):
+        self.listen()
+        self.run_listening(idle_exit)
+
+    def run_listening(self, idle_exit=None):
+        signal.signal(signal.SIGCHLD, lambda *a: None)
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+        last_tick = 0
+        while True:
+            try:
+                events = self.sel.select(timeout=0.25)
+            except InterruptedError:
+                events = []
+            for key, mask in events:
+                kind, obj = key.data
+                if kind == "listen":
+                    try:
+                        cs, _ = self.lsock.accept()
+                    except OSError:
+                        continue
+                    if not peer_ok(cs):
+                        cs.close()
+                        continue
+                    cs.setblocking(False)
+                    set_cloexec(cs.fileno())
+                    c = Client(cs)
+                    self.clients.add(c)
+                    self.sel.register(cs, selectors.EVENT_READ, ("client", c))
+                elif kind == "client":
+                    c = obj
+                    if mask & selectors.EVENT_WRITE:
+                        self._flush(c)
+                    if mask & selectors.EVENT_READ and c in self.clients:
+                        try:
+                            d = c.sock.recv(262144)
+                        except (BlockingIOError, InterruptedError):
+                            continue
+                        except OSError:
+                            d = b""
+                        if not d:
+                            self.drop(c)
+                            continue
+                        c.rbuf += d
+                        while b"\n" in c.rbuf and c in self.clients:
+                            line, c.rbuf = c.rbuf.split(b"\n", 1)
+                            if line.strip():
+                                try:
+                                    m = json.loads(line)
+                                except ValueError:
+                                    continue
+                                self.handle(c, m)
+                elif kind == "pty":
+                    s = obj
+                    if s.fd is None:
+                        continue
+                    if mask & selectors.EVENT_WRITE:
+                        self._pty_flush(s)
+                    if mask & selectors.EVENT_READ:
+                        try:
+                            d = os.read(s.fd, 65536)
+                        except (BlockingIOError, InterruptedError):
+                            continue
+                        except OSError:
+                            d = b""
+                        if d:
+                            s.on_output(d)
+                        else:
+                            # EOF: child closed the pty; reap() will deliver the exit code
+                            try:
+                                self.sel.unregister(s.fd)
+                            except (KeyError, ValueError):
+                                pass
+            self.reap()
+            if now() - last_tick >= 0.2:
+                last_tick = now()
+                self.tick()
+            if idle_exit:
+                busy = self.clients or any(s.fd is not None for s in self.sessions.values())
+                if busy:
+                    self.idle_since = now()
+                elif now() - self.idle_since > idle_exit:
+                    return
+
+
+# --------------------------------------------------------------------------- client side
+
+# exec()'d from an ssh one-liner: no script file exists, keep no files on that machine
+BOOTSTRAP = "__file__" not in globals()
+
+
+def daemon_addr():
+    if BOOTSTRAP and sys.platform.startswith("linux"):
+        return "@glimpse-%d" % os.getuid(), None
+    sdir = state_dir()
+    return sock_path(), sdir
+
+
+def connect(addr, timeout=None):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    if timeout:
+        s.settimeout(timeout)
+    s.connect("\0" + addr[1:] if addr.startswith("@") else addr)
+    if addr.startswith("@") and not peer_ok(s):
+        # anyone can bind an abstract name first: never talk to another user's "daemon"
+        s.close()
+        raise OSError("glimpse: %s is owned by another user" % addr)
+    s.settimeout(None)
+    return s
+
+
+def start_daemon(addr, sdir):
+    """Fork a detached daemon (works without a script file, i.e. when bootstrapped over ssh)."""
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(r)
+            os.setsid()
+            if os.fork() != 0:
+                os._exit(0)
+            devnull = os.open(os.devnull, os.O_RDWR)
+            logf = devnull
+            if sdir:
+                logf = os.open(os.path.join(sdir, "agent.log"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            os.dup2(devnull, 0)
+            os.dup2(logf, 1)
+            os.dup2(logf, 2)
+            os.closerange(3, w)
+            os.closerange(w + 1, 65536)
+            d = Daemon(addr, sdir)
+            d.listen()
+            os.write(w, b"1")
+            os.close(w)
+            d.run_listening()
+        except BaseException as e:  # pragma: no cover
+            try:
+                sys.stderr.write("glimpse daemon died: %r\n" % (e,))
+            except Exception:
+                pass
+        os._exit(0)
+    os.close(w)
+    os.waitpid(pid, 0)
+    ok = os.read(r, 1)
+    os.close(r)
+    return ok == b"1"
+
+
+def ensure_daemon():
+    addr, sdir = daemon_addr()
+    for attempt in range(3):
+        try:
+            return connect(addr, timeout=3)
+        except OSError:
+            pass
+        if attempt == 0:
+            start_daemon(addr, sdir)
+        time.sleep(0.2)
+    raise SystemExit("glimpse: cannot reach or start the agent daemon at %s" % addr)
+
+
+class Conn:
+    """Small blocking JSON-lines client."""
+
+    def __init__(self, sock):
+        self.s = sock
+        self.buf = b""
+
+    def send(self, obj):
+        self.s.sendall((json.dumps(obj) + "\n").encode())
+
+    def recv(self, timeout=None):
+        while b"\n" not in self.buf:
+            if timeout is not None:
+                r, _, _ = select.select([self.s], [], [], timeout)
+                if not r:
+                    return None
+            d = self.s.recv(262144)
+            if not d:
+                raise EOFError
+            self.buf += d
+        line, self.buf = self.buf.split(b"\n", 1)
+        return json.loads(line)
+
+    def call(self, obj, want):
+        self.send(obj)
+        while True:
+            m = self.recv()
+            if m.get("t") in want or (m.get("t") == "error" and m.get("req") == obj.get("req")):
+                return m
+
+
+def cmd_bridge():
+    """stdio <-> daemon socket byte pump. Exits when either side closes; the daemon keeps running."""
+    s = ensure_daemon()
+    s.setblocking(False)
+    out = sys.stdout.fileno()
+    inp = sys.stdin.fileno()
+    set_nonblock(inp)
+    pending = bytearray()
+    while True:
+        r, _, _ = select.select([s, inp], [], [])
+        if inp in r:
+            try:
+                d = os.read(inp, 262144)
+            except (BlockingIOError, InterruptedError):
+                d = None
+            if d == b"":
+                return
+            if d:
+                pending += d
+        if s in r:
+            try:
+                d = s.recv(262144)
+            except (BlockingIOError, InterruptedError):
+                d = None
+            if d == b"":
+                return
+            if d:
+                mv = memoryview(d)
+                while mv:
+                    try:
+                        n = os.write(out, mv)
+                        mv = mv[n:]
+                    except BlockingIOError:
+                        select.select([], [out], [])
+        while pending:
+            try:
+                n = s.send(pending)
+                del pending[:n]
+            except BlockingIOError:
+                select.select([], [s], [])
+
+
+def cmd_hook():
+    data = sys.stdin.read()
+    sid = os.environ.get("GLIMPSE_SID")
+    if not sid:
+        return
+    try:
+        ev = json.loads(data or "{}")
+        c = Conn(connect(os.environ.get("GLIMPSE_SOCK") or daemon_addr()[0], timeout=3))
+        c.send({"op": "hook", "sid": sid, "ev": ev})
+        c.recv(timeout=3)
+    except Exception:
+        pass
+
+
+def fmt_age(t):
+    d = int(now() - t)
+    return "%ds" % d if d < 60 else "%dm" % (d // 60) if d < 3600 else "%dh" % (d // 3600)
+
+
+def cmd_ls():
+    c = Conn(ensure_daemon())
+    m = c.call({"op": "hello", "client": "cli"}, ("hello",))
+    rows = m["sessions"]
+    if not rows:
+        print("no sessions")
+    for s in rows:
+        print("%-7s %-7s %-8s %-6s %-30s %s" % (s["sid"], s["kind"], s["status"], fmt_age(s["activity"]),
+                                                 clip(s["name"], 30), s["cwd"]))
+
+
+def term_size():
+    try:
+        rows, cols = struct.unpack("HH", fcntl.ioctl(1, termios.TIOCGWINSZ, b"\0" * 4))
+        if rows and cols:
+            return cols, rows
+    except OSError:
+        pass
+    return 100, 32
+
+
+def pick_live(sessions):
+    """Most recently active session that still has a process, or None."""
+    live = [s for s in sessions if s.get("pid") and s.get("exit_code") is None and s.get("status") != "exited"]
+    return max(live, key=lambda s: s.get("activity") or 0) if live else None
+
+
+def attach(sid=None):
+    import tty
+    c = Conn(ensure_daemon())
+    hello = c.call({"op": "hello", "client": "attach"}, ("hello",))
+    if not sid:
+        s = pick_live(hello.get("sessions") or [])
+        if s is None:
+            raise SystemExit("glimpse: no running session (start one: glimpse run claude)")
+        sid = s["sid"]
+        print("[glimpse] attaching %s  %s" % (sid, s.get("name") or ""))
+    elif sid not in [s["sid"] for s in hello.get("sessions") or []]:
+        # exit code 3 = not on this machine (the launcher may then try through the hub)
+        sys.stderr.write("glimpse: no such session %s here (glimpse ls)\n" % sid)
+        raise SystemExit(3)
+    cols, rows = term_size()
+    c.send({"op": "resize", "sid": sid, "cols": cols, "rows": rows})
+    c.send({"op": "sub", "sid": sid})
+    r = c.call({"op": "replay", "req": 1, "sid": sid, "off": None}, ("replay",))
+    if r.get("t") == "error":
+        raise SystemExit(r.get("msg"))
+    out = sys.stdout.buffer
+    out.write(b"\x1b[H\x1b[2J" + base64.b64decode(r["d"]))
+    out.flush()
+    pos = r["end"]
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    winch = [False]
+    signal.signal(signal.SIGWINCH, lambda *a: winch.__setitem__(0, True))
+    tty.setraw(fd)
+    reason = "detached"
+    try:
+        while True:
+            if winch[0]:
+                winch[0] = False
+                cols, rows = term_size()
+                c.send({"op": "resize", "sid": sid, "cols": cols, "rows": rows})
+            try:
+                rr, _, _ = select.select([c.s, fd], [], [], 0.5)
+            except InterruptedError:
+                continue
+            if fd in rr:
+                d = os.read(fd, 65536)
+                if not d or DETACH_KEY in d:
+                    break
+                cols, rows = term_size()
+                c.send({"op": "in", "sid": sid, "d": b64e(d), "cols": cols, "rows": rows})
+            if c.s in rr or b"\n" in c.buf:
+                try:
+                    m = c.recv(timeout=0)
+                except EOFError:
+                    reason = "daemon closed"
+                    break
+                while m is not None:
+                    if m.get("t") == "out" and m.get("sid") == sid:
+                        data = base64.b64decode(m["d"])
+                        skip = pos - m["off"]
+                        if skip < len(data):
+                            out.write(data[max(0, skip):])
+                            out.flush()
+                            pos = m["off"] + len(data)
+                    elif m.get("t") == "session" and m["s"]["sid"] == sid and m["s"]["status"] in ("exited", "error") \
+                            and m["s"].get("exit_code") is not None:
+                        # ("error" without an exit code = a failed turn, the process still runs)
+                        reason = "session exited (code %s)" % m["s"]["exit_code"]
+                    m = c.recv(timeout=0) if b"\n" in c.buf else None
+                if reason.startswith("session exited"):
+                    break
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    sys.stdout.write("\r\n[glimpse] %s: %s\r\n" % (reason, sid))
+
+
+def cmd_run(argv):
+    import argparse
+    ap = argparse.ArgumentParser(prog="glimpse run", description="start an AI coding session that the phone can see")
+    ap.add_argument("kind", choices=sorted(DEFAULT_PRESETS))
+    ap.add_argument("-n", "--name")
+    ap.add_argument("-C", "--cwd", default=os.getcwd())
+    ap.add_argument("-d", "--detach", action="store_true", help="do not attach this terminal")
+    ap.add_argument("-r", "--resume", metavar="ID", help="continue this claude session id / codex thread id")
+    extra = []
+    if "--" in argv:                       # everything after -- goes to claude / codex untouched
+        i = argv.index("--")
+        argv, extra = argv[:i], argv[i + 1:]
+    a = ap.parse_args(argv)
+    if a.resume and a.kind == "shell":
+        ap.error("--resume needs claude or codex")
+    args = extra
+    # same launch preset as the phone uses: config.json -> machines[type=local].presets[kind].argv
+    base = list(DEFAULT_PRESETS[a.kind]["argv"])
+    try:
+        with open(os.environ.get("GLIMPSE_CONFIG") or os.path.join(project_dir(), "config.json")) as f:
+            for mc in json.load(f).get("machines") or []:
+                if mc.get("type") == "local":
+                    pre = (mc.get("presets") or {}).get(a.kind)
+                    pre = pre.get("argv") if isinstance(pre, dict) else pre
+                    if isinstance(pre, list):
+                        base = [str(x) for x in pre]
+                    break
+    except (OSError, ValueError):
+        pass
+    c = Conn(ensure_daemon())
+    c.call({"op": "hello", "client": "cli"}, ("hello",))
+    cols, rows = term_size()
+    full = (base + args) if (base or args) else None
+    if a.kind == "shell" and not full:
+        full = None                        # interactive login shell
+    m = c.call({"op": "create", "req": 1, "kind": a.kind, "cwd": a.cwd, "name": a.name, "args": full,
+                "cols": cols, "rows": rows, "resume_id": a.resume or None}, ("created",))
+    if m.get("t") == "error":
+        raise SystemExit("glimpse: " + m.get("msg", "error"))
+    sid = m["s"]["sid"]
+    print("[glimpse] session %s started (detach: Ctrl-], re-attach: glimpse attach %s)" % (sid, sid))
+    if not a.detach:
+        time.sleep(0.1)
+        attach(sid)
+
+
+def cmd_history(argv, adopt=False):
+    """List recent claude / codex conversations; adopt: pick one and continue it in a session."""
+    kind = argv[0] if argv and argv[0] in ("claude", "codex") else None
+    c = Conn(ensure_daemon())
+    c.call({"op": "hello", "client": "cli"}, ("hello",))
+    m = c.call({"op": "history", "req": 1, "kind": kind, "limit": 30}, ("history",))
+    items = m.get("items") or []
+    if not items:
+        print("no recent conversations")
+        return
+    home = os.path.expanduser("~")
+    for i, it in enumerate(items, 1):
+        cwd = it["cwd"].replace(home, "~", 1) if it["cwd"].startswith(home) else it["cwd"]
+        print("%3d  %-6s %-5s %s%-40s %s" % (i, it["kind"], fmt_age(it["updated"]), "* " if it["active"] else "  ",
+                                             clip(it["title"], 40), cwd))
+        if not adopt:
+            print("     glimpse run %s --resume %s" % (it["kind"], it["id"]))
+    if any(it["active"] for it in items):
+        print("* = written in the last 2 minutes, probably still open in another terminal (close it first)")
+    if not adopt:
+        return
+    try:
+        ans = input("continue which one (number, empty = cancel)? ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if not ans.isdigit() or not 1 <= int(ans) <= len(items):
+        return
+    it = items[int(ans) - 1]
+    c.s.close()
+    cwd = it["cwd"] if it["cwd"] and os.path.isdir(it["cwd"]) else os.getcwd()
+    cmd_run([it["kind"], "--resume", it["id"], "-C", cwd, "-n", clip(it["title"], 40)])
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    cmd = argv[0] if argv else "help"
+    if cmd == "daemon":
+        addr, sdir = daemon_addr()
+        try:
+            connect(addr, timeout=1).close()
+            print("daemon already running at %s" % addr)
+            return
+        except OSError:
+            pass
+        Daemon(addr, sdir).run()
+    elif cmd == "bridge":
+        cmd_bridge()
+    elif cmd == "hook":
+        cmd_hook()
+    elif cmd == "ls":
+        cmd_ls()
+    elif cmd == "run":
+        cmd_run(argv[1:])
+    elif cmd == "attach":
+        attach(argv[1] if len(argv) > 1 else None)
+    elif cmd in ("history", "adopt"):
+        cmd_history(argv[1:], adopt=cmd == "adopt")
+    elif cmd in ("kill", "forget") and len(argv) > 1:
+        c = Conn(ensure_daemon())
+        c.call({"op": "hello", "client": "cli"}, ("hello",))
+        c.send({"op": cmd, "sid": argv[1]})
+        m = c.recv(timeout=0.5)
+        if m and m.get("t") == "error":
+            raise SystemExit("glimpse: " + m["msg"])
+    elif cmd == "version":
+        print(VERSION)
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

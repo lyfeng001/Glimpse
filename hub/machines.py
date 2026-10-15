@@ -1,0 +1,237 @@
+"""Connections from the hub to the Glimpse agent on each machine (local subprocess or ssh)."""
+import asyncio
+import base64
+import json
+import logging
+import os
+import sys
+import time
+import zlib
+
+log = logging.getLogger("glimpse.machines")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+AGENT = os.path.join(ROOT, "agent", "glimpse_agent.py")
+# The agent source is sent zlib+base64 on the first stdin line and exec'd in memory:
+# nothing is installed on the remote machine. `or b"\n"` stops the read loop on EOF.
+REMOTE_CMD = ("python3 -u -c 'import os,sys,zlib,base64;sys.argv=[\"glimpse\",\"bridge\"];"
+              "exec(compile(zlib.decompress(base64.b64decode(b\"\".join(iter(lambda:os.read(0,1) or b\"\\n\",b\"\\n\")))),"
+              "\"glimpse_agent\",\"exec\"))'")
+SSH_OPTS = ["-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+            "-o", "ConnectTimeout=15"]
+STATS_EVERY = 5.0
+USAGE_EVERY = 12                  # stats ticks between usage_today scans (~60 s)
+
+
+def dumps(obj):
+    return (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8", "replace")
+
+
+class Machine:
+    def __init__(self, cfg, on_msg, on_state):
+        self.id = cfg["id"]
+        self.name = cfg.get("name") or self.id
+        self.cfg = cfg
+        self.on_msg = on_msg          # async (machine, msg)
+        self.on_state = on_state      # sync (machine)
+        self.online = False
+        self.error = None
+        self.version = None
+        self.host = None
+        self.stats = None
+        self.usage_today = None
+        self.sessions = {}
+        self.order = []
+        self.proc = None
+        self.task = None
+        self.req = 0
+        self.waiters = {}
+        self.wake = asyncio.Event()
+
+    def info(self, presets_view):
+        return {"id": self.id, "name": self.name, "type": self.cfg.get("type"), "online": self.online,
+                "error": self.error, "version": self.version, "host": self.host, "stats": self.stats,
+                "usage_today": self.usage_today, "ssh_host": self.cfg.get("host"), "port": self.cfg.get("port"),
+                "presets": presets_view, "default_cwd": self.cfg.get("default_cwd"),
+                "sessions": [self.sessions[k] for k in self.order if k in self.sessions]}
+
+    def argv(self):
+        if self.cfg.get("type") == "ssh":
+            port = ["-p", str(self.cfg["port"])] if self.cfg.get("port") else []
+            return ["ssh"] + SSH_OPTS + port + list(self.cfg.get("ssh_opts") or []) + [self.cfg["host"], REMOTE_CMD]
+        return [sys.executable, AGENT, "bridge"]
+
+    def start(self):
+        self.task = asyncio.ensure_future(self.run())
+
+    async def stop(self):
+        if self.task:
+            self.task.cancel()
+        if self.proc and self.proc.returncode is None:
+            self.proc.kill()
+        for f in self.waiters.values():
+            if not f.done():
+                f.set_exception(ConnectionError("machine removed"))
+        self.waiters.clear()
+
+    def reconnect_fresh(self):
+        """Drop the current connection (e.g. host changed) and reconnect with the new settings."""
+        if self.proc and self.proc.returncode is None:
+            self.proc.kill()
+        self.wake.set()
+
+    def reconnect_now(self):
+        self.wake.set()
+
+    async def run(self):
+        delay = 1
+        while True:
+            try:
+                await self.session_once()
+                delay = 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("%s: %s", self.id, e)
+                self.error = str(e)[:300]
+            self.online = False
+            self.stats = None
+            for f in self.waiters.values():
+                if not f.done():
+                    f.set_exception(ConnectionError("machine offline"))
+            self.waiters.clear()
+            self.on_state(self)
+            self.wake.clear()
+            try:
+                await asyncio.wait_for(self.wake.wait(), delay)
+            except asyncio.TimeoutError:
+                pass
+            delay = min(delay * 2, 30)
+
+    async def stats_loop(self):
+        tick = 0
+        while True:
+            if tick % USAGE_EVERY == 0:
+                await self.poll_usage()
+            tick += 1
+            await asyncio.sleep(STATS_EVERY)
+            t0 = time.monotonic()
+            try:
+                r = await self.call({"op": "stats"}, timeout=10)
+            except (ConnectionError, asyncio.TimeoutError):
+                continue
+            st = dict(r.get("stats") or {})
+            st["rtt_ms"] = round((time.monotonic() - t0) * 1000, 1)
+            self.stats = st
+            self.on_state(self)
+
+    async def poll_usage(self):
+        """Today's token totals over every transcript on that machine (older agents answer with an error)."""
+        try:
+            r = await self.call({"op": "usage_today"}, timeout=30)
+        except (ConnectionError, asyncio.TimeoutError):
+            return
+        if r.get("t") == "usage_today":
+            self.usage_today = {k: v for k, v in r.items() if k not in ("t", "req")}
+            self.on_state(self)
+
+    async def session_once(self):
+        self.proc = await asyncio.create_subprocess_exec(
+            *self.argv(), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, limit=64 * 1024 * 1024, start_new_session=True)
+        errbuf = []
+
+        async def pump_err():
+            while True:
+                ln = await self.proc.stderr.readline()
+                if not ln:
+                    return
+                s = ln.decode("utf-8", "replace").strip()
+                if s and not s.startswith("Welcome to "):     # ssh bastion banners
+                    errbuf.append(s)
+                    del errbuf[:-5]
+        errt = asyncio.ensure_future(pump_err())
+        statst = None
+        try:
+            if self.cfg.get("type") == "ssh":
+                with open(AGENT, "rb") as f:
+                    src = f.read()
+                self.proc.stdin.write(base64.b64encode(zlib.compress(src, 9)) + b"\n")
+            self.write({"op": "hello", "client": "hub"})
+            hello = False
+            while True:
+                ln = await self.proc.stdout.readline()
+                if not ln:
+                    break
+                try:
+                    m = json.loads(ln)
+                except ValueError:
+                    continue       # login banners etc.
+                if not isinstance(m, dict):
+                    continue
+                if not hello:
+                    if m.get("t") != "hello":
+                        continue
+                    hello = True
+                    self.online, self.error = True, None
+                    self.version, self.host = m.get("version"), m.get("host")
+                    self.sessions = {s["sid"]: s for s in m.get("sessions", [])}
+                    self.order = [s["sid"] for s in m.get("sessions", [])]
+                    log.info("%s online (%s, %d sessions)", self.id, self.host, len(self.order))
+                    self.on_state(self)
+                    statst = asyncio.ensure_future(self.stats_loop())
+                    await self.on_msg(self, {"t": "resync"})
+                    continue
+                try:
+                    await self.handle(m)
+                except Exception:
+                    log.exception("%s: error handling %s", self.id, m.get("t"))
+        finally:
+            errt.cancel()
+            if statst:
+                statst.cancel()
+            if self.proc.returncode is None:
+                self.proc.kill()
+            await self.proc.wait()
+        msg = "; ".join(errbuf) or "connection closed (exit %s)" % self.proc.returncode
+        raise ConnectionError(msg)
+
+    async def handle(self, m):
+        t = m.get("t")
+        if t == "session":
+            s = m["s"]
+            if s["sid"] not in self.sessions:
+                self.order.append(s["sid"])
+            self.sessions[s["sid"]] = s
+            self.on_state(self)
+        elif t == "gone":
+            self.sessions.pop(m["sid"], None)
+            if m["sid"] in self.order:
+                self.order.remove(m["sid"])
+            self.on_state(self)
+        req = m.get("req")
+        if req is not None and req in self.waiters:
+            f = self.waiters.pop(req)
+            if not f.done():
+                f.set_result(m)
+            return       # replies to call() go only to the caller
+        await self.on_msg(self, m)
+
+    def write(self, obj):
+        if not self.proc or self.proc.returncode is not None or self.proc.stdin.is_closing():
+            raise ConnectionError("machine %s offline" % self.id)
+        self.proc.stdin.write(dumps(obj))
+
+    async def call(self, obj, timeout=20):
+        self.req += 1
+        req = self.req
+        f = asyncio.get_running_loop().create_future()
+        self.waiters[req] = f
+        try:
+            self.write(dict(obj, req=req))
+            return await asyncio.wait_for(f, timeout)
+        finally:
+            self.waiters.pop(req, None)
+
+    def next_req(self):
+        self.req += 1
+        return self.req

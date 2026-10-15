@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Glimpse">
+<meta name="theme-color" content="#0B0C0F" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#F2F2F7" media="(prefers-color-scheme: light)">
+<meta name="color-scheme" content="dark light">
+<meta name="description" content="在手机上查看和操作电脑里的 Claude Code / Codex 终端会话">
+<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
+<link rel="apple-touch-icon" href="/static/icon-180.png">
+<link rel="icon" href="/static/icon-192.png" sizes="192x192" type="image/png">
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/vendor/xterm.css">
+<link rel="stylesheet" href="/static/app.css">
+<title>Glimpse</title>
+</head>
+<body>
+<!-- icon sprite (stroke icons, 24x24 grid) -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+  <symbol id="i-up" viewBox="0 0 24 24"><path d="m18 15-6-6-6 6"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.3" fill="currentColor"/><circle cx="12" cy="12" r="1.3" fill="currentColor"/><circle cx="19" cy="12" r="1.3" fill="currentColor"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20.5l1.4-4.9A8 8 0 1 1 21 12z"/></symbol>
+  <symbol id="i-term" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7 9 3 3-3 3M13 15h4"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6"/></symbol>
+  <symbol id="i-return" viewBox="0 0 24 24"><path d="M9 10 4 15l5 5"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></symbol>
+  <symbol id="i-arrow-down" viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+  <symbol id="i-check-c" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="i-x-c" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m15 9-6 6M9 9l6 6"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M12 8v4M12 16h.01"/></symbol>
+  <symbol id="i-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></symbol>
+  <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M5 12.6a10 10 0 0 1 14 0M8.5 16a5 5 0 0 1 7 0M2 8.8a15 15 0 0 1 20 0M12 20h.01"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 1v4M15 1v4M9 19v4M15 19v4M1 9h4M1 15h4M19 9h4M19 15h4"/></symbol>
+  <symbol id="i-coins" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/></symbol>
+  <symbol id="i-gauge" viewBox="0 0 24 24"><path d="M12 14l4-4"/><path d="M3.3 19a10 10 0 1 1 17.4 0"/></symbol>
+  <symbol id="i-pulse" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5M3 21v-5h5"/></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 9.3-9.3M17 6l3 3M14.5 8.5l2 2"/></symbol>
+  <symbol id="i-logout" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></symbol>
+  <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.9 1.9 0 0 0 3.4 0"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="8" rx="2"/><rect x="3" y="13" width="18" height="8" rx="2"/><path d="M7 7h.01M7 17h.01"/></symbol>
+  <symbol id="i-laptop" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="11" rx="2"/><path d="M2 19h20"/></symbol>
+  <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></symbol>
+  <symbol id="i-resize" viewBox="0 0 24 24"><rect x="6" y="2" width="12" height="20" rx="3"/><path d="M10 18h4"/></symbol>
+  <symbol id="i-power" viewBox="0 0 24 24"><path d="M18.4 6.6a9 9 0 1 1-12.8 0M12 2v10"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M8 13h8M8 17h5"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></symbol>
+  <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></symbol>
+  <symbol id="i-tool" viewBox="0 0 24 24"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9z"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/></symbol>
+  <symbol id="i-widgets" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+  <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></symbol>
+  <symbol id="i-prompt" viewBox="0 0 24 24"><path d="m5 7 5 5-5 5M12 17h7"/></symbol>
+  <symbol id="i-cloud-off" viewBox="0 0 24 24"><path d="m2 2 20 20M5.8 5.8A7 7 0 0 0 7 19h10.5M22 15.5A4.5 4.5 0 0 0 17.5 10h-1.3A7 7 0 0 0 9.6 5.1"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></symbol>
+  <symbol id="i-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 2.6-6.4L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/></symbol>
+  <symbol id="i-share" viewBox="0 0 24 24"><path d="M12 3v12M8 7l4-4 4 4"/><path d="M8 11H6a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-6a2 2 0 0 0-2-2h-2"/></symbol>
+  <symbol id="i-plus-sq" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M12 8v8M8 12h8"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></symbol>
+  <symbol id="i-broom" viewBox="0 0 24 24"><path d="M19 3 11 11"/><path d="M8.5 10.5 13.5 15.5 11 21H4l-1-3c2.5-1 4-3 5.5-7.5z"/><path d="M7 21l1-3.5M10.5 21l.5-2.5"/></symbol>
+  <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1" fill="currentColor"/></symbol>
+  <symbol id="i-phone" viewBox="0 0 24 24"><rect x="6" y="2" width="12" height="20" rx="3"/><path d="M11 18h2"/></symbol>
+  <symbol id="i-inbox" viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5.1 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.5-6.9A2 2 0 0 0 16.8 4H7.2a2 2 0 0 0-1.7 1.1z"/></symbol>
+</svg>
+<div id="app">
+  <!-- login -->
+  <section id="login" class="screen" hidden aria-labelledby="login-title">
+    <form id="login-form" class="hero" novalidate>
+      <div class="brand">
+        <img class="logo" src="/static/icon.svg" alt="" width="84" height="84">
+        <h1 id="login-title">Glimpse</h1>
+        <p>在手机上监控和操作电脑里的 AI 编程会话。<br>在电脑终端运行 <code>./glimpse url</code>，用手机打开输出的链接，或在下方粘贴访问令牌。</p>
+      </div>
+      <div class="group">
+        <label class="cell" for="login-token">
+          <span class="cell-ic" aria-hidden="true"><svg class="ic"><use href="#i-key"/></svg></span>
+          <span class="sr">访问令牌</span>
+          <input id="login-token" type="password" autocomplete="current-password" placeholder="访问令牌" required
+            autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="go">
+        </label>
+      </div>
+      <p id="login-err" class="err" role="alert"></p>
+      <button type="submit" id="login-btn" class="btn primary lg block">登录</button>
+      <p class="foot">令牌只保存在这台设备上，可在设置里退出登录。</p>
+    </form>
+  </section>
+
+  <!-- hub unreachable at launch -->
+  <section id="offline" class="screen" hidden aria-labelledby="off-title">
+    <div class="hero">
+      <div class="brand">
+        <div class="offline-art" aria-hidden="true"><svg class="ic lg"><use href="#i-cloud-off"/></svg></div>
+        <h1 id="off-title">无法连接</h1>
+        <p id="off-msg">连不上 hub。请确认电脑上的 Glimpse hub 正在运行，并且手机已连上 Tailscale。</p>
+      </div>
+      <button type="button" id="off-retry" class="btn primary lg block"><svg class="ic" aria-hidden="true"><use href="#i-refresh"/></svg>重试</button>
+    </div>
+  </section>
+
+  <!-- home -->
+  <section id="home" class="screen" hidden>
+    <header class="nav" id="home-nav">
+      <div class="nav-row">
+        <div class="nav-side"><button type="button" id="btn-settings" class="icon-btn" aria-label="设置"><svg class="ic"><use href="#i-gear"/></svg></button></div>
+        <div class="nav-title" aria-hidden="true">会话</div>
+        <div class="nav-side end"><button type="button" id="btn-new" class="icon-btn" aria-label="新建会话"><svg class="ic"><use href="#i-plus"/></svg></button></div>
+      </div>
+    </header>
+    <main id="home-scroll" class="scroll list">
+      <div class="large-title">
+        <h1>会话</h1>
+        <span id="conn" class="conn wait" role="status" aria-live="polite"><span class="dot"></span><span class="ct">连接中…</span></span>
+      </div>
+      <div id="install" class="install" hidden role="region" aria-label="安装为 App"></div>
+      <div id="home-widgets" class="widgets" role="region" aria-label="插件"></div>
+      <nav id="chips" class="chips" aria-label="快速切换会话"></nav>
+      <div id="groups" aria-busy="true">
+        <div class="cards" style="padding-top:16px">
+          <div class="skel skel-card"></div><div class="skel skel-card"></div><div class="skel skel-card"></div>
+        </div>
+      </div>
+    </main>
+    <button type="button" id="fab" class="fab" aria-label="新建会话"><svg class="ic"><use href="#i-plus"/></svg></button>
+  </section>
+
+  <!-- session view -->
+  <section id="view" class="screen" hidden>
+    <header class="nav vnav scrolled">
+      <div class="nav-row">
+        <button type="button" id="btn-back" class="icon-btn" aria-label="返回会话列表"><svg class="ic"><use href="#i-back"/></svg></button>
+        <div class="vtitle">
+          <h1 class="vname"><span class="dot" id="v-dot" aria-hidden="true"></span><span id="v-name"></span></h1>
+          <div id="v-sub" class="vsub"></div>
+        </div>
+        <button type="button" id="btn-more" class="icon-btn" aria-label="会话操作"><svg class="ic"><use href="#i-more"/></svg></button>
+      </div>
+      <div class="vbar">
+        <div class="seg" id="seg" role="tablist" aria-label="视图">
+          <span class="thumb" aria-hidden="true"></span>
+          <button type="button" id="mode-chat" role="tab" aria-controls="chat"><svg class="ic" aria-hidden="true"><use href="#i-chat"/></svg>对话</button>
+          <button type="button" id="mode-term" role="tab" aria-controls="term-wrap"><svg class="ic" aria-hidden="true"><use href="#i-term"/></svg>终端</button>
+        </div>
+        <button type="button" id="btn-wstrip" class="wtoggle" aria-expanded="true" aria-controls="v-widgets" aria-label="显示会话插件"><svg class="ic sm" aria-hidden="true"><use href="#i-gauge"/></svg><svg class="ic xs" aria-hidden="true"><use href="#i-down"/></svg></button>
+      </div>
+      <div id="v-widgets" class="wstrip" role="region" aria-label="会话插件"></div>
+      <div id="v-banner" class="banner" hidden role="status"></div>
+    </header>
+    <div class="body">
+      <div id="chat" class="chat" role="tabpanel" aria-label="对话" tabindex="-1"></div>
+      <div id="term-wrap" class="term-wrap" role="tabpanel" aria-label="终端" hidden><div id="term"></div></div>
+      <button type="button" id="jump" class="jump" hidden><svg class="ic" aria-hidden="true"><use href="#i-arrow-down"/></svg>回到最新</button>
+    </div>
+    <div class="dock">
+      <div id="v-card"></div>
+      <div id="keys" class="keys" role="toolbar" aria-label="快捷键">
+        <button type="button" class="key" data-k="esc" aria-label="Esc">Esc</button>
+        <button type="button" class="key" data-k="ctrlc" aria-label="Control C 中断">^C</button>
+        <button type="button" class="key" data-k="tab" aria-label="Tab">Tab</button>
+        <button type="button" class="key" data-k="stab" aria-label="Shift Tab">⇧Tab</button>
+        <button type="button" class="key sep" data-k="up" aria-label="上">↑</button>
+        <button type="button" class="key" data-k="down" aria-label="下">↓</button>
+        <button type="button" class="key" data-k="left" aria-label="左">←</button>
+        <button type="button" class="key" data-k="right" aria-label="右">→</button>
+        <button type="button" class="key" data-k="enter" aria-label="回车">⏎</button>
+        <button type="button" class="key sep" data-k="1">1</button>
+        <button type="button" class="key" data-k="2">2</button>
+        <button type="button" class="key" data-k="3">3</button>
+        <button type="button" class="key" data-k="y">y</button>
+        <button type="button" class="key" data-k="n">n</button>
+      </div>
+      <form id="composer" class="composer">
+        <div class="field">
+          <label for="input" class="sr">输入指令</label>
+          <textarea id="input" rows="1" placeholder="发送消息到该会话" enterkeyhint="send"
+            autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
+        </div>
+        <button id="btn-send" type="submit" class="send enter" aria-label="发送回车"><svg class="ic"><use href="#i-return"/></svg></button>
+      </form>
+    </div>
+  </section>
+</div>
+
+<!-- new session sheet -->
+<dialog id="dlg-new" class="sheet" aria-labelledby="dlg-new-title">
+  <form id="new-form" novalidate>
+    <div class="sh-grab" aria-hidden="true"></div>
+    <div class="sh-head">
+      <button type="button" class="txt-btn l" data-close>取消</button>
+      <h2 id="dlg-new-title">新建会话</h2>
+      <button type="submit" class="txt-btn strong r" id="new-ok">启动</button>
+    </div>
+    <div class="sh-body">
+      <div class="g-h" id="new-kind-h">类型</div>
+      <div class="choice" role="radiogroup" aria-labelledby="new-kind-h">
+        <label><input type="radio" name="kind" value="claude"><svg class="ic" aria-hidden="true"><use href="#i-sparkle"/></svg>Claude Code</label>
+        <label><input type="radio" name="kind" value="codex"><svg class="ic" aria-hidden="true"><use href="#i-cpu"/></svg>Codex</label>
+        <label><input type="radio" name="kind" value="shell"><svg class="ic" aria-hidden="true"><use href="#i-term"/></svg>Shell</label>
+      </div>
+      <div class="group" style="margin-top:12px">
+        <button type="button" class="cell" id="new-adopt"><span class="cell-ic" style="background:#2FB457" aria-hidden="true"><svg class="ic"><use href="#i-history"/></svg></span>
+          <span class="grow">接管电脑上的会话<div class="sub">继续电脑上已有的 Claude / Codex 对话</div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
+      </div>
+      <div class="g-h">位置</div>
+      <div class="group">
+        <label class="cell" for="new-machine"><span class="lbl">机器</span><select id="new-machine"></select></label>
+        <label class="cell" for="new-key" id="new-key-row"><span class="lbl">Key</span><select id="new-key"></select></label>
+        <label class="cell stack" for="new-cwd"><span class="lbl">工作目录</span>
+          <input id="new-cwd" class="mono" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="go" placeholder="~/code/project"></label>
+      </div>
+      <div id="new-recent" class="rchips" aria-label="最近使用的目录"></div>
+      <div class="g-h">可选</div>
+      <div class="group">
+        <label class="cell" for="new-name"><span class="lbl">任务名</span><input id="new-name" placeholder="默认用目录名" enterkeyhint="go"></label>
+        <label class="cell" for="new-args"><span class="lbl">额外参数</span>
+          <input id="new-args" class="mono" placeholder="--verbose" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="go"></label>
+      </div>
+      <div id="new-adv" hidden>
+        <div class="g-h">模型与模式</div>
+        <div class="group">
+          <label class="cell" for="new-model"><span class="lbl">模型</span>
+            <input id="new-model" list="new-models" class="mono" placeholder="默认" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="go"></label>
+          <label class="cell" for="new-effort"><span class="lbl">推理强度</span><select id="new-effort"></select></label>
+          <label class="cell" for="new-pmode" id="new-pmode-row"><span class="lbl">权限模式</span><select id="new-pmode"></select></label>
+          <label class="cell" for="new-approval" id="new-approval-row"><span class="lbl">审批</span><select id="new-approval"></select></label>
+          <label class="cell" for="new-sandbox" id="new-sandbox-row"><span class="lbl">沙箱</span><select id="new-sandbox"></select></label>
+        </div>
+        <datalist id="new-models"></datalist>
+        <p class="g-f" id="new-adv-f">留空则使用这台机器预设里的配置。启动后也可以在会话里的“模型与模式”插件中修改。</p>
+      </div>
+      <p id="new-err" class="sh-err" role="alert"></p>
+      <p id="new-note" class="sh-note" hidden><span class="spinner" aria-hidden="true"></span>启动中…</p>
+      <div style="height:16px"></div>
+      <button type="submit" class="btn primary lg block">启动会话</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- adopt a conversation that was started on the computer (resume it under Glimpse) -->
+<dialog id="dlg-adopt" class="sheet tall" aria-labelledby="dlg-adopt-title">
+  <div class="sh-grab" aria-hidden="true"></div>
+  <div class="sh-head">
+    <button type="button" class="txt-btn l" data-close>取消</button>
+    <h2 id="dlg-adopt-title">接管电脑上的会话</h2>
+    <button type="button" class="icon-btn r" id="adopt-refresh" aria-label="刷新列表"><svg class="ic"><use href="#i-refresh"/></svg></button>
+  </div>
+  <div class="sh-body">
+    <div class="note-box"><svg class="ic sm" aria-hidden="true"><use href="#i-info"/></svg>
+      <div>Glimpse 无法直接接管已经打开的终端窗口，而是新启动一个进程<b>继续同一段对话</b>。接管前请先在电脑上关闭原来的 claude / codex，否则两边会各自写入、对话分叉。</div></div>
+    <div class="group" style="margin-top:12px">
+      <label class="cell" for="adopt-machine"><span class="lbl">机器</span><select id="adopt-machine"></select></label>
+    </div>
+    <div class="fchips" id="adopt-kind" role="radiogroup" aria-label="类型">
+      <button type="button" role="radio" data-k="">全部</button><button type="button" role="radio" data-k="claude">Claude</button><button type="button" role="radio" data-k="codex">Codex</button>
+    </div>
+    <div id="adopt-list" class="group hlist" aria-live="polite"></div>
+    <p id="adopt-err" class="sh-err" role="alert"></p>
+  </div>
+</dialog>
+
+<!-- session controls: model / effort / mode -->
+<dialog id="dlg-ctl" class="sheet" aria-labelledby="dlg-ctl-title">
+  <div class="sh-grab" aria-hidden="true"></div>
+  <div class="sh-head">
+    <span class="l"></span><h2 id="dlg-ctl-title">模型与模式</h2>
+    <button type="button" class="txt-btn strong r" data-close>完成</button>
+  </div>
+  <div class="sh-body" id="ctl-body"></div>
+</dialog>
+
+<!-- add / edit a machine -->
+<dialog id="dlg-machine" class="sheet" aria-labelledby="dlg-mc-title">
+  <form id="mc-form" novalidate>
+    <div class="sh-grab" aria-hidden="true"></div>
+    <div class="sh-head">
+      <button type="button" class="txt-btn l" data-close>取消</button>
+      <h2 id="dlg-mc-title">添加机器</h2>
+      <button type="submit" class="txt-btn strong r" id="mc-ok">保存</button>
+    </div>
+    <div class="sh-body">
+      <div class="group">
+        <label class="cell" for="mc-name"><span class="lbl">名称</span><input id="mc-name" placeholder="例如 GPU 服务器" enterkeyhint="next" required></label>
+        <label class="cell stack" for="mc-host" id="mc-host-row"><span class="lbl">SSH 主机</span>
+          <input id="mc-host" class="mono" placeholder="~/.ssh/config 里的 Host，或 user@host" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="next"></label>
+        <label class="cell" for="mc-port" id="mc-port-row"><span class="lbl">端口</span><input id="mc-port" type="number" inputmode="numeric" min="1" max="65535" placeholder="22" enterkeyhint="next"></label>
+        <label class="cell stack" for="mc-cwd"><span class="lbl">默认工作目录</span>
+          <input id="mc-cwd" class="mono" placeholder="~" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="done"></label>
+      </div>
+      <p class="g-f" id="mc-foot">Hub 会用这台电脑已有的 SSH 密钥连接（不支持密码登录），远端需要 Python 3.8+。Claude / Codex 的启动命令沿用本机预设，之后可在 config.json 修改。</p>
+      <div class="group" style="margin-top:16px" id="mc-test-g">
+        <button type="button" class="cell" id="mc-test"><span class="cell-ic" style="background:#2FB457" aria-hidden="true"><svg class="ic"><use href="#i-pulse"/></svg></span><span class="grow">测试连接<div class="sub" id="mc-test-sub">检查 SSH 免密登录和远端 Python</div></span></button>
+      </div>
+      <div class="group" style="margin-top:16px" id="mc-del-g">
+        <button type="button" class="cell center danger" id="mc-del">删除这台机器</button>
+      </div>
+      <p id="mc-err" class="sh-err" role="alert"></p>
+    </div>
+  </form>
+</dialog>
+
+<!-- install as an app (Home Screen PWA) -->
+<dialog id="dlg-install" class="sheet" aria-labelledby="dlg-inst-title">
+  <div class="sh-grab" aria-hidden="true"></div>
+  <div class="sh-head">
+    <span class="l"></span><h2 id="dlg-inst-title">安装为 App</h2>
+    <button type="button" class="txt-btn strong r" data-close>完成</button>
+  </div>
+  <div class="sh-body">
+    <div class="inst-hero"><img src="/static/icon.svg" alt="" width="64" height="64">
+      <p>添加到主屏幕后，Glimpse 会像原生 App 一样全屏打开，有自己的图标，并且可以接收推送通知。</p></div>
+    <ol class="inst-steps" id="inst-ios">
+      <li><span class="n">1</span><span class="grow">在 Safari 底部（iPad 在右上角）点 <span class="kbd"><svg class="ic sm" aria-hidden="true"><use href="#i-share"/></svg>分享</span></span></li>
+      <li><span class="n">2</span><span class="grow">向下滑动，选择 <span class="kbd"><svg class="ic sm" aria-hidden="true"><use href="#i-plus-sq"/></svg>添加到主屏幕</span></span></li>
+      <li><span class="n">3</span><span class="grow">点右上角“添加”，然后<b>从主屏幕图标打开</b> Glimpse，再到设置里开启通知</span></li>
+    </ol>
+    <ol class="inst-steps" id="inst-other" hidden>
+      <li><span class="n">1</span><span class="grow">Android Chrome：点右上角 <span class="kbd">⋮</span> → <span class="kbd">安装应用</span>（或“添加到主屏幕”）</span></li>
+      <li><span class="n">2</span><span class="grow">电脑上的 Chrome / Edge：点地址栏右侧的 <span class="kbd"><svg class="ic sm" aria-hidden="true"><use href="#i-download"/></svg>安装</span> 图标</span></li>
+      <li><span class="n">3</span><span class="grow">安装后从桌面或启动器打开 Glimpse</span></li>
+    </ol>
+    <button type="button" class="btn primary lg block" id="inst-go" hidden><svg class="ic" aria-hidden="true"><use href="#i-download"/></svg>安装 App</button>
+    <p class="g-f" style="text-align:center">没有 App Store 版本：添加到主屏幕的网页 App 就是 Glimpse 的 App 形态。</p>
+  </div>
+</dialog>
+
+<!-- more actions sheet -->
+<dialog id="dlg-more" class="sheet" aria-labelledby="dlg-more-title">
+  <div class="sh-grab" aria-hidden="true"></div>
+  <div class="sh-head">
+    <span class="l"></span><h2 id="dlg-more-title">会话操作</h2>
+    <button type="button" class="txt-btn strong r" data-close>完成</button>
+  </div>
+  <div class="sh-body">
+    <div class="group">
+      <button type="button" class="cell" id="act-ctl"><span class="cell-ic" style="background:#E8930C" aria-hidden="true"><svg class="ic"><use href="#i-sliders"/></svg></span><span class="grow">模型与模式<div class="sub" id="act-ctl-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
+      <button type="button" class="cell" id="act-rename"><span class="cell-ic" aria-hidden="true"><svg class="ic"><use href="#i-pencil"/></svg></span><span class="grow">重命名</span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
+      <button type="button" class="cell" id="act-restart"><span class="cell-ic" style="background:#8E5CF0" aria-hidden="true"><svg class="ic"><use href="#i-key"/></svg></span><span class="grow">更换 Key 并重启<div class="sub" id="act-restart-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
+      <button type="button" class="cell" id="act-fit"><span class="cell-ic" style="background:#2FB457" aria-hidden="true"><svg class="ic"><use href="#i-resize"/></svg></span><span class="grow">按手机屏幕调整终端尺寸<div class="sub" id="act-fit-sub"></div></span></button>
+    </div>
+    <div class="g-h">在其他地方打开</div>
+    <div class="group">
+      <div class="cell stack open-row">
+        <span class="row1"><span class="cell-ic" style="background:#5C636E" aria-hidden="true"><svg class="ic"><use href="#i-laptop"/></svg></span><span class="grow">在电脑上打开<div class="sub">在运行 hub 的电脑终端里执行，Ctrl-] 退出</div></span></span>
+        <span class="cmd"><code id="act-cmd"></code><button type="button" class="btn sm" id="act-cmd-copy" aria-label="复制命令"><svg class="ic" aria-hidden="true"><use href="#i-copy"/></svg>复制</button></span>
+      </div>
+      <button type="button" class="cell" id="act-link"><span class="cell-ic" style="background:#0A84FF" aria-hidden="true"><svg class="ic"><use href="#i-link"/></svg></span><span class="grow">其他设备浏览器打开<div class="sub" id="act-link-sub">复制链接，在同一 Tailscale 网络的设备上打开</div></span><svg class="ic sm" style="color:var(--text-3)" aria-hidden="true"><use href="#i-copy"/></svg></button>
+    </div>
+    <div class="g-h"></div>
+    <div class="group">
+      <button type="button" class="cell danger" id="act-kill"><span class="cell-ic" aria-hidden="true"><svg class="ic"><use href="#i-power"/></svg></span><span class="grow">结束进程</span></button>
+      <button type="button" class="cell danger" id="act-delete"><span class="cell-ic" aria-hidden="true"><svg class="ic"><use href="#i-trash"/></svg></span><span class="grow">删除会话<div class="sub" id="act-delete-sub"></div></span></button>
+    </div>
+  </div>
+</dialog>
+
+<!-- rename sheet -->
+<dialog id="dlg-rename" class="sheet" aria-labelledby="dlg-rename-title">
+  <form id="rename-form" novalidate>
+    <div class="sh-grab" aria-hidden="true"></div>
+    <div class="sh-head">
+      <button type="button" class="txt-btn l" data-close>取消</button>
+      <h2 id="dlg-rename-title">重命名</h2>
+      <button type="submit" class="txt-btn strong r">保存</button>
+    </div>
+    <div class="sh-body">
+      <div class="group"><label class="cell" for="rename-input"><span class="sr">任务名</span>
+        <input id="rename-input" style="text-align:left" enterkeyhint="done" required></label></div>
+    </div>
+  </form>
+</dialog>
+
+<!-- confirm sheet -->
+<dialog id="dlg-confirm" class="sheet" aria-labelledby="cf-title" aria-describedby="cf-msg">
+  <div class="sh-grab" aria-hidden="true"></div>
+  <div class="sh-body" style="padding-top:4px">
+    <h2 id="cf-title" style="font-size:17px;text-align:center;margin:4px 0 6px"></h2>
+    <p id="cf-msg" style="text-align:center;color:var(--text-2);font-size:14px;margin-bottom:18px"></p>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button type="button" id="cf-ok" class="btn danger lg block"></button>
+      <button type="button" class="btn lg block" data-close>取消</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- restart with another key -->
+<dialog id="dlg-restart" class="sheet" aria-labelledby="dlg-rs-title">
+  <form id="rs-form" novalidate>
+    <div class="sh-grab" aria-hidden="true"></div>
+    <div class="sh-head">
+      <button type="button" class="txt-btn l" data-close>取消</button>
+      <h2 id="dlg-rs-title">更换 Key 并重启</h2>
+      <button type="submit" class="txt-btn strong r" id="rs-ok">重启</button>
+    </div>
+    <div class="sh-body">
+      <div class="g-h" id="rs-key-h">Key</div>
+      <div class="group" id="rs-keys" role="radiogroup" aria-labelledby="rs-key-h"></div>
+      <div id="rs-new" hidden>
+        <div class="g-h">新的 Key</div>
+        <div class="group">
+          <label class="cell stack" for="rs-value"><span class="lbl" id="rs-value-lbl">Key 值</span>
+            <input id="rs-value" type="password" class="mono" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="sk-…" enterkeyhint="go"></label>
+          <label class="cell" for="rs-save"><span class="lbl">保存为</span><input id="rs-save" placeholder="不保存" enterkeyhint="go"></label>
+        </div>
+        <p class="g-f">同一个 Key 同时用于 Claude 和 Codex（hub 会映射成对应的环境变量）。填写“保存为”后会出现在 Key 列表里。</p>
+      </div>
+      <div class="g-h"></div>
+      <div class="group">
+        <label class="cell" for="rs-resume"><span class="grow">恢复原对话<div class="sub" id="rs-resume-sub">重启后接着之前的上下文继续</div></span>
+          <span class="switch"><input type="checkbox" id="rs-resume" role="switch" checked><i></i></span></label>
+      </div>
+      <div id="rs-progress" class="group" style="margin-top:16px" hidden aria-live="polite">
+        <div class="progress-steps" id="rs-steps"></div>
+      </div>
+      <p id="rs-err" class="sh-err" role="alert"></p>
+    </div>
+  </form>
+</dialog>
+
+<!-- settings sheet -->
+<dialog id="dlg-settings" class="sheet" aria-labelledby="dlg-set-title">
+  <div class="sh-grab" aria-hidden="true"></div>
+  <div class="sh-head">
+    <span class="l"></span><h2 id="dlg-set-title">设置</h2>
+    <button type="button" class="txt-btn strong r" data-close>完成</button>
+  </div>
+  <div class="sh-body">
+    <div class="g-h">通知</div>
+    <div class="group">
+      <div class="cell"><span class="cell-ic" style="background:#E5484D" aria-hidden="true"><svg class="ic"><use href="#i-bell"/></svg></span>
+        <span class="grow">推送通知<div class="sub" id="set-push" aria-live="polite">检查中…</div></span></div>
+      <button type="button" class="cell" id="btn-push"><span class="grow" style="color:var(--accent-text)">开启通知</span></button>
+      <button type="button" class="cell" id="btn-push-test"><span class="grow" style="color:var(--accent-text)">发送测试通知</span></button>
+    </div>
+    <div class="g-h">插件</div>
+    <div class="group" id="set-widgets"></div>
+    <p class="g-f">开关控制首页和会话页显示哪些插件，箭头调整顺序。</p>
+    <div class="g-h">外观</div>
+    <div class="group">
+      <div class="cell"><span class="grow" id="font-lbl">终端字号</span>
+        <span class="stepper" role="group" aria-labelledby="font-lbl">
+          <button type="button" id="font-dec" aria-label="减小字号"><svg class="ic sm"><use href="#i-minus"/></svg></button>
+          <output id="opt-font" aria-live="polite">11</output>
+          <button type="button" id="font-inc" aria-label="增大字号"><svg class="ic sm"><use href="#i-plus"/></svg></button>
+        </span></div>
+      <label class="cell" for="opt-hide-exited"><span class="grow">隐藏已结束的会话</span>
+        <span class="switch"><input type="checkbox" id="opt-hide-exited" role="switch"><i></i></span></label>
+    </div>
+    <div class="g-h">机器</div>
+    <div class="group" id="set-machines"></div>
+    <div class="group" style="margin-top:8px">
+      <button type="button" class="cell" id="btn-add-machine"><span class="cell-ic" aria-hidden="true"><svg class="ic"><use href="#i-plus"/></svg></span><span class="grow" style="color:var(--accent-text)">添加机器</span></button>
+      <button type="button" class="cell" id="btn-clean"><span class="cell-ic" style="background:#5C636E" aria-hidden="true"><svg class="ic"><use href="#i-broom"/></svg></span><span class="grow">清理已结束的会话<div class="sub" id="btn-clean-sub"></div></span></button>
+    </div>
+    <div class="g-h">App</div>
+    <div class="group">
+      <button type="button" class="cell" id="btn-install"><span class="cell-ic" style="background:#0A84FF" aria-hidden="true"><svg class="ic"><use href="#i-phone"/></svg></span><span class="grow">添加到主屏幕<div class="sub" id="btn-install-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
+    </div>
+    <div class="g-h">关于</div>
+    <div class="group">
+      <div class="cell"><span class="grow">Glimpse</span><span class="val" id="set-ver"></span></div>
+      <div class="cell"><span class="grow">Hub</span><span class="val" id="set-hubver">—</span></div>
+    </div>
+    <div class="g-h"></div>
+    <div class="group">
+      <button type="button" class="cell center danger" id="btn-logout">退出登录</button>
+    </div>
+  </div>
+</dialog>
+
+<div id="toast-host" aria-live="polite"></div>
+<div id="sr-live" class="sr" aria-live="assertive"></div>
+<script src="/static/vendor/xterm.js"></script>
+<script src="/static/vendor/addon-fit.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

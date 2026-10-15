@@ -1,0 +1,30 @@
+#!/bin/sh
+# Glimpse launcher
+#   ./glimpse setup          create .venv and install the hub dependencies
+#   ./glimpse hub            run the hub (web app + relay) in the foreground
+#   ./glimpse url            print the login URL to open on the phone
+#   ./glimpse run claude     start a Claude Code session here, visible on the phone (Ctrl-] detaches)
+#   ./glimpse run codex      start a Codex session
+#   ./glimpse ls | kill ID
+#   ./glimpse attach [ID]    attach this terminal (no ID: most recent live session). Sessions on other machines
+#                            (ssh) are attached through the running hub: ./glimpse attach ID or M2:ID
+set -e
+DIR="$(cd "$(dirname "$0")" && pwd)"
+PY="$DIR/.venv/bin/python"
+[ -x "$PY" ] || PY=python3
+case "${1:-help}" in
+  setup)
+    [ -x "$DIR/.venv/bin/python" ] || python3 -m venv "$DIR/.venv"
+    "$DIR/.venv/bin/pip" install -q -r "$DIR/requirements.txt"
+    [ -f "$DIR/config.json" ] || { cp "$DIR/config.example.json" "$DIR/config.json"; chmod 600 "$DIR/config.json"; }
+    echo "done. edit config.json, then run: ./glimpse hub" ;;
+  hub)  shift; exec "$PY" "$DIR/hub/server.py" "$@" ;;
+  url)  exec "$PY" "$DIR/hub/server.py" --print-url ;;
+  test) exec "$PY" -m pytest -q "$DIR/tests" ;;
+  attach)
+    shift
+    # the hub fallback needs aiohttp (the .venv); without it only local sessions can be attached
+    if "$PY" -c "import aiohttp" 2>/dev/null; then exec "$PY" "$DIR/hub/attach_client.py" "$@"; fi
+    exec "$PY" "$DIR/agent/glimpse_agent.py" attach "$@" ;;
+  *)    exec "$PY" "$DIR/agent/glimpse_agent.py" "$@" ;;
+esac

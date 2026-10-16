@@ -475,8 +475,9 @@ button.cell:active, label.cell:active { background: var(--fill-press); }
 .switch { position: relative; width: 51px; height: 31px; flex: none; margin-left: auto; }
 .switch input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; z-index: 1; }
 .switch i { position: absolute; inset: 0; border-radius: 16px; background: var(--fill-2); transition: background-color .2s; pointer-events: none; }
-@media (prefers-color-scheme: light) { :root:not([data-theme=dark]) .switch i { background: #D8D8DE; } }
-:root[data-theme=light] .switch i { background: #D8D8DE; }
+/* light track colour only for the OFF state (an unscoped rule would outrank :checked and keep ON switches grey) */
+@media (prefers-color-scheme: light) { :root:not([data-theme=dark]) .switch input:not(:checked) + i { background: #D8D8DE; } }
+:root[data-theme=light] .switch input:not(:checked) + i { background: #D8D8DE; }
 .switch i::after { content: ""; position: absolute; top: 2px; left: 2px; width: 27px; height: 27px; border-radius: 50%; background: #fff;
   box-shadow: 0 2px 6px rgba(0,0,0,.25); transition: transform .22s var(--ease); }
 .switch input:checked + i { background: #2FB457; }

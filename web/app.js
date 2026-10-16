@@ -382,25 +382,31 @@ async function api(path, body) {
   if (!r.ok) { const e = new Error((await r.text()) || r.statusText); e.status = r.status; throw e; }
   return r.json();
 }
-async function login(token) { await api('/api/login', { token }); LS.setItem('glimpse.token', token); }
+// session token of this device (also an HttpOnly cookie; the copy here survives iOS Home Screen cookie loss)
+async function loginWith(body) {
+  const r = await api('/api/login', body);
+  if (r && r.session) LS.setItem('glimpse.token', r.session);
+  return r;
+}
 
 let booted = false;
 async function boot() {
   const u = new URL(location.href);
-  const t = u.searchParams.get('t');
-  if (t) {
-    try { await login(t); } catch (e) { /* fall through */ }
-    u.searchParams.delete('t');
-    history.replaceState(null, '', u.pathname + u.hash);
+  const pair = u.searchParams.get('pair');
+  if (u.searchParams.has('t')) u.searchParams.delete('t');             // links from older versions: ignored
+  if (pair) {
+    try { await loginWith({ pair }); } catch (e) { S.pairErr = e.status === 429 ? '尝试次数过多，请稍后再试' : '登录链接无效或已过期，请在电脑上重新运行 ./glimpse url'; }
+    u.searchParams.delete('pair');
   }
+  if (pair || location.search) history.replaceState(null, '', u.pathname + u.hash);
   // only a definite 401 shows the login screen; anything else (network) shows "无法连接"
   let status = 0;
-  try { await api('/api/me'); status = 200; } catch (e) { status = e.status || 0; }
+  try { const me = await api('/api/me'); S.me = me; status = 200; } catch (e) { status = e.status || 0; }
   if (status === 401) {
-    const tok = LS.getItem('glimpse.token');
-    if (tok) { try { await login(tok); status = 200; } catch (e) { status = e.status || 0; } }
+    LS.removeItem('glimpse.token');
+    show('login'); $('#login-err').textContent = S.pairErr || ''; S.pairErr = '';
+    setTimeout(() => $('#login-pw').focus(), 50); return;
   }
-  if (status === 401) { show('login'); setTimeout(() => $('#login-token').focus(), 50); return; }
   if (status !== 200) { show('offline'); $('#off-retry').disabled = false; return; }
   if (booted) return;
   booted = true;
@@ -420,11 +426,11 @@ $('#off-retry').onclick = () => { $('#off-retry').disabled = true; setTimeout(bo
 
 $('#login-form').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const v = $('#login-token').value.trim();
-  if (!v) { $('#login-err').textContent = '请输入访问令牌'; return; }
+  const v = $('#login-pw').value;
+  if (!v) { $('#login-err').textContent = '请输入密码'; return; }
   const b = $('#login-btn'); b.disabled = true; b.innerHTML = '<span class="spinner" aria-hidden="true"></span>登录中…';
-  try { await login(v); $('#login-err').textContent = ''; boot(); } catch (err) {
-    $('#login-err').textContent = err.status === 401 ? '令牌不正确' : '无法连接 hub';
+  try { await loginWith({ password: v }); $('#login-pw').value = ''; $('#login-err').textContent = ''; boot(); } catch (err) {
+    $('#login-err').textContent = err.status === 401 ? '密码不正确' : err.status === 429 ? '尝试次数过多，请稍后再试' : '无法连接 hub';
   } finally { b.disabled = false; b.textContent = '登录'; }
 });
 
@@ -471,10 +477,15 @@ function connect() {
     let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
     onMsg(m);
   };
-  ws.onclose = () => {
+  ws.onclose = (ev) => {
     clearTimeout(openTimer);
     if (S.ws !== ws) return;
     S.wsOk = false; S.ws = null;
+    if (ev && ev.code === 4401) {          // this device was logged out (here or from another device / the CLI)
+      LS.removeItem('glimpse.token'); booted = false;
+      show('login'); $('#login-err').textContent = '这台设备已退出登录，请重新登录';
+      return;
+    }
     setConn('bad', '已断开');
     scheduleReconnect();
   };
@@ -1911,10 +1922,31 @@ async function renderSettings() {
   $('#opt-font').textContent = String(S.fontSize);
   $('#set-ver').textContent = APP_VERSION;
   $('#set-hubver').textContent = S.hub && S.hub.version ? S.hub.version : '—';
-  renderSettingsWidgets(); renderSettingsMachines();
+  renderSettingsWidgets(); renderSettingsMachines(); renderAccount();
   $('#btn-install-sub').textContent = standalone() ? '已作为 App 运行 ✓' : isIOS() ? 'Safari：分享 → 添加到主屏幕' : INST.prompt ? '可以直接安装' : '查看安装方法';
   $('#set-push').textContent = await pushState();
 }
+// ---- account: password state + per-device sessions (GET /api/devices, POST /api/devices/revoke)
+async function renderAccount() {
+  let r;
+  try { r = await api('/api/devices'); } catch (e) { $('#acct-pw-sub').textContent = '无法读取'; return; }
+  $('#acct-pw-sub').textContent = r.has_password ? '已设置' : '未设置（只能用一次性链接登录），在电脑上运行 ./glimpse password';
+  const host = $('#acct-devices');
+  host.innerHTML = r.devices.map((d) => '<div class="cell"><span class="cell-ic" style="background:#5C636E" aria-hidden="true">' + ic(/iPhone|Android|iPad/.test(d.name) ? 'phone' : 'laptop') + '</span>' +
+    '<span class="grow">' + esc(d.name) + (d.current ? ' <span class="tag">本机</span>' : '') +
+    '<div class="sub">最近 ' + esc(ago(d.last_seen)) + (d.ip ? ' · ' + esc(d.ip) : '') + '</div></span>' +
+    (d.current ? '' : '<button type="button" class="btn sm danger" data-revoke="' + esc(d.id) + '">退出</button>') + '</div>').join('');
+  for (const b of $$('[data-revoke]', host)) b.onclick = async () => {
+    if (!(await confirmSheet('退出这台设备？', '它需要重新登录才能再次访问。', '退出'))) return;
+    try { await api('/api/devices/revoke', { id: b.dataset.revoke }); toast('已退出', '', null, 'done'); renderAccount(); } catch (e) { toast('操作失败', e.message, null, 'error'); }
+  };
+  $('#acct-revoke-others').hidden = r.devices.filter((d) => !d.current).length === 0;
+}
+$('#acct-revoke-others').onclick = async () => {
+  if (!(await confirmSheet('退出其他所有设备？', '除了这台以外，所有设备都需要重新登录。', '全部退出'))) return;
+  try { await api('/api/devices/revoke', { all: true }); toast('已退出其他设备', '', null, 'done'); renderAccount(); } catch (e) { toast('操作失败', e.message, null, 'error'); }
+};
+
 function refreshOpenSheets() {
   if ($('#dlg-settings').open) { renderSettingsMachines(); $('#set-hubver').textContent = S.hub && S.hub.version ? S.hub.version : '—'; }
   if ($('#dlg-new').open) {

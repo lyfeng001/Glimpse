@@ -91,19 +91,19 @@
       <div class="brand">
         <img class="logo" src="/static/icon.svg?v=4" alt="" width="84" height="84">
         <h1 id="login-title">Glimpse</h1>
-        <p>在手机上监控和操作电脑里的 AI 编程会话。<br>在电脑终端运行 <code>./glimpse url</code>，用手机打开输出的链接，或在下方粘贴访问令牌。</p>
+        <p>在手机上监控和操作电脑里的 AI 编程会话。</p>
       </div>
       <div class="group">
-        <label class="cell" for="login-token">
+        <label class="cell" for="login-pw">
           <span class="cell-ic" aria-hidden="true"><svg class="ic"><use href="#i-key"/></svg></span>
-          <span class="sr">访问令牌</span>
-          <input id="login-token" type="password" autocomplete="current-password" placeholder="访问令牌" required
+          <span class="sr">密码</span>
+          <input id="login-pw" type="password" autocomplete="current-password" placeholder="密码" required
             autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="go">
         </label>
       </div>
       <p id="login-err" class="err" role="alert"></p>
       <button type="submit" id="login-btn" class="btn primary lg block">登录</button>
-      <p class="foot">令牌只保存在这台设备上，可在设置里退出登录。</p>
+      <p class="foot">还没设置密码，或者是新设备？在电脑终端运行 <code>./glimpse url</code>，用手机打开输出的一次性链接（10 分钟内有效）。设置密码：<code>./glimpse password</code>。</p>
     </form>
   </section>
 
@@ -483,6 +483,13 @@
     <div class="group">
       <button type="button" class="cell" id="btn-install"><span class="cell-ic" style="background:#0A84FF" aria-hidden="true"><svg class="ic"><use href="#i-phone"/></svg></span><span class="grow">添加到主屏幕<div class="sub" id="btn-install-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
     </div>
+    <div class="g-h">账号与设备</div>
+    <div class="group">
+      <div class="cell"><span class="cell-ic" style="background:#30B0C7" aria-hidden="true"><svg class="ic"><use href="#i-key"/></svg></span><span class="grow">登录密码<div class="sub" id="acct-pw-sub">—</div></span></div>
+      <div id="acct-devices"></div>
+      <button type="button" class="cell" id="acct-revoke-others"><span class="cell-ic" style="background:#FF453A" aria-hidden="true"><svg class="ic"><use href="#i-logout"/></svg></span><span class="grow">退出其他所有设备</span></button>
+    </div>
+    <p class="g-f">每台设备单独登录，可以随时在这里把它退出。新设备在电脑上运行 <code>./glimpse url</code> 获取一次性登录链接（10 分钟内有效，只能用一次）；修改密码：<code>./glimpse password</code>。</p>
     <div class="g-h">关于</div>
     <div class="group">
       <div class="cell"><span class="grow">Glimpse</span><span class="val" id="set-ver"></span></div>

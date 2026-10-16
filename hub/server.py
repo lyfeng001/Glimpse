@@ -19,6 +19,7 @@ from aiohttp import web
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config as C  # noqa: E402
+from auth import PAIR_TTL, Auth  # noqa: E402
 import webpush  # noqa: E402
 from machines import Machine  # noqa: E402
 
@@ -81,6 +82,23 @@ def init_cmds(kind, msg):
     if kind == "claude" and msg.get("effort") == "ultracode":
         return ["/effort ultracode"]
     return None
+
+
+def device_name(request):
+    """A readable name for the device list, from the User-Agent (no fingerprinting beyond that)."""
+    ua = request.headers.get("User-Agent", "")
+    for k, v in (("iPhone", "iPhone"), ("iPad", "iPad"), ("Android", "Android"), ("Macintosh", "Mac"),
+                 ("Windows", "Windows"), ("Linux", "Linux")):
+        if k in ua:
+            name = v
+            break
+    else:
+        name = "设备"
+    for k, v in (("Edg/", "Edge"), ("CriOS", "Chrome"), ("Chrome/", "Chrome"), ("Firefox/", "Firefox"),
+                 ("Safari/", "Safari")):
+        if k in ua:
+            return "%s · %s" % (name, v)
+    return name
 
 
 def origin_ok(request):
@@ -162,8 +180,9 @@ async def ssh_test(host, port=None):
 class Phone:
     """One websocket. Messages go through a queue so a slow phone never stalls the machines."""
 
-    def __init__(self, ws):
+    def __init__(self, ws, device=None):
         self.ws = ws
+        self.device = device       # device session id (None: local CLI)
         self.subs = set()          # (m, sid)
         self.visible = True
         self.last_seen = time.time()
@@ -198,7 +217,8 @@ class Phone:
 class Hub:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.token = C.token()
+        self.token = C.token()       # local CLI token: only accepted from 127.0.0.1
+        self.auth = Auth(os.path.join(DATA, "auth.json"), C.write_secret)
         self.vapid = webpush.Vapid(os.path.join(DATA, "vapid.json"))
         self.push_path = os.path.join(DATA, "push_subs.json")
         self.push_subs = self._load_push()
@@ -642,19 +662,53 @@ class Hub:
                 del self.reply_to[k]
 
     # --- http
-    def authed(self, request):
-        tok = request.cookies.get("glimpse") or ""
-        if request.path == "/ws" and request.query.get("t"):
-            tok = request.query["t"]
+    @staticmethod
+    def client_ip(request):
+        return request.remote or ""
+
+    def is_local(self, request):
+        return self.client_ip(request) in ("127.0.0.1", "::1")
+
+    def request_token(self, request):
         h = request.headers.get("Authorization", "")
         if h.startswith("Bearer "):
-            tok = h[7:]
-        return bool(tok) and hmac.compare_digest(tok.encode(), self.token.encode())
+            return h[7:].strip()
+        if request.path == "/ws" and request.query.get("t"):
+            return request.query["t"]
+        return request.cookies.get("glimpse") or ""
 
-    def set_cookie(self, resp):
-        resp.set_cookie("glimpse", self.token, max_age=365 * 86400, httponly=True, secure=True,
+    def authed(self, request):
+        tok = self.request_token(request)
+        if not tok:
+            return False
+        if self.auth.device_for(tok):
+            return True
+        # the CLI token in data/token is for this computer only (./glimpse attach); never valid over the network
+        return self.is_local(request) and hmac.compare_digest(tok.encode(), self.token.encode())
+
+    def set_cookie(self, resp, tok):
+        resp.set_cookie("glimpse", tok, max_age=365 * 86400, httponly=True, secure=True,
                         samesite="Strict", path="/")
 
+    def issue_session(self, request):
+        tok, dev = self.auth.new_device(device_name(request), self.client_ip(request))
+        resp = web.json_response({"ok": True, "session": tok, "device": dev["id"]})
+        self.set_cookie(resp, tok)
+        self.auth.ok(self.client_ip(request))
+        return resp
+
+    async def login(self, request):
+        """{"password"} or {"pair": code} -> a new device session (cookie + returned token)."""
+        ip = self.client_ip(request)
+        if self.auth.blocked(ip):
+            raise web.HTTPTooManyRequests(text="too many attempts, try again later")
+        body = await self.json_body(request)
+        pair, pw = body.get("pair"), body.get("password")
+        if (isinstance(pair, str) and self.auth.use_pair(pair)) or (isinstance(pw, str) and self.auth.check_password(pw)):
+            return self.issue_session(request)
+        self.auth.failed(ip)
+        await asyncio.sleep(1)
+        raise web.HTTPUnauthorized(text="bad credentials")
     def static_file(self, name):
         path = os.path.realpath(os.path.join(WEB, name))
         if not path.startswith(os.path.realpath(WEB) + os.sep) or not os.path.isfile(path):
@@ -683,10 +737,10 @@ class Hub:
     async def manifest(self, request):
         with open(os.path.join(WEB, "manifest.webmanifest")) as f:
             man = json.load(f)
-        # Home Screen apps on iOS do not share Safari's cookies: carry the token in the start URL
-        # (only when the request that adds the app is already authenticated)
-        if self.authed(request):
-            man["start_url"] = "/?t=" + self.token
+        # Home Screen apps on iOS do not share Safari's cookies: the start URL carries a fresh one-time
+        # pairing code (never a session or the CLI token), and only for an already logged-in device
+        if self.auth.device_for(self.request_token(request)):
+            man["start_url"] = "/?pair=" + self.auth.new_pair()
         resp = web.json_response(man, content_type="application/manifest+json")
         resp.headers["Cache-Control"] = "no-store"
         return resp
@@ -700,20 +754,51 @@ class Hub:
             raise web.HTTPBadRequest(text="invalid json")
         return body
 
-    async def login(self, request):
-        body = await self.json_body(request)
-        tok = str(body.get("token") or "").strip()
-        if not tok or not hmac.compare_digest(tok.encode(), self.token.encode()):
-            await asyncio.sleep(1)
-            raise web.HTTPUnauthorized(text="bad token")
-        resp = web.json_response({"ok": True})
-        self.set_cookie(resp)
-        return resp
-
     async def logout(self, request):
+        dev = self.auth.device_for(self.request_token(request))
+        if dev:
+            self.auth.revoke(dev["id"])
+            self.kick_device(dev["id"])
         resp = web.json_response({"ok": True})
         resp.del_cookie("glimpse", path="/")
         return resp
+
+    def kick_device(self, dev_id=None, keep=None):
+        """Close the websockets of a revoked device (dev_id None: every device session except keep)."""
+        for p in list(self.phones):
+            if p.device and p.device != keep and (dev_id is None or p.device == dev_id):
+                asyncio.ensure_future(p.ws.close(code=4401, message=b"logged out"))
+
+    async def devices(self, request):
+        cur = self.auth.device_for(self.request_token(request))
+        return web.json_response({"devices": self.auth.public_devices(cur and cur["id"]),
+                                  "has_password": self.auth.has_password()})
+
+    async def device_revoke(self, request):
+        body = await self.json_body(request)
+        cur = self.auth.device_for(self.request_token(request))
+        if body.get("all"):
+            keep = cur and cur["id"]
+            self.auth.revoke_all(keep=keep)
+            self.kick_device(None, keep=keep)
+            return web.json_response({"ok": True})
+        did = str(body.get("id") or "")
+        if not self.auth.revoke(did):
+            raise web.HTTPNotFound(text="no such device")
+        self.kick_device(did)
+        return web.json_response({"ok": True})
+
+    async def change_password(self, request):
+        """Set / change the password. Changing an existing one needs the current one."""
+        body = await self.json_body(request)
+        if self.auth.has_password() and not self.auth.check_password(body.get("current")):
+            self.auth.failed(self.client_ip(request))
+            raise web.HTTPForbidden(text="当前密码不正确")
+        try:
+            self.auth.set_password(body.get("new"))
+        except ValueError as e:
+            raise web.HTTPBadRequest(text=str(e))
+        return web.json_response({"ok": True})
 
     @web.middleware
     async def auth_mw(self, request, handler):
@@ -727,7 +812,9 @@ class Hub:
         return resp
 
     async def me(self, request):
-        return web.json_response({"ok": True, "version": VERSION})
+        dev = self.auth.device_for(self.request_token(request))
+        return web.json_response({"ok": True, "version": VERSION, "device": dev and dev["id"],
+                                  "has_password": self.auth.has_password()})
 
     async def vapid_key(self, request):
         return web.json_response({"publicKey": self.vapid.public_b64})
@@ -757,7 +844,8 @@ class Hub:
             raise web.HTTPForbidden(text="bad origin")
         ws = web.WebSocketResponse(heartbeat=20, max_msg_size=8 * 1024 * 1024, compress=True)
         await ws.prepare(request)
-        p = Phone(ws)
+        dev = self.auth.device_for(self.request_token(request))
+        p = Phone(ws, dev and dev["id"])
         self.phones.add(p)
         p.send(self.state())
         try:
@@ -789,6 +877,9 @@ class Hub:
         app.router.add_post("/api/login", self.login)
         app.router.add_post("/api/logout", self.logout)
         app.router.add_get("/api/me", self.me)
+        app.router.add_get("/api/devices", self.devices)
+        app.router.add_post("/api/devices/revoke", self.device_revoke)
+        app.router.add_post("/api/password", self.change_password)
         app.router.add_get("/api/vapid", self.vapid_key)
         app.router.add_post("/api/push/subscribe", self.push_subscribe)
         app.router.add_post("/api/push/unsubscribe", self.push_unsubscribe)
@@ -879,10 +970,19 @@ def resolve_hub(cfg):
 
 
 def login_url(cfg, mask=False):
+    """One-time pairing link for a new device (valid PAIR_TTL seconds, single use). Needs the running hub's
+    data/auth.json: the code is added to it, and the hub reloads the file when the link is used."""
+    base = hub_base_url(cfg)
+    if mask:
+        return base
+    a = Auth(os.path.join(DATA, "auth.json"), C.write_secret)
+    return base + "?pair=" + a.new_pair()
+
+
+def hub_base_url(cfg):
     listen, name = resolve_hub(cfg)
     first = listen[0] if listen else {"host": "127.0.0.1", "port": 8443}
-    return "https://%s:%s/?t=%s" % (name or first["host"], first["port"],
-                                    "<run ./glimpse url>" if mask else C.token())
+    return "https://%s:%s/" % (name or first["host"], first["port"])
 
 
 async def serve(cfg, hub):
@@ -927,7 +1027,10 @@ async def serve(cfg, hub):
 
 def main():
     ap = argparse.ArgumentParser(description="Glimpse hub")
-    ap.add_argument("--print-url", action="store_true", help="print the phone login URL and exit")
+    ap.add_argument("--print-url", action="store_true", help="print a one-time pairing link for a new device")
+    ap.add_argument("--set-password", action="store_true", help="set / change the login password")
+    ap.add_argument("--devices", action="store_true", help="list logged-in devices")
+    ap.add_argument("--revoke", metavar="ID", help="log out a device (ID from --devices, or 'all')")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
@@ -935,6 +1038,36 @@ def main():
     cfg = C.load()
     if a.print_url:
         print(login_url(cfg))
+        print("(one-time link, valid %d minutes; the device stays logged in afterwards)" % (PAIR_TTL // 60),
+              file=sys.stderr)
+        return
+    auth = Auth(os.path.join(DATA, "auth.json"), C.write_secret)
+    if a.set_password:
+        import getpass
+        pw = getpass.getpass("new password (8+ characters): ")
+        if pw != getpass.getpass("again: "):
+            raise SystemExit("passwords differ")
+        try:
+            auth.set_password(pw)
+        except ValueError as e:
+            raise SystemExit(str(e))
+        print("password set")
+        return
+    if a.devices:
+        devs = auth.public_devices()
+        for d in devs:
+            print("%s  %-24s last seen %s  %s" % (d["id"], d["name"], time.strftime("%m-%d %H:%M",
+                  time.localtime(d["last_seen"])), d["ip"]))
+        print("%d device(s)%s" % (len(devs), "" if auth.has_password() else "; no password set (./glimpse password)"))
+        return
+    if a.revoke:
+        if a.revoke == "all":
+            auth.revoke_all()
+            print("all devices logged out")
+        elif not auth.revoke(a.revoke):
+            raise SystemExit("no such device: " + a.revoke)
+        else:
+            print("logged out " + a.revoke)
         return
     os.environ["GLIMPSE_APPROVAL_WAIT"] = str(int(cfg["hub"].get("approval_wait_seconds") or 600))
     renew_cert(cfg)

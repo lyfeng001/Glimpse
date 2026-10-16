@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/img/icon.png" width="112" alt="Glimpse">
+<img src="docs/img/icon-v4.png" width="112" alt="Glimpse">
 
 # Glimpse
 
@@ -9,6 +9,7 @@
   <img src="https://img.shields.io/badge/hub-macOS%20%7C%20Linux-lightgrey" alt="hub: macOS | Linux">
   <img src="https://img.shields.io/badge/client-iPhone%20%7C%20Android%20%7C%20desktop%20PWA-black" alt="client: iPhone | Android | desktop PWA">
   <img src="https://img.shields.io/badge/remote%20deps-none-brightgreen" alt="remote deps: none">
+  <img src="https://img.shields.io/badge/license-MIT-blue" alt="license: MIT">
 </p>
 
 **Watch and drive the Claude Code / Codex sessions running on your laptop and dev boxes — from your phone.**
@@ -19,7 +20,7 @@ Live output · reply and approve from your phone · push notifications on done /
 
 [Quick start](#quick-start) · [How it works](#how-it-works) · [Configuration](#configuration) · [Security](#security) · [FAQ](#faq)
 
-<img src="docs/img/home.png" width="22%" alt="Session list"> <img src="docs/img/approval.png" width="22%" alt="Approve from the phone"> <img src="docs/img/chat.png" width="22%" alt="Chat view"> <img src="docs/img/terminal.png" width="22%" alt="Terminal view">
+<img src="docs/img/home-v4.png" width="22%" alt="Session list"> <img src="docs/img/approval-v4.png" width="22%" alt="Approve from the phone"> <img src="docs/img/chat-v4.png" width="22%" alt="Chat view"> <img src="docs/img/terminal-v4.png" width="22%" alt="Terminal view">
 
 </div>
 
@@ -54,7 +55,7 @@ Glimpse turns your phone into a remote control for those sessions. What you see 
 - **Laptop and phone together**: `./glimpse run claude` attaches your laptop terminal to the same session. `Ctrl-]` detaches.
 - **Light / dark**: Settings → 外观 switches between follow system, light and dark. The terminal view stays dark.
 
-<p align="center"><img src="docs/img/controls.png" width="22%" alt="Model & mode"> <img src="docs/img/adopt.png" width="22%" alt="Continue a conversation"> <img src="docs/img/restart.png" width="22%" alt="Key"> <img src="docs/img/home-light.png" width="22%" alt="Light"></p>
+<p align="center"><img src="docs/img/controls-v4.png" width="18%" alt="Model & mode"> <img src="docs/img/adopt-v4.png" width="18%" alt="Continue a conversation"> <img src="docs/img/restart-v4.png" width="18%" alt="Key"> <img src="docs/img/home-light-v4.png" width="18%" alt="Light"> <img src="docs/img/devices-v4.png" width="18%" alt="Devices"></p>
 
 ## How it works
 
@@ -111,7 +112,7 @@ scripts/install_launchd.sh       # optional (macOS): start at login and restart 
 ### 4. Open it on the phone
 
 1. Open the Tailscale app and stay connected.
-2. On the computer, run `./glimpse url` and open the printed link in the phone's browser. The link contains your access token, so don't share it.
+2. On the computer, run `./glimpse url` and open the printed link in the phone's browser. It is a one-time login link: it works once, within 10 minutes. Optionally run `./glimpse password` so devices can also log in with a password.
 3. Install it as an app (see [Use it as an app](#use-it-as-an-app)), and from then on open Glimpse from its icon.
 4. In ⚙︎ Settings, tap **Enable notifications** and allow them, then tap **Send test notification** to check.
 
@@ -195,15 +196,17 @@ Every setting, including secrets such as API keys, lives in one file: `config.js
 
 ## Security
 
-- **Network**: the hub listens only on the addresses in `hub.listen` (by default the Tailscale IP and `127.0.0.1`), so it is unreachable from the LAN and the internet. Every request also needs a 192-bit random access token (`data/token`):
-  - it is stored in an `HttpOnly; Secure; SameSite=Strict` cookie and compared in constant time;
-  - WebSocket connections from another origin are rejected;
-  - the token is never written to the log.
+- **Network**: the hub listens only on the addresses in `hub.listen` (by default the Tailscale IP and `127.0.0.1`), so it is unreachable from the LAN and the internet. Only devices signed in to your tailnet can reach it at all.
+- **Login**: every device logs in on its own and gets its own session.
+  - New devices log in with a **one-time link** from `./glimpse url` (single use, expires after 10 minutes), or with the **password** you set with `./glimpse password`. A copied old link is useless.
+  - Sessions are random 256-bit tokens in an `HttpOnly; Secure; SameSite=Strict` cookie. The hub stores only their SHA-256, and the password only as a salted scrypt hash (`data/auth.json`, `0600`).
+  - Settings → 账号与设备 lists every device with its last use and lets you log one out, or all others, instantly. From the computer: `./glimpse devices`, `./glimpse logout ID|all`.
+  - Repeated wrong passwords lock that client out for a growing time.
+  - WebSocket connections from another origin are rejected, and nothing secret is written to the log.
 - **Keys**: the browser only ever sees key names. Key values live in the hub's `config.json` (written atomically, `0600`) and in the temporary launch files. Launch command lines are not sent to the phone either.
 - **Agent socket**: the Unix socket is mode `0600`. On Linux, abstract sockets check `SO_PEERCRED` in both directions, so only the same uid can connect and a socket squatted by another user is refused.
 - **Adding machines from the phone** only accepts plain SSH host names or aliases. The hub connects with `BatchMode=yes` and its own keys, never with passwords.
-- **Files**: everything under `data/` (token, VAPID private key, push subscriptions, TLS key) is `0600`.
-- **Revoking access**: delete `data/token`, restart the hub, and log in again with the new `./glimpse url`.
+- **Files**: everything under `data/` (auth data, VAPID private key, push subscriptions, TLS key) is `0600`. `data/token` is only for tools on the hub computer itself (`./glimpse attach`) and is refused from any other address.
 
 ## FAQ
 
@@ -214,7 +217,7 @@ The project runs on the computer (the hub). The phone only needs the Tailscale a
 
 <details><summary><b>Only iPhone? What about Android or another computer?</b></summary>
 
-Any device with a modern browser that is on your tailnet works: Android, iPad, or another Mac / Windows / Linux computer. Open the same link and log in with the token. Push notifications work on Android Chrome and on desktop Chrome, Edge and Safari as well.
+Any device with a modern browser that is on your tailnet works: Android, iPad, or another Mac / Windows / Linux computer. Log in with a fresh `./glimpse url` link or your password. Push notifications work on Android Chrome and on desktop Chrome, Edge and Safari as well.
 </details>
 
 <details><summary><b>What does the logo mean?</b></summary>
@@ -268,3 +271,7 @@ web/                     the PWA (vanilla JS + xterm.js, no build step); web/ico
 - [xterm.js](https://xtermjs.org/) (MIT) renders the terminal on the phone
 - [Tailscale](https://tailscale.com/) provides the network and HTTPS certificates
 - The interaction design was inspired by [Moshi](https://getmoshi.app/) and [Happier](https://github.com/happier-dev/happier)
+
+## License
+
+[MIT](LICENSE). The bundled [xterm.js](https://xtermjs.org/) is MIT licensed as well (`web/vendor/xterm.LICENSE`).

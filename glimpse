@@ -2,7 +2,9 @@
 # Glimpse launcher
 #   ./glimpse setup          create .venv and install the hub dependencies
 #   ./glimpse hub            run the hub (web app + relay) in the foreground
-#   ./glimpse url            print the login URL to open on the phone
+#   ./glimpse url            print a one-time login link for a new device (expires in 10 minutes)
+#   ./glimpse password       set / change the login password
+#   ./glimpse devices        list logged-in devices; ./glimpse logout ID|all logs them out
 #   ./glimpse run claude     start a Claude Code session here, visible on the phone (Ctrl-] detaches)
 #   ./glimpse run codex      start a Codex session
 #   ./glimpse ls | kill ID
@@ -21,6 +23,9 @@ case "${1:-help}" in
     echo "done. edit config.json, then run: ./glimpse hub" ;;
   hub)  shift; exec "$PY" "$DIR/hub/server.py" "$@" ;;
   url)  exec "$PY" "$DIR/hub/server.py" --print-url ;;
+  password) exec "$PY" "$DIR/hub/server.py" --set-password ;;
+  devices)  exec "$PY" "$DIR/hub/server.py" --devices ;;
+  logout)   shift; exec "$PY" "$DIR/hub/server.py" --revoke "${1:?usage: ./glimpse logout DEVICE_ID|all}" ;;
   test) exec "$PY" -m pytest -q "$DIR/tests" ;;
   attach)
     shift

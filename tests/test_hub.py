@@ -58,15 +58,15 @@ def test_http_auth_static_and_state(hub_mod):
         try:
             r = await client.get("/api/me")
             assert r.status == 401
-            r = await client.post("/api/login", json={"token": "wrong"})
+            r = await client.post("/api/login", json={"password": "wrong"})
             assert r.status in (401, 403)
             r = await client.get("/static/../config.json")
             assert r.status in (401, 403, 404)
-            r = await client.post("/api/login", json={"token": hub.token})
+            r = await client.post("/api/login", json={"pair": hub.auth.new_pair()})
             assert r.status == 200
             sc = r.headers.get("Set-Cookie", "")
             assert "HttpOnly" in sc and "Secure" in sc and "SameSite=Strict" in sc
-            auth = {"Authorization": "Bearer " + hub.token}
+            auth = {"Authorization": "Bearer " + (await r.json())["session"]}
             r = await client.get("/api/me", headers=auth)
             assert r.status == 200
             r = await client.get("/static/../../config.json", headers=auth)
@@ -303,8 +303,10 @@ def test_resolve_hub_auto(hub_mod, monkeypatch):
     listen, name = server.resolve_hub(cfg)
     assert listen[0]["host"] == "100.1.2.3" and name == "mac.tail.ts.net"
     url = server.login_url(cfg, mask=True)
-    assert url == "https://mac.tail.ts.net:8443/?t=<run ./glimpse url>"
+    assert url == "https://mac.tail.ts.net:8443/"
     assert C.token() not in url
+    full = server.login_url(cfg)
+    assert full.startswith("https://mac.tail.ts.net:8443/?pair=") and C.token() not in full
     server.RUNTIME.clear()
 
 
@@ -434,3 +436,72 @@ def test_models_forwarding_and_cache(hub_mod, monkeypatch):
         await hub.phone_op(p, {"op": "models", "m": "M1", "kind": "shell"})
         assert p.sent[-1]["t"] == "error"
     asyncio.run(run())
+
+
+def test_login_pairing_password_devices(hub_mod, tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+    C, server = hub_mod
+    from auth import Auth
+
+    async def run():
+        hub = server.Hub(C.load())
+        client = TestClient(TestServer(hub.app()))
+        await client.start_server()
+        try:
+            code = hub.auth.new_pair()
+            r = await client.post("/api/login", json={"pair": code})
+            assert r.status == 200
+            tok1 = (await r.json())["session"]
+            r = await client.post("/api/login", json={"pair": code})           # single use
+            assert r.status == 401
+            # a pairing code made by the CLI (another Auth instance on the same file) works on the running hub
+            cli = Auth(hub.auth.path, C.write_secret)
+            r = await client.post("/api/login", json={"pair": cli.new_pair()})
+            assert r.status == 200
+            tok2 = (await r.json())["session"]
+            a1, a2 = ({"Authorization": "Bearer " + t} for t in (tok1, tok2))
+            r = await client.get("/api/devices", headers=a1)
+            devs = (await r.json())["devices"]
+            assert len(devs) == 2 and sum(d["current"] for d in devs) == 1
+            other = [d for d in devs if not d["current"]][0]["id"]
+            # device 1 logs device 2 out; device 2 stops working immediately
+            r = await client.post("/api/devices/revoke", headers=a1, json={"id": other})
+            assert r.status == 200
+            r = await client.get("/api/me", headers=a2)
+            assert r.status == 401
+            # password: none yet -> set -> login with it; wrong current password is refused when changing
+            r = await client.post("/api/login", json={"password": "anything1"})
+            assert r.status == 401
+            r = await client.post("/api/password", headers=a1, json={"new": "short"})
+            assert r.status == 400
+            r = await client.post("/api/password", headers=a1, json={"new": "correct horse"})
+            assert r.status == 200
+            r = await client.post("/api/password", headers=a1, json={"current": "bad", "new": "another one"})
+            assert r.status == 403
+            r = await client.get("/api/me", headers=a1)
+            assert r.status == 200 and (await r.json())["has_password"] is True
+            r = await client.post("/api/login", json={"password": "correct horse"})
+            assert r.status == 200
+            # brute force: lockout after repeated failures
+            for _ in range(6):
+                r = await client.post("/api/login", json={"password": "nope-nope"})
+            assert r.status == 429
+            # auth.json stores hashes only
+            raw = open(hub.auth.path).read()
+            assert tok1 not in raw and "correct horse" not in raw
+            assert oct(os.stat(hub.auth.path).st_mode & 0o777) == "0o600"
+        finally:
+            await client.close()
+    asyncio.run(run())
+
+
+def test_cli_token_only_from_localhost(hub_mod):
+    C, server = hub_mod
+    hub = server.Hub(C.load())
+
+    class Req:
+        def __init__(self, remote):
+            self.remote, self.path, self.query, self.cookies = remote, "/api/me", {}, {}
+            self.headers = {"Authorization": "Bearer " + hub.token}
+    assert hub.authed(Req("127.0.0.1")) is True
+    assert hub.authed(Req("100.64.1.2")) is False                 # over Tailscale the file token is useless

@@ -11,8 +11,8 @@ self.addEventListener('push', (event) => {
     tag: data.tag || 'glimpse',          // same tag per session: a new notification replaces the old one
     renotify: true,
     data: { url: data.url || '/' },
-    icon: '/static/icon-192.png',
-    badge: '/static/icon-192.png',
+    icon: '/static/icon-192.png?v=4',
+    badge: '/static/icon-192.png?v=4',
   };
   event.waitUntil((async () => {
     await self.registration.showNotification(title, opts);

@@ -1746,7 +1746,7 @@ function renderInstall() {
   const b = $('#install');
   const show = !standalone() && LS.getItem('glimpse.installHint') == null && (isIOS() || !!INST.prompt);
   b.hidden = !show; if (!show) return;
-  setHTML(b, '<img src="/static/icon.svg" alt="" width="40" height="40"><div class="grow"><b>把 Glimpse 装成 App</b><span>' +
+  setHTML(b, '<img src="/static/icon.svg?v=4" alt="" width="40" height="40"><div class="grow"><b>把 Glimpse 装成 App</b><span>' +
     (isIOS() ? '点 Safari 的 ' + ic('share', 'xs') + ' 分享 → 添加到主屏幕，全屏打开并接收通知' : '全屏打开、独立图标，并可接收推送通知') + '</span></div>' +
     (INST.prompt ? '<button type="button" class="btn sm primary" data-i="go">安装</button>' : '<button type="button" class="btn sm" data-i="how">怎么做</button>') +
     '<button type="button" class="icon-btn plain x" data-i="x" aria-label="不再提示">' + ic('x', 'sm') + '</button>');

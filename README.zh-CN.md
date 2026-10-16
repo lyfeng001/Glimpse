@@ -1,6 +1,15 @@
 <div align="center">
 
+<img src="docs/img/icon.png" width="112" alt="Glimpse">
+
 # Glimpse
+
+<p>
+  <img src="https://img.shields.io/badge/hub-python%203.9%2B-3776AB?logo=python&logoColor=white" alt="hub: python 3.9+">
+  <img src="https://img.shields.io/badge/hub-macOS%20%7C%20Linux-lightgrey" alt="hub: macOS | Linux">
+  <img src="https://img.shields.io/badge/client-iPhone%20%7C%20Android%20%7C%20desktop%20PWA-black" alt="client: iPhone | Android | desktop PWA">
+  <img src="https://img.shields.io/badge/remote%20deps-none-brightgreen" alt="remote deps: none">
+</p>
 
 **在手机上查看和操作你电脑、开发机里正在跑的 Claude Code / Codex 会话。**
 
@@ -9,11 +18,6 @@
 [English](README.md) · **简体中文**
 
 [快速开始](#快速开始) · [工作原理](#工作原理) · [配置](#配置) · [安全](#安全) · [FAQ](#faq)
-
-![python](https://img.shields.io/badge/hub-python%203.9%2B-3776AB?logo=python&logoColor=white)
-![platform](https://img.shields.io/badge/hub-macOS%20%7C%20Linux-lightgrey)
-![client](https://img.shields.io/badge/client-iPhone%20%7C%20Android%20%7C%20desktop%20PWA-black)
-![deps](https://img.shields.io/badge/remote%20deps-none-brightgreen)
 
 <img src="docs/img/home.png" width="22%" alt="会话列表"> <img src="docs/img/approval.png" width="22%" alt="手机上授权"> <img src="docs/img/chat.png" width="22%" alt="对话视图"> <img src="docs/img/terminal.png" width="22%" alt="终端视图">
 

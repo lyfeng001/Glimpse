@@ -1,6 +1,15 @@
 <div align="center">
 
+<img src="docs/img/icon.png" width="112" alt="Glimpse">
+
 # Glimpse
+
+<p>
+  <img src="https://img.shields.io/badge/hub-python%203.9%2B-3776AB?logo=python&logoColor=white" alt="hub: python 3.9+">
+  <img src="https://img.shields.io/badge/hub-macOS%20%7C%20Linux-lightgrey" alt="hub: macOS | Linux">
+  <img src="https://img.shields.io/badge/client-iPhone%20%7C%20Android%20%7C%20desktop%20PWA-black" alt="client: iPhone | Android | desktop PWA">
+  <img src="https://img.shields.io/badge/remote%20deps-none-brightgreen" alt="remote deps: none">
+</p>
 
 **Watch and drive the Claude Code / Codex sessions running on your laptop and dev boxes — from your phone.**
 
@@ -9,11 +18,6 @@ Live output · reply and approve from your phone · push notifications on done /
 **English** · [简体中文](README.zh-CN.md)
 
 [Quick start](#quick-start) · [How it works](#how-it-works) · [Configuration](#configuration) · [Security](#security) · [FAQ](#faq)
-
-![python](https://img.shields.io/badge/hub-python%203.9%2B-3776AB?logo=python&logoColor=white)
-![platform](https://img.shields.io/badge/hub-macOS%20%7C%20Linux-lightgrey)
-![client](https://img.shields.io/badge/client-iPhone%20%7C%20Android%20%7C%20desktop%20PWA-black)
-![deps](https://img.shields.io/badge/remote%20deps-none-brightgreen)
 
 <img src="docs/img/home.png" width="22%" alt="Session list"> <img src="docs/img/approval.png" width="22%" alt="Approve from the phone"> <img src="docs/img/chat.png" width="22%" alt="Chat view"> <img src="docs/img/terminal.png" width="22%" alt="Terminal view">
 

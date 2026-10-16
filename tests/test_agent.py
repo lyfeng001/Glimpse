@@ -1028,6 +1028,11 @@ def test_memory_project_id_and_launch_args(tmp_path):
     assert "mcp__amem__memory_save" in mem.claude_allow(s)
     c = mem.codex_args(s)
     assert 'mcp_servers.amem.command="/opt/py"' in c and any(x.startswith("developer_instructions=") for x in c)
+    # a root already bound in the vault keeps that project id
+    mem.set_roots({"echo-sim": {"root": str(repo)}})
+    mem.attach(s)
+    assert s.memory_project == "echo-sim" and mem.bound["echo-sim"] == os.path.realpath(str(repo))
+    mem.roots = {}
     # a project that wires AMem itself is left alone
     (repo / ".mcp.json").write_text('{"mcpServers": {"x": {"args": ["-m", "agent_memory"]}}}')
     mem.attach(s)

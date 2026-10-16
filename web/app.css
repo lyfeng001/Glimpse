@@ -723,3 +723,6 @@ dialog.sheet.tall { min-height: min(560px, calc(var(--app-h) - var(--safe-t) - 1
 .back-btn .ic { width: 20px; height: 20px; }
 @media (prefers-reduced-motion: reduce) { .spage.in, .spage.back { animation: none; } }
 #set-back:focus:not(:focus-visible) { outline: none; box-shadow: none; }
+/* settings keeps one height for every sub-page: a short page must not shrink the sheet */
+#dlg-settings { height: min(calc(var(--app-h) - var(--safe-t) - 16px), 760px); }
+#dlg-settings .sh-body { flex: 1 1 auto; }

@@ -2020,6 +2020,7 @@ class Memory:
         self.running = set()           # projects with a capture in flight
         self.again = set()             # ... and a turn that finished meanwhile
         self.bound = {}                # project -> root registered with `amem init`
+        self.roots = {}                # root -> project id already bound in the vault (wins over the derived id)
 
     def store(self):
         return os.path.expanduser(self.cfg.get("store") or os.path.join(project_dir(), "data", "memory"))
@@ -2049,6 +2050,7 @@ class Memory:
                 self.error = err
             else:
                 self.version = res.strip()
+                self.load_roots()
                 b = str(self.cfg.get("budget") or "0")
                 self.run(["budget", "--max-bytes", b, "--keep-days", str(int(self.cfg.get("keep_days") or 30))],
                          lambda r, e: setattr(self, "error", e) if e else None)
@@ -2067,8 +2069,20 @@ class Memory:
                                stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
             if r.returncode == 0:
                 self.version, self.error = r.stdout.decode().strip(), None
+                r = subprocess.run([self.python(), "-m", "agent_memory", "--store", self.store(), "projects"],
+                                   stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+                if r.returncode == 0:
+                    self.set_roots(json.loads(r.stdout or b"{}"))
         except (OSError, subprocess.SubprocessError) as e:
             self.error = clip(str(e), 300)
+
+    def load_roots(self):
+        self.run(["projects"], lambda res, err: self.set_roots(res) if isinstance(res, dict) else None)
+
+    def set_roots(self, projects):
+        self.roots = {os.path.realpath(v["root"]): k for k, v in (projects or {}).items()
+                      if isinstance(v, dict) and isinstance(v.get("root"), str)}
+        self.bound.update({k: v for v, k in self.roots.items()})
 
     def exec_py(self, args, done, fail=None, timeout=MEMORY_TIMEOUT):
         import subprocess
@@ -2106,6 +2120,7 @@ class Memory:
         if not self.on() or s.kind not in ("claude", "codex"):
             return
         project, top = memory_project_id(s.cwd)
+        project = self.roots.get(os.path.realpath(top), project)   # e.g. a vault imported from an older setup
         if memory_external(top) or memory_external(os.path.expanduser("~")):
             return
         s.memory_project, s.memory_root = project, top

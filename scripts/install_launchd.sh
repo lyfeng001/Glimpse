@@ -1,5 +1,5 @@
 #!/bin/sh
-# Keep the glimpse hub running in the background on macOS (starts at login, restarts if it dies).
+# Keep the gli hub running in the background on macOS (starts at login, restarts if it dies).
 #   scripts/install_launchd.sh            install + start
 #   scripts/install_launchd.sh uninstall  stop + remove
 # Note: this writes ~/Library/LaunchAgents/dev.glimpse.hub.plist (outside the project directory).
@@ -24,7 +24,7 @@ cat > "$PLIST" <<EOF
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>$LABEL</string>
-  <key>ProgramArguments</key><array><string>$DIR/glimpse</string><string>hub</string></array>
+  <key>ProgramArguments</key><array><string>$DIR/gli</string><string>hub</string></array>
   <key>WorkingDirectory</key><string>$DIR</string>
   <key>EnvironmentVariables</key><dict>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>

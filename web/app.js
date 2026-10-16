@@ -396,7 +396,7 @@ async function boot() {
   const pair = u.searchParams.get('pair');
   if (u.searchParams.has('t')) u.searchParams.delete('t');             // links from older versions: ignored
   if (pair) {
-    try { await loginWith({ pair }); } catch (e) { S.pairErr = e.status === 429 ? '尝试次数过多，请稍后再试' : '登录链接无效或已过期，请在电脑上重新运行 glimpse url'; }
+    try { await loginWith({ pair }); } catch (e) { S.pairErr = e.status === 429 ? '尝试次数过多，请稍后再试' : '登录链接无效或已过期，请在电脑上重新运行 gli url'; }
     u.searchParams.delete('pair');
   }
   if (pair || location.search) history.replaceState(null, '', u.pathname + u.hash);
@@ -1420,8 +1420,8 @@ function fillMore() {
     $('#act-link-sub').textContent = deepLink(v.m, v.sid);
   }
 }
-// `glimpse attach <sid>` on the hub computer finds the session on any machine (local daemon first, then through the hub)
-function attachCmd(m, sid) { return 'glimpse attach ' + sid; }
+// `gli attach <sid>` on the hub computer finds the session on any machine (local daemon first, then through the hub)
+function attachCmd(m, sid) { return 'gli attach ' + sid; }
 function deepLink(m, sid) { return location.origin + '/#' + m + '/' + sid; }
 async function copyText(t, what) {
   let ok = false;
@@ -2136,7 +2136,7 @@ async function renderSettings() {
 async function renderAccount() {
   let r;
   try { r = await api('/api/devices'); } catch (e) { $('#acct-pw-sub').textContent = '无法读取'; return; }
-  $('#acct-pw-sub').textContent = r.has_password ? '已设置' : '未设置（只能用一次性链接登录），在电脑上运行 glimpse password';
+  $('#acct-pw-sub').textContent = r.has_password ? '已设置' : '未设置（只能用一次性链接登录），在电脑上运行 gli password';
   const host = $('#acct-devices');
   host.innerHTML = r.devices.map((d) => '<div class="cell"><span class="cell-ic" style="background:#5C636E" aria-hidden="true">' + ic(/iPhone|Android|iPad/.test(d.name) ? 'phone' : 'laptop') + '</span>' +
     '<span class="grow">' + esc(d.name) + (d.current ? ' <span class="tag">本机</span>' : '') +

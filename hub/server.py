@@ -106,7 +106,7 @@ def origin_ok(request):
     """Cross-site websocket hijacking guard: browsers always send Origin, it must name this host."""
     origin = request.headers.get("Origin")
     if not origin:
-        return True                  # non-browser clients (glimpse attach, tests)
+        return True                  # non-browser clients (gli attach, tests)
     try:
         return urlsplit(origin).netloc.lower() == (request.host or "").lower()
     except ValueError:
@@ -818,7 +818,7 @@ class Hub:
             return False
         if self.auth.device_for(tok):
             return True
-        # the CLI token in data/token is for this computer only (glimpse attach); never valid over the network
+        # the CLI token in data/token is for this computer only (gli attach); never valid over the network
         return self.is_local(request) and hmac.compare_digest(tok.encode(), self.token.encode())
 
     def set_cookie(self, resp, tok):
@@ -1197,7 +1197,7 @@ def main():
         for d in devs:
             print("%s  %-24s last seen %s  %s" % (d["id"], d["name"], time.strftime("%m-%d %H:%M",
                   time.localtime(d["last_seen"])), d["ip"]))
-        print("%d device(s)%s" % (len(devs), "" if auth.has_password() else "; no password set (glimpse password)"))
+        print("%d device(s)%s" % (len(devs), "" if auth.has_password() else "; no password set (gli password)"))
         return
     if a.revoke:
         if a.revoke == "all":

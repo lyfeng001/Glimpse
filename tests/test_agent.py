@@ -1064,3 +1064,51 @@ def test_memory_query_validation():
     mem.query({"action": "budget", "budget": "20G"}, lambda r, e: None)
     assert ran[0] == ["search", "--project", "p", "--limit", "30", "build fail"]
     assert ran[1][:3] == ["budget", "--max-bytes", "20G"]
+
+
+def test_daemon_saves_and_restores_live_sessions(tmp_path, monkeypatch):
+    d = A.Daemon("@unused", str(tmp_path))
+    live = A.Session(d, "a1b2c3", "codex", "codex · x", str(tmp_path), ["codex", "--no-daemon"], 100, 30)
+    live.fd, live.agent_session_id, live.key, live.auto_continue = 5, "019a-conv", "key3", True
+    live.overrides = {"model": "gpt-x"}
+    gone = A.Session(d, "dddddd", "claude", "n", str(tmp_path), ["claude"], 80, 24)
+    gone.agent_session_id = "c-conv"                    # exited: not restored
+    shell = A.Session(d, "eeeeee", "shell", "n", str(tmp_path), [], 80, 24)
+    shell.fd = 6
+    for s in (live, gone, shell):
+        d.sessions[s.sid] = s
+        d.order.append(s.sid)
+    live.env = {"OPENAI_API_KEY": "sk-secret-value"}
+    d.save_state()
+    raw = (tmp_path / "sessions.json").read_text()
+    assert "sk-secret-value" not in raw and oct(os.stat(tmp_path / "sessions.json").st_mode & 0o777) == "0o600"
+    saved = json.loads(raw)["sessions"]
+    assert [r["sid"] for r in saved] == ["a1b2c3"]
+    # a new daemon resumes it under the same sid, key looked up again by name
+    d2 = A.Daemon("@unused", str(tmp_path))
+    calls = []
+
+    def fake_create(kind, cwd, name, args, cols, rows, env=None, key=None, resume_id=None, init_cmds=None,
+                    sid=None, overrides=None):
+        calls.append((kind, args, key, env, resume_id, sid, overrides))
+        s = A.Session(d2, sid, kind, name, cwd, args, cols, rows)
+        d2.sessions[sid] = s
+        return s
+    d2.create = fake_create
+    monkeypatch.setattr(A, "local_launch", lambda kind, key: (["codex"], key, {"OPENAI_API_KEY": "fresh"}))
+    d2.restore_state()
+    assert calls == [("codex", ["codex", "--no-daemon"], "key3", {"OPENAI_API_KEY": "fresh"}, "019a-conv",
+                      "a1b2c3", {"model": "gpt-x"})]
+    assert d2.sessions["a1b2c3"].auto_continue is True
+    assert "自动恢复" in d2.sessions["a1b2c3"].chat[-1]["text"]
+    # a key removed from config.json: resumed without a key instead of failing
+    calls.clear()
+    d3 = A.Daemon("@unused", str(tmp_path))
+    d3.create = fake_create
+
+    def no_key(kind, key):
+        raise RuntimeError("no key")
+    monkeypatch.setattr(A, "local_launch", no_key)
+    (tmp_path / "sessions.json").write_text(raw)
+    d3.restore_state()
+    assert calls[0][2] is None and calls[0][3] is None

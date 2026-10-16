@@ -2520,7 +2520,71 @@ class Daemon:
     def session_list(self):
         return [self.sessions[k].info() for k in self.order if k in self.sessions]
 
-    def create(self, kind, cwd, name, args, cols, rows, env=None, key=None, resume_id=None, init_cmds=None):
+    # --- persistence: a restarted daemon (upgrade, crash, reboot) resumes the conversations that were live
+    def state_file(self):
+        return os.path.join(self.sdir, "sessions.json") if self.sdir else None
+
+    def save_state(self):
+        """Live claude / codex sessions with a known conversation id. No key values / env: the key is looked
+        up again by name in config.json when the session is restored."""
+        path = self.state_file()
+        if not path:
+            return
+        rows = []
+        for k in self.order:
+            s = self.sessions.get(k)
+            if s and s.fd is not None and s.kind in ("claude", "codex") and s.agent_session_id:
+                rows.append({"sid": s.sid, "kind": s.kind, "cwd": s.cwd, "name": s.name, "argv": list(s.argv),
+                             "key": s.key, "conv": s.agent_session_id, "auto_continue": s.auto_continue,
+                             "overrides": dict(s.overrides), "cols": s.cols, "rows": s.rows})
+        data = json.dumps({"v": 1, "sessions": rows}, ensure_ascii=False)
+        if data == getattr(self, "_saved", None):
+            return
+        tmp = path + ".tmp"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(data)
+            os.replace(tmp, path)
+            self._saved = data
+        except OSError as e:
+            sys.stderr.write("glimpse: cannot save sessions: %s\n" % e)
+
+    def restore_state(self):
+        """Resume the sessions saved by the previous daemon (same sid, so phones and attach keep working)."""
+        path = self.state_file()
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                rows = (json.load(f) or {}).get("sessions") or []
+        except (OSError, ValueError):
+            return
+        for r in rows:
+            try:
+                if not isinstance(r, dict) or r.get("kind") not in ("claude", "codex") or r.get("sid") in self.sessions:
+                    continue
+                env, key = None, r.get("key")
+                if key:
+                    try:
+                        _, key, env = local_launch(r["kind"], key)
+                    except RuntimeError:
+                        key = None         # the key was removed from config.json: start without it
+                s = self.create(r["kind"], r.get("cwd"), r.get("name"), [str(a) for a in r.get("argv") or []],
+                                r.get("cols"), r.get("rows"), env, key if env else None, r.get("conv"),
+                                sid=r.get("sid"), overrides=r.get("overrides"))
+                s.auto_continue = bool(r.get("auto_continue"))
+                it = s.add_chat("system", "—— Glimpse 守护进程已重启，已自动恢复这个对话 ——")
+                if it:
+                    self.send_subs(s, {"t": "chat", "sid": s.sid, "items": [it]})
+                sys.stderr.write("glimpse: restored %s (%s %s)\n" % (s.sid, s.kind, s.agent_session_id))
+            except Exception as e:
+                sys.stderr.write("glimpse: cannot restore %s: %s\n" % (r.get("sid") if isinstance(r, dict) else r, e))
+        self.save_state()
+
+
+    def create(self, kind, cwd, name, args, cols, rows, env=None, key=None, resume_id=None, init_cmds=None,
+               sid=None, overrides=None):
         """New session. With resume_id a session that already owns that conversation is reused:
         running -> returned as is, exited -> restarted in place (see create_or_reuse)."""
         if kind not in DEFAULT_PRESETS:
@@ -2539,15 +2603,18 @@ class Daemon:
         cwd = os.path.abspath(os.path.expanduser(cwd or "~"))
         if not os.path.isdir(cwd):
             raise RuntimeError("目录不存在: %s" % cwd)
-        sid = os.urandom(3).hex()
-        while sid in self.sessions:
+        if not (isinstance(sid, str) and re.match(r"^[0-9a-f]{6}$", sid) and sid not in self.sessions):
             sid = os.urandom(3).hex()
+            while sid in self.sessions:
+                sid = os.urandom(3).hex()
         nm = name or "%s · %s" % (kind, os.path.basename(cwd) or cwd)
         s = Session(self, sid, kind, nm, cwd, argv, int(cols or 100), int(rows or 32))
         if env:
             s.env = {str(k): str(v) for k, v in env.items()}
         s.key = key
         s.init_cmds = cmds
+        if kind == "codex" and isinstance(overrides, dict):
+            s.overrides = {k: str(v) for k, v in overrides.items() if k in ("model", "effort", "approval", "sandbox") and v}
         if resume_id:
             s.agent_session_id = resume_id
         self.sessions[sid] = s          # before spawn: a resumed rollout is imported with send_subs etc.
@@ -2995,6 +3062,9 @@ class Daemon:
 
     def tick(self):
         t = now()
+        if t - getattr(self, "_saved_at", 0) > 2:
+            self._saved_at = t
+            self.save_state()
         while self.bg_done:
             cb, res, err = self.bg_done.pop(0)
             try:
@@ -3038,6 +3108,7 @@ class Daemon:
 
     def run(self, idle_exit=None):
         self.listen()
+        self.restore_state()
         self.run_listening(idle_exit)
 
     def run_listening(self, idle_exit=None):
@@ -3174,6 +3245,7 @@ def start_daemon(addr, sdir):
             d.listen()
             os.write(w, b"1")
             os.close(w)
+            d.restore_state()
             d.run_listening()
         except BaseException as e:  # pragma: no cover
             try:
@@ -3327,12 +3399,12 @@ def attach(sid=None):
     if not sid:
         s = pick_live(hello.get("sessions") or [])
         if s is None:
-            raise SystemExit("glimpse: no running session (start one: glimpse run claude)")
+            raise SystemExit("glimpse: no running session (start one: gli run claude)")
         sid = s["sid"]
         print("[glimpse] attaching %s  %s" % (sid, s.get("name") or ""))
     elif sid not in [s["sid"] for s in hello.get("sessions") or []]:
         # exit code 3 = not on this machine (the launcher may then try through the hub)
-        sys.stderr.write("glimpse: no such session %s here (glimpse ls)\n" % sid)
+        sys.stderr.write("glimpse: no such session %s here (gli ls)\n" % sid)
         raise SystemExit(3)
     cols, rows = term_size()
     c.send({"op": "resize", "sid": sid, "cols": cols, "rows": rows})
@@ -3436,7 +3508,7 @@ def local_launch(kind, key_name=None):
 
 def cmd_run(argv):
     import argparse
-    ap = argparse.ArgumentParser(prog="glimpse run", description="start an AI coding session that the phone can see")
+    ap = argparse.ArgumentParser(prog="gli run", description="start an AI coding session that the phone can see")
     ap.add_argument("kind", choices=sorted(DEFAULT_PRESETS))
     ap.add_argument("-n", "--name")
     ap.add_argument("-C", "--cwd", default=os.getcwd())
@@ -3475,7 +3547,7 @@ def start_session(kind, cwd, name, full, resume, env, key, detach=False):
     if m.get("existing"):
         print("[glimpse] this conversation is already session %s, attaching (detach: Ctrl-])" % sid)
     else:
-        print("[glimpse] session %s started (detach: Ctrl-], re-attach: glimpse attach %s)" % (sid, sid))
+        print("[glimpse] session %s started (detach: Ctrl-], re-attach: gli attach %s)" % (sid, sid))
     if not detach:
         time.sleep(0.1)
         attach(sid)
@@ -3546,11 +3618,11 @@ def merge_wrap_argv(base, extra):
 
 
 def cmd_wrap(argv):
-    """`glimpse wrap claude|codex ARGS...`: what the shell functions from `glimpse shell-init` call.
+    """`gli wrap claude|codex ARGS...`: what the shell functions from `gli shell-init` call.
     The usual command line runs as a Glimpse session (visible on the phone) with this terminal attached;
     anything that is not an interactive session runs the real program unchanged."""
     if not argv or argv[0] not in ("claude", "codex"):
-        raise SystemExit("usage: glimpse wrap claude|codex [args...]")
+        raise SystemExit("usage: gli wrap claude|codex [args...]")
     kind, args = argv[0], argv[1:]
     wrap, rid, extra = split_wrap_args(kind, args)
     if not wrap or os.environ.get("GLIMPSE_SID") or os.environ.get("GLIMPSE") == "0" \
@@ -3581,7 +3653,7 @@ codex() { _glimpse_wrap codex "$@"; }
 
 
 def cmd_shell_init():
-    launcher = os.path.join(project_dir(), "glimpse")
+    launcher = os.path.join(project_dir(), "gli")
     print(SHELL_INIT % {"launcher": shlex.quote(launcher)}, end="")
 
 
@@ -3601,7 +3673,7 @@ def cmd_history(argv, adopt=False):
         print("%3d  %-6s %-5s %s%-40s %s" % (i, it["kind"], fmt_age(it["updated"]), "* " if it["active"] else "  ",
                                              clip(it["title"], 40), cwd))
         if not adopt:
-            print("     glimpse run %s --resume %s" % (it["kind"], it["id"]))
+            print("     gli run %s --resume %s" % (it["kind"], it["id"]))
     if any(it["active"] for it in items):
         print("* = written in the last 2 minutes, probably still open in another terminal (close it first)")
     if not adopt:

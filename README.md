@@ -56,7 +56,7 @@ Glimpse turns your phone into a remote control for those sessions. What you see 
 - **Persistent memory (optional, [AMem](https://github.com/lyfeng001/AMem))**: every Claude Code / Codex session of the same project shares one long-term memory, across sessions and machines. The assistant reads earlier conclusions at the start of a task and saves verified ones (decisions, root causes, handoffs) itself; the full history is captured after every turn and searchable. The injected instructions tell the assistant that the current request and the live repository always outrank memory, and to ignore memories that don't matter for the task. Settings → 记忆 shows storage use against the budget (default 20 GB), each project's saved memories and a search. Beyond the budget the oldest tool output and tool calls are compacted away; memories and conversation are never removed. See [Memory](#memory).
 - **Widgets**: network latency and throughput, token usage (including **today's total** per machine, counted from all Claude / Codex transcripts on it), context usage, model & mode, machine CPU and memory, and session counts. Each can be toggled and reordered.
 - **Sessions outlive every connection**: an agent daemon owns the PTYs, the same idea as tmux. Restarting the hub, dropping SSH or locking the phone never stops the AI process. Output resumes from the exact byte offset on reconnect.
-- **Laptop and phone together**: `glimpse run claude` attaches your laptop terminal to the same session. `Ctrl-]` detaches.
+- **Laptop and phone together**: `gli run claude` attaches your laptop terminal to the same session. `Ctrl-]` detaches.
 - **Light / dark**: Settings → 外观 switches between follow system, light and dark. The terminal view stays dark.
 
 <p align="center"><img src="docs/img/controls-v4.png" width="18%" alt="Model & mode"> <img src="docs/img/adopt-v4.png" width="18%" alt="Continue a conversation"> <img src="docs/img/restart-v4.png" width="18%" alt="Key"> <img src="docs/img/home-light-v4.png" width="18%" alt="Light"> <img src="docs/img/devices-v4.png" width="18%" alt="Devices"></p>
@@ -96,8 +96,8 @@ Glimpse turns your phone into a remote control for those sessions. What you see 
 ```sh
 git clone https://github.com/lyfeng001/Glimpse.git
 cd Glimpse
-./glimpse setup            # creates .venv, installs dependencies, creates config.json from config.example.json
-./glimpse install          # optional: puts `glimpse` on your PATH (symlink in ~/.local/bin)
+./gli setup            # creates .venv, installs dependencies, creates config.json from config.example.json
+./gli install          # optional: puts `gli` on your PATH (symlink in ~/.local/bin)
 ```
 
 ### 2. Configure
@@ -110,32 +110,32 @@ Edit `config.json` (every field is documented under [Configuration](#configurati
 ### 3. Run the hub
 
 ```sh
-glimpse hub                    # foreground; the first start fetches an HTTPS certificate via `tailscale cert`
+gli hub                    # foreground; the first start fetches an HTTPS certificate via `tailscale cert`
 scripts/install_launchd.sh       # optional (macOS): start at login and restart if it dies
 ```
 
 ### 4. Open it on the phone
 
 1. Open the Tailscale app and stay connected.
-2. On the computer, run `glimpse url` and open the printed link in the phone's browser. It is a one-time login link: it works once, within 10 minutes. Optionally run `glimpse password` so devices can also log in with a password.
+2. On the computer, run `gli url` and open the printed link in the phone's browser. It is a one-time login link: it works once, within 10 minutes. Optionally run `gli password` so devices can also log in with a password.
 3. Install it as an app (see [Use it as an app](#use-it-as-an-app)), and from then on open Glimpse from its icon.
 4. In ⚙︎ Settings, tap **Enable notifications** and allow them, then tap **Send test notification** to check.
 
 ### 5. Start a session
 
 - **From the phone**: tap ＋ and pick a machine, a type (Claude Code / Codex / Shell), a key and a working directory.
-- **From the computer**: run `glimpse run claude` or `glimpse run codex`. Your terminal attaches to the same session:
+- **From the computer**: run `gli run claude` or `gli run codex`. Your terminal attaches to the same session:
   - `Ctrl-]` detaches.
-  - `glimpse attach <id>` re-attaches, and plain `glimpse attach` picks the latest live session. On the hub computer this also works for sessions on other machines (`glimpse attach M2:<id>`), through the hub. The phone's 会话操作 sheet shows the exact command and a deep link for any other browser.
-  - `glimpse ls` lists all sessions.
-  - Arguments after `--` go to the tool unchanged, e.g. `glimpse run claude -- --model sonnet`.
+  - `gli attach <id>` re-attaches, and plain `gli attach` picks the latest live session. On the hub computer this also works for sessions on other machines (`gli attach M2:<id>`), through the hub. The phone's 会话操作 sheet shows the exact command and a deep link for any other browser.
+  - `gli ls` lists all sessions.
+  - Arguments after `--` go to the tool unchanged, e.g. `gli run claude -- --model sonnet`.
   - It uses the machine's preset from `config.json` (argv and default key, the same as the phone). `-k/--key NAME` picks another key, `--key none` uses none. It prints the key name, never its value.
-  - `glimpse run claude --resume <id>` continues a conversation. If a Glimpse session already holds it, you attach to that session (restarted in place if it had exited) instead of getting a second copy.
+  - `gli run claude --resume <id>` continues a conversation. If a Glimpse session already holds it, you attach to that session (restarted in place if it had exited) instead of getting a second copy.
 
 - **Shell integration (keep typing your usual commands)**: add one line to `~/.zshrc` (or `~/.bashrc`) on the hub computer:
 
   ```sh
-  eval "$(glimpse shell-init)"
+  eval "$(gli shell-init)"
   ```
 
   From then on the plain commands run as Glimpse sessions, with your terminal attached and the session visible on the phone:
@@ -201,7 +201,7 @@ Every setting, including secrets such as API keys, lives in one file: `config.js
 - **Claude Code** always starts with a `--settings` file. Glimpse reads your own settings file from the preset and writes the selected key into its `env`. It then adds Glimpse's hooks and saves the result as a temporary file (`0600`, deleted when the process exits). The key never appears in the process environment or on the command line.
 - **Codex** gets the key as an environment variable (the equivalent of `export OPENAI_API_KEY=...`), named in `keys.env.codex`. The variable is set after your shell rc files run, so a stale key exported in `~/.bashrc` can't override it. If your Codex setup needs extra flags (e.g. `--no-daemon`), add them to `argv`.
 
-**Editing config.json**: changes to `keys` and `memory` are picked up within a few seconds, no restart needed. Changes to `hub` and `machines` need `glimpse hub` restarted (sessions keep running).
+**Editing config.json**: changes to `keys` and `memory` are picked up within a few seconds, no restart needed. Changes to `hub` and `machines` need `gli hub` restarted (sessions keep running).
 
 ## Memory
 
@@ -232,15 +232,15 @@ A machine can override any field with `machines[].memory` (for example its own `
 
 - **Network**: the hub listens only on the addresses in `hub.listen` (by default the Tailscale IP and `127.0.0.1`), so it is unreachable from the LAN and the internet. Only devices signed in to your tailnet can reach it at all.
 - **Login**: every device logs in on its own and gets its own session.
-  - New devices log in with a **one-time link** from `glimpse url` (single use, expires after 10 minutes), or with the **password** you set with `glimpse password`. A copied old link is useless.
+  - New devices log in with a **one-time link** from `gli url` (single use, expires after 10 minutes), or with the **password** you set with `gli password`. A copied old link is useless.
   - Sessions are random 256-bit tokens in an `HttpOnly; Secure; SameSite=Strict` cookie. The hub stores only their SHA-256, and the password only as a salted scrypt hash (`data/auth.json`, `0600`).
-  - Settings → 账号与设备 lists every device with its last use and lets you log one out, or all others, instantly. From the computer: `glimpse devices`, `glimpse logout ID|all`.
+  - Settings → 账号与设备 lists every device with its last use and lets you log one out, or all others, instantly. From the computer: `gli devices`, `gli logout ID|all`.
   - Repeated wrong passwords lock that client out for a growing time.
   - WebSocket connections from another origin are rejected, and nothing secret is written to the log.
 - **Keys**: the browser only ever sees key names. Key values live in the hub's `config.json` (written atomically, `0600`) and in the temporary launch files. Launch command lines are not sent to the phone either.
 - **Agent socket**: the Unix socket is mode `0600`. On Linux, abstract sockets check `SO_PEERCRED` in both directions, so only the same uid can connect and a socket squatted by another user is refused.
 - **Adding machines from the phone** only accepts plain SSH host names or aliases. The hub connects with `BatchMode=yes` and its own keys, never with passwords.
-- **Files**: everything under `data/` (auth data, VAPID private key, push subscriptions, TLS key) is `0600`. `data/token` is only for tools on the hub computer itself (`glimpse attach`) and is refused from any other address.
+- **Files**: everything under `data/` (auth data, VAPID private key, push subscriptions, TLS key) is `0600`. `data/token` is only for tools on the hub computer itself (`gli attach`) and is refused from any other address.
 
 ## FAQ
 
@@ -251,7 +251,7 @@ The project runs on the computer (the hub). The phone only needs the Tailscale a
 
 <details><summary><b>Only iPhone? What about Android or another computer?</b></summary>
 
-Any device with a modern browser that is on your tailnet works: Android, iPad, or another Mac / Windows / Linux computer. Log in with a fresh `glimpse url` link or your password. Push notifications work on Android Chrome and on desktop Chrome, Edge and Safari as well.
+Any device with a modern browser that is on your tailnet works: Android, iPad, or another Mac / Windows / Linux computer. Log in with a fresh `gli url` link or your password. Push notifications work on Android Chrome and on desktop Chrome, Edge and Safari as well.
 </details>
 
 <details><summary><b>What does the logo mean?</b></summary>
@@ -285,9 +285,9 @@ Whichever you answer first. If you tap Allow or Deny on the phone, Claude gets t
 ## Development
 
 ```sh
-glimpse test                   # unit tests + hub integration tests (incl. the RFC 8291 Web Push vectors)
-glimpse hub -v                 # verbose logging
-GLIMPSE_DEBUG=1 glimpse hub    # the agent logs hook events and launch commands to data/agent/agent.log
+gli test                   # unit tests + hub integration tests (incl. the RFC 8291 Web Push vectors)
+gli hub -v                 # verbose logging
+GLIMPSE_DEBUG=1 gli hub    # the agent logs hook events and launch commands to data/agent/agent.log
 ```
 
 ```
@@ -296,7 +296,7 @@ hub/server.py            HTTPS + WebSocket server, auth, push, machine managemen
 hub/machines.py          stdio channel to each machine (local subprocess / ssh)
 hub/webpush.py           Web Push (RFC 8291 encryption + RFC 8292 VAPID), no third-party push library
 hub/config.py            configuration loading
-hub/attach_client.py     `glimpse attach` through the hub (sessions on other machines)
+hub/attach_client.py     `gli attach` through the hub (sessions on other machines)
 web/                     the PWA (vanilla JS + xterm.js, no build step); web/icon.svg is the master logo (PNGs are generated from it)
 ```
 

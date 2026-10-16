@@ -63,7 +63,7 @@ Glimpse 让手机变成这些会话的遥控器。手机上看到的就是它们
 
   每个插件都可以开关和调整顺序。
 - **进程不受连接影响**：会话由 agent 守护进程托管（原理同 tmux）。hub 重启、ssh 断线、手机锁屏都不会中断 AI 进程，重连后从断点续传输出。
-- **电脑和手机同时操作**：`glimpse run claude` 把电脑终端接到同一个会话上，按 `Ctrl-]` 断开。
+- **电脑和手机同时操作**：`gli run claude` 把电脑终端接到同一个会话上，按 `Ctrl-]` 断开。
 - **浅色 / 深色**：设置 → 外观里可选“跟随系统 · 浅色 · 深色”。终端视图始终是深色。
 
 <p align="center"><img src="docs/img/controls-v4.png" width="18%" alt="模型与模式"> <img src="docs/img/adopt-v4.png" width="18%" alt="接管电脑上的会话"> <img src="docs/img/restart-v4.png" width="18%" alt="Key"> <img src="docs/img/home-light-v4.png" width="18%" alt="Light"> <img src="docs/img/devices-v4.png" width="18%" alt="账号与设备"></p>
@@ -106,8 +106,8 @@ Glimpse 让手机变成这些会话的遥控器。手机上看到的就是它们
 ```sh
 git clone https://github.com/lyfeng001/Glimpse.git
 cd Glimpse
-./glimpse setup            # 创建 .venv、安装依赖，并从 config.example.json 生成 config.json
-./glimpse install          # 可选：把 `glimpse` 放进 PATH（在 ~/.local/bin 建一个链接），之后在任何目录都能直接用
+./gli setup            # 创建 .venv、安装依赖，并从 config.example.json 生成 config.json
+./gli install          # 可选：把 `gli` 放进 PATH（在 ~/.local/bin 建一个链接），之后在任何目录都能直接用
 ```
 
 ### 2. 配置
@@ -120,28 +120,28 @@ cd Glimpse
 ### 3. 启动 hub
 
 ```sh
-glimpse hub                    # 前台运行，首次启动会自动用 tailscale cert 申请 HTTPS 证书
+gli hub                    # 前台运行，首次启动会自动用 tailscale cert 申请 HTTPS 证书
 scripts/install_launchd.sh       # 可选（macOS）：开机自启，挂了自动拉起
 ```
 
 ### 4. 在手机上打开
 
 1. 打开 Tailscale App 并保持连接。
-2. 在电脑上运行 `glimpse url`，用手机浏览器打开输出的链接。这是一次性登录链接：只能用一次，10 分钟内有效。也可以运行 `glimpse password` 设置密码，之后设备可以直接用密码登录。
+2. 在电脑上运行 `gli url`，用手机浏览器打开输出的链接。这是一次性登录链接：只能用一次，10 分钟内有效。也可以运行 `gli password` 设置密码，之后设备可以直接用密码登录。
 3. 安装为 App（见[作为 App 使用](#作为-app-使用)），之后都从图标打开。
 4. 进入 ⚙︎ 设置，点“开启通知”并允许，再点“发送测试通知”确认能收到。
 
 ### 5. 开始一个会话
 
 - **在手机上**：点 ＋，选择机器、类型（Claude Code / Codex / Shell）、Key 和工作目录。
-- **在电脑上**：运行 `glimpse run claude` 或 `glimpse run codex`。当前终端会接入同一个会话，`Ctrl-]` 断开，`glimpse attach <id>` 重新接入，不带 id 时接入最近的会话。在 hub 电脑上也能接入其他机器上的会话（`glimpse attach M2:<id>`，经 hub 转发）。手机“会话操作”里会显示具体命令，以及给其他浏览器用的链接。`glimpse ls` 列出所有会话。`--` 之后的参数会原样传给工具，例如 `glimpse run claude -- --model sonnet`。
+- **在电脑上**：运行 `gli run claude` 或 `gli run codex`。当前终端会接入同一个会话，`Ctrl-]` 断开，`gli attach <id>` 重新接入，不带 id 时接入最近的会话。在 hub 电脑上也能接入其他机器上的会话（`gli attach M2:<id>`，经 hub 转发）。手机“会话操作”里会显示具体命令，以及给其他浏览器用的链接。`gli ls` 列出所有会话。`--` 之后的参数会原样传给工具，例如 `gli run claude -- --model sonnet`。
   - 它使用 `config.json` 里这台机器的预设（argv 和默认 Key，与手机端一致）。`-k/--key 名称` 换用其他 Key，`--key none` 不用 Key。终端里只显示 Key 的名称，不显示值。
-  - `glimpse run claude --resume <id>` 继续一段对话。如果这段对话已经在某个 Glimpse 会话里，会直接接入那个会话（已结束的会原地重启），不会再开一个副本。
+  - `gli run claude --resume <id>` 继续一段对话。如果这段对话已经在某个 Glimpse 会话里，会直接接入那个会话（已结束的会原地重启），不会再开一个副本。
 
 - **Shell 集成（继续敲原来的命令）**：在 hub 电脑的 `~/.zshrc`（或 `~/.bashrc`）里加一行：
 
   ```sh
-  eval "$(glimpse shell-init)"
+  eval "$(gli shell-init)"
   ```
 
   之后直接敲原来的命令就会以 Glimpse 会话运行，当前终端照常接入，手机上同时能看到：
@@ -206,7 +206,7 @@ Glimpse 是一个 PWA。安装后从自己的图标全屏打开，没有浏览�
 - **Claude Code**：始终通过 `--settings` 文件启动。Glimpse 读取 preset 里你自己的 settings 文件，把选中的 Key 写进它的 `env`，再加上 Glimpse 的 hooks，合并成一个临时文件（`0600`，进程退出后删除）。Key 不会出现在进程环境变量或命令行参数里。
 - **Codex**：以环境变量的方式注入（相当于 `export OPENAI_API_KEY=...`），变量名在 `keys.env.codex` 里配置。注入发生在 shell 的 rc 文件执行之后，所以 `~/.bashrc` 里写死的旧 Key 不会把它覆盖。如果你的 Codex 需要额外参数（例如 `--no-daemon`），直接写进 `argv`。
 
-**修改 config.json**：`keys` 和 `memory` 的修改几秒内自动生效，不用重启。`hub` 和 `machines` 的修改需要重启 `glimpse hub`（会话不会中断）。
+**修改 config.json**：`keys` 和 `memory` 的修改几秒内自动生效，不用重启。`hub` 和 `machines` 的修改需要重启 `gli hub`（会话不会中断）。
 
 ## 长期记忆
 
@@ -237,15 +237,15 @@ VIRTUAL_ENV=$PWD/.amem uv pip install "agent-memory-local[mcp] @ git+https://git
 
 - **网络**：hub 只监听 `hub.listen` 里的地址（默认是 Tailscale IP 和 `127.0.0.1`），局域网和公网都访问不到，只有登录了你 tailnet 的设备才能连上。
 - **登录**：每台设备单独登录，各自有独立的会话。
-  - 新设备用 `glimpse url` 生成的**一次性链接**登录（只能用一次，10 分钟内有效），或者用 `glimpse password` 设置的**密码**登录。别人拿到之前用过的链接也进不来。
+  - 新设备用 `gli url` 生成的**一次性链接**登录（只能用一次，10 分钟内有效），或者用 `gli password` 设置的**密码**登录。别人拿到之前用过的链接也进不来。
   - 会话是 256 位随机令牌，存在 `HttpOnly; Secure; SameSite=Strict` 的 cookie 里。hub 只保存它的 SHA-256；密码只保存加盐的 scrypt 哈希（`data/auth.json`，`0600`）。
-  - 设置 → 账号与设备里能看到每台设备和最近使用时间，可以随时退出某一台，或者退出其他所有设备，立即生效。在电脑上：`glimpse devices`、`glimpse logout ID|all`。
+  - 设置 → 账号与设备里能看到每台设备和最近使用时间，可以随时退出某一台，或者退出其他所有设备，立即生效。在电脑上：`gli devices`、`gli logout ID|all`。
   - 连续输错密码，这个客户端会被锁定，锁定时间逐次加长。
   - 拒绝来自其他来源的 WebSocket 连接，日志里不写任何机密。
 - 浏览器只拿得到 Key 的名字。Key 值只存在于 hub 的 `config.json`（原子写入，`0600`）和启动用的临时文件里。启动命令行也不会发给手机。
 - agent 的 Unix socket 权限是 `0600`。Linux 抽象 socket 会双向校验 `SO_PEERCRED`：只允许同一个 uid 连接，别的用户抢占的 socket 也会被拒绝。
 - 手机上添加机器时只接受普通的 SSH 主机名或别名。hub 用 `BatchMode=yes` 和自己的密钥连接，从不使用密码。
-- `data/` 下的登录数据、VAPID 私钥、推送订阅、证书私钥都是 `0600`。`data/token` 只给 hub 电脑本机上的工具用（`glimpse attach`），从其他地址发来一律拒绝。
+- `data/` 下的登录数据、VAPID 私钥、推送订阅、证书私钥都是 `0600`。`data/token` 只给 hub 电脑本机上的工具用（`gli attach`），从其他地址发来一律拒绝。
 
 ## FAQ
 
@@ -256,7 +256,7 @@ VIRTUAL_ENV=$PWD/.amem uv pip install "agent-memory-local[mcp] @ git+https://git
 
 <details><summary><b>只有 iPhone 能用吗？安卓或者其他电脑呢？</b></summary>
 
-在 tailnet 里、有现代浏览器的设备都能用，包括 Android、iPad，以及其他 Mac / Windows / Linux 电脑。用新的 `glimpse url` 链接或密码登录即可。Android 上的 Chrome，以及电脑上的 Chrome、Edge、Safari 也都支持推送通知。
+在 tailnet 里、有现代浏览器的设备都能用，包括 Android、iPad，以及其他 Mac / Windows / Linux 电脑。用新的 `gli url` 链接或密码登录即可。Android 上的 Chrome，以及电脑上的 Chrome、Edge、Safari 也都支持推送通知。
 </details>
 
 <details><summary><b>标志是什么意思？</b></summary>
@@ -290,9 +290,9 @@ hub 运行期间会通过 `caffeinate -i` 阻止空闲休眠，但合盖一般�
 ## 开发
 
 ```sh
-glimpse test               # 单元测试 + hub 集成测试（含 RFC 8291 Web Push 官方向量）
-glimpse hub -v             # 详细日志
-GLIMPSE_DEBUG=1 glimpse hub   # agent 记录 hook 事件和启动命令到 data/agent/agent.log
+gli test               # 单元测试 + hub 集成测试（含 RFC 8291 Web Push 官方向量）
+gli hub -v             # 详细日志
+GLIMPSE_DEBUG=1 gli hub   # agent 记录 hook 事件和启动命令到 data/agent/agent.log
 ```
 
 目录结构：
@@ -303,7 +303,7 @@ hub/server.py            HTTPS + WebSocket 服务、鉴权、推送、机器管�
 hub/machines.py          到各台机器的 stdio 通道（本地子进程 / ssh）
 hub/webpush.py           Web Push（RFC 8291 加密 + RFC 8292 VAPID），无第三方依赖
 hub/config.py            配置加载
-hub/attach_client.py     经 hub 实现 `glimpse attach`（接入其他机器上的会话）
+hub/attach_client.py     经 hub 实现 `gli attach`（接入其他机器上的会话）
 web/                     PWA（原生 JS + xterm.js，无构建步骤）；web/icon.svg 是标志源文件（PNG 由它生成）
 ```
 

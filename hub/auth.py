@@ -59,7 +59,7 @@ class Auth:
             self._mtime = None
 
     def refresh(self):
-        """Pick up changes another process made (`./glimpse url` / `./glimpse password` while the hub runs)."""
+        """Pick up changes another process made (`./gli url` / `./gli password` while the hub runs)."""
         try:
             m = os.stat(self.path).st_mtime_ns
         except OSError:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""`./glimpse attach [M2:]SID` on the hub computer.
+"""`./gli attach [M2:]SID` on the hub computer.
 
 Sessions owned by the local agent daemon are attached directly (agent/glimpse_agent.py attach). Anything
 else, i.e. sessions on ssh machines, goes through the running hub's websocket (same protocol as the phone:
@@ -94,7 +94,7 @@ async def connect_hub(token, port):
         except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as e:
             last = e
     await http.close()
-    raise SystemExit("glimpse: cannot reach the hub on 127.0.0.1:%d (%s). Is ./glimpse hub running?" % (port, last))
+    raise SystemExit("glimpse: cannot reach the hub on 127.0.0.1:%d (%s). Is ./gli hub running?" % (port, last))
 
 
 async def attach_hub(want_m, want_sid):

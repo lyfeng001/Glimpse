@@ -1014,11 +1014,13 @@ def test_memory_project_id_and_launch_args(tmp_path):
     s.cwd = str(repo)
     mem = A.Memory(d)
     mem.cfg = dict(A.MEMORY_DEFAULT, enabled=True, python="/opt/py", store=str(tmp_path / "vault"))
+    captured = []
+    mem.capture = lambda ss: captured.append(ss.memory_project)
     mem.attach(s)
     assert s.memory_project is None                     # not probed yet: memory stays off
     mem.version = "0.4.0"
     mem.attach(s)
-    assert s.memory_project == "My-Repo"
+    assert s.memory_project == "My-Repo" and captured == ["My-Repo"]   # earlier history imported at spawn
     args = mem.claude_args(s)
     cfg = json.loads(args[args.index("--mcp-config") + 1])["mcpServers"]["amem"]
     assert cfg["command"] == "/opt/py" and cfg["args"][-3:] == ["--project", "My-Repo", "--no-context"]
@@ -1112,3 +1114,25 @@ def test_daemon_saves_and_restores_live_sessions(tmp_path, monkeypatch):
     (tmp_path / "sessions.json").write_text(raw)
     d3.restore_state()
     assert calls[0][2] is None and calls[0][3] is None
+
+
+def test_claude_stop_failure_no_balance_is_not_retried():
+    d, s = _session("claude")
+    s.fd, s.auto_continue = 99, True
+    timers = []
+    d.later = lambda delay, fn: timers.append((delay, fn))
+    s.poll_tail = lambda: None
+    # the hook only says server_error; the reason is in the last assistant message
+    s.on_hook({"hook_event_name": "StopFailure", "error": "server_error", "error_details": "",
+               "last_assistant_message": "API Error: 500 Key余额不足，无法完成当前操作. This is a server-side issue"})
+    assert timers == [] and s.status == "error"
+    # same category with a transient message is retried
+    s.status = "running"
+    s.on_hook({"hook_event_name": "StopFailure", "error": "server_error", "error_details": "",
+               "last_assistant_message": "API Error: 529 Overloaded"})
+    assert len(timers) == 1 and s.status == "waiting"
+    # no message in the hook: the transcript preview is used
+    s.ac_pending, s.status, timers[:] = False, "running", []
+    s.preview = "API Error: 401 权限验证失败"
+    s.on_hook({"hook_event_name": "StopFailure", "error": "server_error"})
+    assert timers == [] and s.status == "error"

@@ -2130,7 +2130,45 @@ async function renderSettings() {
   $('#set-hubver').textContent = S.hub && S.hub.version ? S.hub.version : '—';
   renderSettingsWidgets(); renderSettingsKeys(); renderSettingsMachines(); renderSettingsMemory(); renderAccount();
   $('#btn-install-sub').textContent = standalone() ? '已作为 App 运行 ✓' : isIOS() ? 'Safari：分享 → 添加到主屏幕' : INST.prompt ? '可以直接安装' : '查看安装方法';
+  renderSettingsNav();
   $('#set-push').textContent = await pushState();
+  const ps = $('#set-push').textContent;
+  $('#nav-push-sub').textContent = /已开启/.test(ps) ? '已开启' : /拒绝/.test(ps) ? '权限被拒绝' : /主屏幕/.test(ps) ? '需从主屏幕图标打开' : /不支持/.test(ps) ? '此浏览器不支持' : ps;
+}
+// ---- settings sub-pages: the main list links to pages that slide in from the right
+const THEME_NAMES = { auto: '跟随系统', light: '浅色', dark: '深色' };
+function renderSettingsNav() {
+  $('#nav-look-sub').textContent = THEME_NAMES[themePref()] + ' · 终端字号 ' + S.fontSize;
+  const w = $$('#set-widgets input[type=checkbox]'); const won = w.filter((x) => x.checked).length;
+  $('#nav-widgets-sub').textContent = w.length ? '已开启 ' + won + ' / ' + w.length : '';
+  $('#nav-keys-sub').textContent = '按键栏 ' + keybar().length + ' 个键';
+  $('#nav-machines-sub').textContent = S.machines.map((mc) => mc.id + (mc.online ? '' : ' 离线')).join(' · ');
+  $('#nav-acct-sub').textContent = $('#acct-pw-sub').textContent === '已设置' ? '已设置密码' : '登录设备与密码';
+}
+function settingsPage(name, back) {
+  const d = $('#dlg-settings'); const cur = $('.spage:not([hidden])', d); const next = $('.spage[data-page="' + name + '"]', d);
+  if (!next || cur === next) return;
+  if (cur) cur.hidden = true;
+  next.hidden = false;
+  next.classList.remove('in', 'back');
+  if (!reduceMotion()) { void next.offsetWidth; next.classList.add(back ? 'back' : 'in'); }
+  $('#dlg-set-title').textContent = next.dataset.title;
+  $('#set-back').style.visibility = name === 'main' ? 'hidden' : '';
+  d.querySelector('.sh-body').scrollTop = 0;
+  if (name === 'main') { renderSettingsNav(); const b = $('[data-spage="' + (cur && cur.dataset.page) + '"]', d); if (b) b.focus({ preventScroll: true }); }
+  else $('#set-back').focus({ preventScroll: true, focusVisible: false });
+}
+for (const b of $$('#dlg-settings [data-spage]')) b.onclick = () => settingsPage(b.dataset.spage);
+$('#set-back').onclick = () => settingsPage('main', true);
+{
+  // swipe right on a sub-page goes back, like iOS
+  const body = $('#dlg-settings .sh-body'); let x0 = null; let y0 = 0;
+  body.addEventListener('touchstart', (e) => { const t = e.touches[0]; x0 = t.clientX < 40 || !$('#dlg-settings .spage[data-page="main"]').hidden ? null : t.clientX; y0 = t.clientY; }, { passive: true });
+  body.addEventListener('touchend', (e) => {
+    if (x0 == null) return; const t = e.changedTouches[0];
+    if (t.clientX - x0 > 80 && Math.abs(t.clientY - y0) < 50) settingsPage('main', true);
+    x0 = null;
+  }, { passive: true });
 }
 // ---- account: password state + per-device sessions (GET /api/devices, POST /api/devices/revoke)
 async function renderAccount() {
@@ -2159,7 +2197,9 @@ const MEM = { m: null, view: 'home', project: null, data: {}, busy: false, q: ''
 function memMachines() { return S.machines.filter((mc) => mc.memory && mc.memory.enabled); }
 function renderSettingsMemory() {
   const list = memMachines();
-  for (const id of ['#set-mem-h', '#set-mem', '#set-mem-f']) $(id).hidden = !list.length;
+  $('#nav-mem').hidden = !list.length;
+  const tot = list.map((mc) => MEM.data[mc.id + ':overview']).filter(Boolean).reduce((a, ov) => a + ov.size.total, 0);
+  $('#nav-mem-sub').textContent = list.length ? (tot ? fmtBytes(tot) + ' · ' : '') + list.map((mc) => mc.id).join(' · ') : '';
   setHTML($('#set-mem'), list.map((mc) => {
     const st = mc.memory; const ov = MEM.data[mc.id + ':overview'];
     const sub = !mc.online ? '机器离线' : st.available ? (ov ? fmtBytes(ov.size.total) + (ov.budget ? ' / ' + fmtBytes(ov.budget.max_bytes) : '') + ' · ' + ov.projects.length + ' 个项目' : 'AMem ' + esc(st.version || '')) : esc(st.error || '不可用');
@@ -2282,7 +2322,7 @@ function refreshOpenSheets() {
   if ($('#dlg-more').open) fillMore();
   if ($('#dlg-ctl').open) renderCtl();
 }
-$('#btn-settings').onclick = () => { renderSettings(); openSheet($('#dlg-settings')); };
+$('#btn-settings').onclick = () => { settingsPage('main'); renderSettings(); openSheet($('#dlg-settings')); };
 $('#opt-hide-exited').onchange = (e) => { S.hideExited = e.target.checked; LS.setItem('glimpse.hideExited', S.hideExited ? '1' : '0'); renderHome(); };
 function setFont(v) {
   S.fontSize = Math.max(8, Math.min(18, v)); LS.setItem('glimpse.font', String(S.fontSize));

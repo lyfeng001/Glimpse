@@ -461,31 +461,44 @@
 <dialog id="dlg-settings" class="sheet" aria-labelledby="dlg-set-title">
   <div class="sh-grab" aria-hidden="true"></div>
   <div class="sh-head">
-    <span class="l"></span><h2 id="dlg-set-title">设置</h2>
+    <button type="button" class="txt-btn l back-btn" id="set-back" style="visibility:hidden" aria-label="返回设置"><svg class="ic" aria-hidden="true"><use href="#i-back"/></svg>设置</button><h2 id="dlg-set-title">设置</h2>
     <button type="button" class="txt-btn strong r" data-close>完成</button>
   </div>
-  <div class="sh-body">
-    <div class="g-h">通知</div>
+  <div class="sh-body spages">
+  <div class="spage" data-page="main" data-title="设置">
+    <div class="group">
+      <button type="button" class="cell" data-spage="push"><span class="cell-ic" style="background:#E5484D" aria-hidden="true"><svg class="ic"><use href="#i-bell"/></svg></span><span class="grow">通知<div class="sub" id="nav-push-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
+      <button type="button" class="cell" data-spage="look"><span class="cell-ic" style="background:#5E5CE6" aria-hidden="true"><svg class="ic"><use href="#i-sun"/></svg></span><span class="grow">外观<div class="sub" id="nav-look-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
+      <button type="button" class="cell" data-spage="widgets"><span class="cell-ic" style="background:#30A46C" aria-hidden="true"><svg class="ic"><use href="#i-widgets"/></svg></span><span class="grow">插件<div class="sub" id="nav-widgets-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
+      <button type="button" class="cell" data-spage="keys"><span class="cell-ic" style="background:#FF9F0A" aria-hidden="true"><svg class="ic"><use href="#i-slash"/></svg></span><span class="grow">快捷键<div class="sub" id="nav-keys-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
+    </div>
+    <div class="group" style="margin-top:var(--s4)">
+      <button type="button" class="cell" data-spage="machines"><span class="cell-ic" style="background:#0A84FF" aria-hidden="true"><svg class="ic"><use href="#i-server"/></svg></span><span class="grow">机器<div class="sub" id="nav-machines-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
+      <button type="button" class="cell" data-spage="mem" id="nav-mem" hidden><span class="cell-ic" style="background:#8E5CF7" aria-hidden="true"><svg class="ic"><use href="#i-sparkle"/></svg></span><span class="grow">记忆<div class="sub" id="nav-mem-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
+    </div>
+    <div class="group" style="margin-top:var(--s4)">
+      <button type="button" class="cell" data-spage="acct"><span class="cell-ic" style="background:#30B0C7" aria-hidden="true"><svg class="ic"><use href="#i-key"/></svg></span><span class="grow">账号与设备<div class="sub" id="nav-acct-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
+      <button type="button" class="cell" id="btn-install"><span class="cell-ic" style="background:#0A84FF" aria-hidden="true"><svg class="ic"><use href="#i-phone"/></svg></span><span class="grow">添加到主屏幕<div class="sub" id="btn-install-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
+    </div>
+    <div class="g-h">关于</div>
+    <div class="group">
+      <div class="cell"><span class="grow">Glimpse</span><span class="val" id="set-ver"></span></div>
+      <div class="cell"><span class="grow">Hub</span><span class="val" id="set-hubver">—</span></div>
+    </div>
+    <div class="g-h"></div>
+    <div class="group">
+      <button type="button" class="cell center danger" id="btn-logout">退出登录</button>
+    </div>
+  </div>
+  <div class="spage" data-page="push" data-title="通知" hidden>
     <div class="group">
       <div class="cell"><span class="cell-ic" style="background:#E5484D" aria-hidden="true"><svg class="ic"><use href="#i-bell"/></svg></span>
         <span class="grow">推送通知<div class="sub" id="set-push" aria-live="polite">检查中…</div></span></div>
       <button type="button" class="cell" id="btn-push"><span class="grow" style="color:var(--accent-text)">开启通知</span></button>
       <button type="button" class="cell" id="btn-push-test"><span class="grow" style="color:var(--accent-text)">发送测试通知</span></button>
     </div>
-    <div class="g-h">插件</div>
-    <div class="group" id="set-widgets"></div>
-    <p class="g-f">开关控制首页和会话页显示哪些插件，箭头调整顺序。</p>
-    <div class="g-h">快捷键</div>
-    <div class="group" id="set-keys"></div>
-    <div class="group" style="margin-top:8px">
-      <label class="cell" for="key-label"><span class="grow">名称</span><input id="key-label" maxlength="8" placeholder="如 ^O" autocapitalize="off" autocorrect="off"></label>
-      <label class="cell" for="key-send"><span class="grow">发送</span><input id="key-send" class="mono" maxlength="500" placeholder="如 ^O、\e、/compact\r" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
-      <button type="button" class="cell" id="key-add"><span class="grow" style="color:var(--accent-text)">添加自定义按键</span></button>
-      <button type="button" class="cell" id="key-reset"><span class="grow" style="color:var(--accent-text)">恢复默认按键栏</span></button>
-    </div>
-    <p class="g-f" id="key-err" role="alert"></p>
-    <p class="g-f">开关决定会话底部显示哪些键，箭头调整顺序。自定义键的写法：<code>^X</code> 是 Ctrl-X，<code>\e</code> 是 Esc，<code>\r</code> 是回车，<code>\t</code> 是 Tab，<code>\x1b</code> 这种是任意字节；其他字符原样发送。</p>
-    <div class="g-h">外观</div>
+  </div>
+  <div class="spage" data-page="look" data-title="外观" hidden>
     <div class="group">
       <div class="cell stack"><span class="lbl" id="theme-lbl">主题</span>
         <div class="tseg" id="opt-theme" role="radiogroup" aria-labelledby="theme-lbl">
@@ -500,35 +513,41 @@
       <label class="cell" for="opt-hide-exited"><span class="grow">隐藏已结束的会话</span>
         <span class="switch"><input type="checkbox" id="opt-hide-exited" role="switch"><i></i></span></label>
     </div>
-    <div class="g-h">机器</div>
+  </div>
+  <div class="spage" data-page="widgets" data-title="插件" hidden>
+    <div class="group" id="set-widgets"></div>
+    <p class="g-f">开关控制首页和会话页显示哪些插件，箭头调整顺序。</p>
+  </div>
+  <div class="spage" data-page="keys" data-title="快捷键" hidden>
+    <div class="group" id="set-keys"></div>
+    <div class="group" style="margin-top:8px">
+      <label class="cell" for="key-label"><span class="grow">名称</span><input id="key-label" maxlength="8" placeholder="如 ^O" autocapitalize="off" autocorrect="off"></label>
+      <label class="cell" for="key-send"><span class="grow">发送</span><input id="key-send" class="mono" maxlength="500" placeholder="如 ^O、\e、/compact\r" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+      <button type="button" class="cell" id="key-add"><span class="grow" style="color:var(--accent-text)">添加自定义按键</span></button>
+      <button type="button" class="cell" id="key-reset"><span class="grow" style="color:var(--accent-text)">恢复默认按键栏</span></button>
+    </div>
+    <p class="g-f" id="key-err" role="alert"></p>
+    <p class="g-f">开关决定会话底部显示哪些键，箭头调整顺序。自定义键的写法：<code>^X</code> 是 Ctrl-X，<code>\e</code> 是 Esc，<code>\r</code> 是回车，<code>\t</code> 是 Tab，<code>\x1b</code> 这种是任意字节；其他字符原样发送。</p>
+  </div>
+  <div class="spage" data-page="machines" data-title="机器" hidden>
     <div class="group" id="set-machines"></div>
     <div class="group" style="margin-top:8px">
       <button type="button" class="cell" id="btn-add-machine"><span class="cell-ic" aria-hidden="true"><svg class="ic"><use href="#i-plus"/></svg></span><span class="grow" style="color:var(--accent-text)">添加机器</span></button>
       <button type="button" class="cell" id="btn-clean"><span class="cell-ic" style="background:#5C636E" aria-hidden="true"><svg class="ic"><use href="#i-broom"/></svg></span><span class="grow">清理已结束的会话<div class="sub" id="btn-clean-sub"></div></span></button>
     </div>
-    <div class="g-h" id="set-mem-h" hidden>记忆</div>
-    <div class="group" id="set-mem" hidden></div>
-    <p class="g-f" id="set-mem-f" hidden>同一个项目的所有 Claude Code / Codex 会话共享一份长期记忆（AMem）：助手会读取之前的结论，并把确认过的结论存下来。超过存储上限时，会先清理最旧的工具输出。</p>
-    <div class="g-h">App</div>
-    <div class="group">
-      <button type="button" class="cell" id="btn-install"><span class="cell-ic" style="background:#0A84FF" aria-hidden="true"><svg class="ic"><use href="#i-phone"/></svg></span><span class="grow">添加到主屏幕<div class="sub" id="btn-install-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
-    </div>
-    <div class="g-h">账号与设备</div>
+  </div>
+  <div class="spage" data-page="mem" data-title="记忆" hidden>
+    <div class="group" id="set-mem"></div>
+    <p class="g-f" id="set-mem-f">同一个项目的所有 Claude Code / Codex 会话共享一份长期记忆（AMem）：助手会读取之前的结论，并把确认过的结论存下来。超过存储上限时，会先清理最旧的工具输出。</p>
+  </div>
+  <div class="spage" data-page="acct" data-title="账号与设备" hidden>
     <div class="group">
       <div class="cell"><span class="cell-ic" style="background:#30B0C7" aria-hidden="true"><svg class="ic"><use href="#i-key"/></svg></span><span class="grow">登录密码<div class="sub" id="acct-pw-sub">—</div></span></div>
       <div id="acct-devices"></div>
       <button type="button" class="cell" id="acct-revoke-others"><span class="cell-ic" style="background:#FF453A" aria-hidden="true"><svg class="ic"><use href="#i-logout"/></svg></span><span class="grow">退出其他所有设备</span></button>
     </div>
     <p class="g-f">每台设备单独登录，可以随时在这里把它退出。新设备在电脑上运行 <code>gli url</code> 获取一次性登录链接（10 分钟内有效，只能用一次）；修改密码：<code>gli password</code>。</p>
-    <div class="g-h">关于</div>
-    <div class="group">
-      <div class="cell"><span class="grow">Glimpse</span><span class="val" id="set-ver"></span></div>
-      <div class="cell"><span class="grow">Hub</span><span class="val" id="set-hubver">—</span></div>
-    </div>
-    <div class="g-h"></div>
-    <div class="group">
-      <button type="button" class="cell center danger" id="btn-logout">退出登录</button>
-    </div>
+  </div>
   </div>
 </dialog>
 

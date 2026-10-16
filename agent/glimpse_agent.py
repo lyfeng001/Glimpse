@@ -1915,7 +1915,14 @@ class Session:
             det = ev.get("error_details") or ""
             if not isinstance(det, str):
                 det = json.dumps(det, ensure_ascii=False)
-            if not self.maybe_auto_continue("%s %s" % (err, det)):
+            # the hook often carries only a category ("server_error"): the real text ("API Error: 500
+            # Key余额不足 ...") is the last assistant message, which decides fatal vs. transient
+            self.poll_tail()
+            last = ev.get("last_assistant_message") or ""
+            if not isinstance(last, str):
+                last = json.dumps(last, ensure_ascii=False)
+            full = " ".join(x for x in (err, det, last, self.preview if not last else "") if x)
+            if not self.maybe_auto_continue(full):
                 self.set_status("error", clip("%s %s" % (err, det), 200), "error")
                 self.event("error", "出错停止: %s" % err, det or ev.get("last_assistant_message") or "")
         self.poll_tail()
@@ -2051,6 +2058,18 @@ class Memory:
         self.exec_py(["-c", "import agent_memory, mcp, sys; sys.stdout.write(agent_memory.__version__)"], probed,
                      "AMem 不可用（需要 Python 3.11+ 且安装 agent-memory-local[mcp]）")
 
+    def configure_now(self, cfg):
+        """Blocking variant of configure() (daemon start, before any session is restored)."""
+        import subprocess
+        self.cfg = dict(MEMORY_DEFAULT, **{k: v for k, v in (cfg or {}).items() if k in MEMORY_DEFAULT})
+        try:
+            r = subprocess.run([self.python(), "-c", "import agent_memory, mcp, sys; sys.stdout.write(agent_memory.__version__)"],
+                               stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+            if r.returncode == 0:
+                self.version, self.error = r.stdout.decode().strip(), None
+        except (OSError, subprocess.SubprocessError) as e:
+            self.error = clip(str(e), 300)
+
     def exec_py(self, args, done, fail=None, timeout=MEMORY_TIMEOUT):
         import subprocess
         cmd = [self.python()] + args
@@ -2090,6 +2109,7 @@ class Memory:
         if memory_external(top) or memory_external(os.path.expanduser("~")):
             return
         s.memory_project, s.memory_root = project, top
+        self.capture(s)          # import this project's earlier conversations now, not after the first turn
 
     def server_entry(self, project):
         return {"command": self.python(),
@@ -2537,7 +2557,7 @@ class Daemon:
                 rows.append({"sid": s.sid, "kind": s.kind, "cwd": s.cwd, "name": s.name, "argv": list(s.argv),
                              "key": s.key, "conv": s.agent_session_id, "auto_continue": s.auto_continue,
                              "overrides": dict(s.overrides), "cols": s.cols, "rows": s.rows})
-        data = json.dumps({"v": 1, "sessions": rows}, ensure_ascii=False)
+        data = json.dumps({"v": 1, "sessions": rows, "memory": self.memory.cfg}, ensure_ascii=False)
         if data == getattr(self, "_saved", None):
             return
         tmp = path + ".tmp"
@@ -2557,9 +2577,13 @@ class Daemon:
             return
         try:
             with open(path) as f:
-                rows = (json.load(f) or {}).get("sessions") or []
+                saved = json.load(f) or {}
+            rows = saved.get("sessions") or []
         except (OSError, ValueError):
             return
+        if isinstance(saved.get("memory"), dict) and saved["memory"].get("enabled") and rows:
+            # the hub sends the memory settings only after it connected: restored sessions need them at spawn
+            self.memory.configure_now(saved["memory"])
         for r in rows:
             try:
                 if not isinstance(r, dict) or r.get("kind") not in ("claude", "codex") or r.get("sid") in self.sessions:

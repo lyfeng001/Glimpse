@@ -713,3 +713,13 @@ dialog.sheet.tall { min-height: min(560px, calc(var(--app-h) - var(--safe-t) - 1
 .mem-text { margin-top: 4px; font-size: 13px; color: var(--text-1); white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow: auto; }
 .mem-text.md { white-space: normal; }
 .mem-q { border: 0; background: transparent; color: var(--text-1); font: inherit; font-size: 15px; padding: 4px 0; outline: none; -webkit-appearance: none; appearance: none; }
+/* settings sub-pages */
+.spage.in { animation: spage-in .26s var(--ease); }
+.spage.back { animation: spage-back .26s var(--ease); }
+@keyframes spage-in { from { transform: translateX(100%); opacity: .6; } }
+@keyframes spage-back { from { transform: translateX(-24%); opacity: .5; } }
+.spages { overflow-x: hidden; }
+.back-btn { display: inline-flex; align-items: center; gap: 2px; padding-left: 0; }
+.back-btn .ic { width: 20px; height: 20px; }
+@media (prefers-reduced-motion: reduce) { .spage.in, .spage.back { animation: none; } }
+#set-back:focus:not(:focus-visible) { outline: none; box-shadow: none; }

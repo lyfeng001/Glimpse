@@ -6,6 +6,7 @@
 #   ./glimpse run claude     start a Claude Code session here, visible on the phone (Ctrl-] detaches)
 #   ./glimpse run codex      start a Codex session
 #   ./glimpse ls | kill ID
+#   ./glimpse shell-init     print shell functions so plain `claude` / `codex` run as Glimpse sessions
 #   ./glimpse attach [ID]    attach this terminal (no ID: most recent live session). Sessions on other machines
 #                            (ssh) are attached through the running hub: ./glimpse attach ID or M2:ID
 set -e

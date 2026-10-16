@@ -600,3 +600,354 @@ def test_always_allow_uses_the_resolved_requests_rules():
     assert s.resolve_pending("always", pid=second["id"])
     out = [o for c, o in d.sent if c == "w2"][-1]["out"]
     assert out["hookSpecificOutput"]["decision"]["updatedPermissions"][0]["rules"][0]["toolName"] == "Bash"
+
+
+# --------------------------------------------------------------------------- v4
+
+FIX = os.path.join(os.path.dirname(__file__), "fixtures")
+
+
+def _screen_menu(name):
+    scr = A.Screen(100, 30)
+    with open(os.path.join(FIX, name), "rb") as f:
+        scr.feed(f.read())
+    return scr.menu()
+
+
+def test_menu_claude_model_capture():
+    m = _screen_menu("tui_claude_model.bin")
+    assert m["kind"] == "list" and m["title"] == "Select model" and m["cursor"] == 0
+    assert [o["label"] for o in m["options"]] == ["Default (recommended)", "global.anthropic.claude-opus-5-5",
+                                                  "Sonnet 5", "Haiku 4.5"]
+    assert m["options"][0]["current"] and not m["options"][1]["current"]
+    assert m["options"][0]["desc"].endswith("(currently global.anthropic.claude-opus-5-5[1m])")   # wrapped line
+    assert m["options"][3]["desc"] == "Custom Haiku model (global.anthropic.claude-haiku-4-5-20251001-v1:0)"
+    assert "s to use this session only" in m["hint"]
+    json.dumps(m)
+
+
+def test_menu_claude_effort_slider_capture():
+    m = _screen_menu("tui_claude_effort.bin")
+    assert m["kind"] == "slider" and m["title"] == "Effort"
+    assert [o["label"] for o in m["options"]] == ["low", "medium", "high", "xhigh", "max", "ultracode"]
+    assert m["cursor"] == 2 and "Enter to confirm" in m["hint"]
+
+
+def test_menu_claude_effort_slider_toggle_layout():
+    """Newer layout: ultracode is a Tab toggle after "max", the slider has five stops."""
+    m = _screen_menu("tui_claude_effort2.bin")
+    assert m["kind"] == "slider" and m["title"] == "Effort" and m["cursor"] == 3
+    assert [o["label"] for o in m["options"]] == ["low", "medium", "high", "xhigh", "max"]
+
+
+def test_menu_codex_model_capture():
+    m = _screen_menu("tui_codex_model.bin")
+    assert m["kind"] == "list" and m["title"] == "Select Model and Effort" and m["cursor"] == 1
+    assert len(m["options"]) == 8 and m["options"][1]["label"] == "GPT-6-Astra" and m["options"][1]["current"]
+    assert m["options"][0]["desc"].startswith("Latest workhorse") and m["hint"] == "enter select · esc back"
+
+
+def test_menu_none_without_footer_or_when_unsure():
+    assert A.parse_menu(["  1. foo", "❯ 2. bar"]) is None                          # no footer
+    assert A.parse_menu(["Pick", "  1. a", "  2. b", "", "Esc to cancel"]) is None   # no cursor mark
+    assert A.parse_menu(["Pick", "❯ 1. a", "  3. b", "", "Esc to cancel"]) is None   # gap in numbering
+    assert A.parse_menu(["", "Esc to cancel"]) is None
+    many = ["Pick"] + ["%s%d. x" % ("❯ " if i == 1 else "  ", i) for i in range(1, 23)] + ["esc to cancel"]
+    assert A.parse_menu(many) is None
+    m = A.parse_menu(["Do you want to proceed?", "› 1. Yes", "  2. No (current)", "Esc to cancel"])
+    assert m["options"][1] == {"i": 1, "label": "No", "desc": "", "current": True}
+    long_ = A.parse_menu(["T", "❯ 1. " + "y" * 300, "esc to cancel"])
+    assert len(long_["options"][0]["label"]) == 200
+
+
+class MenuSess:
+    def __init__(self, menu):
+        self.fd, self.menu, self.menu_dirty, self.writes = 5, menu, False, []
+
+    def check_menu(self, t=None):
+        pass
+
+    def touch(self):
+        pass
+
+    def user_input(self):
+        pass
+
+    def write(self, d):
+        self.writes.append(d)
+
+
+def _timer_daemon():
+    d = A.Daemon.__new__(A.Daemon)
+    d.timers = []
+    return d
+
+
+def _run_timers(d):
+    for _, fn in sorted(d.timers, key=lambda x: x[0]):
+        fn()
+    d.timers = []
+
+
+def test_menu_op_key_sequences():
+    d = _timer_daemon()
+    s = MenuSess({"kind": "list", "options": [{"i": i} for i in range(4)], "cursor": 1})
+    d.menu_op(s, index=3)
+    _run_timers(d)
+    assert s.writes == [b"\x1b[B", b"\x1b[B", b"\r"] and s.menu is None and s.menu_dirty
+    s = MenuSess({"kind": "list", "options": [{"i": i} for i in range(4)], "cursor": 2})
+    d.menu_op(s, index=0)
+    _run_timers(d)
+    assert s.writes == [b"\x1b[A", b"\x1b[A", b"\r"]
+    s = MenuSess({"kind": "slider", "options": [{"i": i} for i in range(6)], "cursor": 2})
+    d.menu_op(s, index=5)
+    _run_timers(d)
+    assert s.writes == [b"\x1b[C"] * 3 + [b"\r"]
+    s = MenuSess({"kind": "slider", "options": [{"i": i} for i in range(6)], "cursor": 2})
+    d.menu_op(s, index=2)
+    assert s.writes == [b"\r"]
+    for key, data in (("esc", b"\x1b"), ("s", b"s")):
+        s = MenuSess({"kind": "list", "options": [{"i": 0}], "cursor": 0})
+        d.menu_op(s, key=key)
+        assert s.writes == [data]
+    import pytest
+    for bad in (dict(index=4), dict(index=-1), dict(index=True), dict(key="q")):
+        with pytest.raises(RuntimeError):
+            d.menu_op(MenuSess({"kind": "list", "options": [{"i": i} for i in range(4)], "cursor": 0}), **bad)
+    with pytest.raises(RuntimeError):
+        d.menu_op(MenuSess(None), index=0)
+
+
+def test_session_menu_detected_after_settle():
+    _, s = _session("codex")
+    with open(os.path.join(FIX, "tui_codex_model.bin"), "rb") as f:
+        s.screen.feed(f.read())
+    s.menu_dirty = True
+    s.activity = A.now()
+    s.menu_parsed = s.activity
+    s.check_menu(s.activity + 0.05)
+    assert s.menu is None                                    # output still settling
+    s.check_menu(s.activity + 0.2)
+    assert s.info()["menu"]["title"] == "Select Model and Effort"
+    # output that never pauses (claude's animated logo) still gets parsed every MENU_MAX_WAIT
+    s.menu, s.menu_dirty, s.menu_parsed = None, True, A.now()
+    s.activity = s.menu_parsed + 0.55
+    s.check_menu(s.activity + 0.01)
+    assert s.menu is not None
+    s.on_exit(0)
+    assert s.info()["menu"] is None
+
+
+def test_models_claude_from_settings(tmp_path):
+    st = tmp_path / "s.json"
+    st.write_text(json.dumps({"env": {"ANTHROPIC_AUTH_TOKEN": "secret-tok", "ANTHROPIC_BASE_URL": "https://x",
+                                      "ANTHROPIC_DEFAULT_OPUS_MODEL": "my-opus",
+                                      "ANTHROPIC_DEFAULT_HAIKU_MODEL": "my-haiku"}}))
+    d = _daemon(tmp_path)
+    out = []
+    d.models("claude", ["claude", "--settings", str(st)], lambda r, e: out.append((r, e)))
+    (r, e), = out
+    assert e is None and "secret-tok" not in json.dumps(r) and "https://x" not in json.dumps(r)
+    assert [m["id"] for m in r["models"]] == ["default", "opus", "sonnet", "haiku", "fable", "opusplan"]
+    assert "my-opus" in r["models"][1]["desc"] and "my-haiku" in r["models"][3]["desc"]
+    assert r["efforts"] == ["low", "medium", "high", "xhigh", "max", "ultracode"]
+    assert r["modes"] == ["manual", "acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions"]
+    out = []
+    d.models("claude", None, lambda r, e: out.append(r))      # no settings file: still a list
+    assert out[0]["models"][0]["label"] == "Default"
+
+
+CODEX_MODELS_JSON = json.dumps({"models": [
+    {"slug": "b", "display_name": "B", "description": "bee", "visibility": "list", "priority": 2,
+     "default_reasoning_level": "medium", "supported_reasoning_levels": [{"effort": "low"}, {"effort": "max"}]},
+    {"slug": "hidden", "display_name": "H", "visibility": "hide", "priority": 0,
+     "supported_reasoning_levels": [{"effort": "minimal"}]},
+    {"slug": "a", "display_name": "A", "description": "ay", "visibility": "list", "priority": 1,
+     "default_reasoning_level": "low",
+     "supported_reasoning_levels": [{"effort": "ultra"}, {"effort": "low"}, {"effort": "xhigh"}]}]})
+
+
+def test_models_codex_subprocess_and_cache(tmp_path, monkeypatch):
+    d = _daemon(tmp_path)
+    calls = []
+    monkeypatch.setattr(A, "run_login_shell", lambda cmd, timeout: calls.append(cmd) or "motd\n" + CODEX_MODELS_JSON)
+    d.background = lambda fn: fn()
+    out = []
+    d.models("codex", ["codex", "-c", "x=1", "--no-daemon", "-p", "prof"], lambda r, e: out.append((r, e)))
+    assert out == []                                          # delivered from tick() (main loop)
+    d.tick()
+    (r, e), = out
+    assert calls == [["codex", "debug", "models", "-c", "x=1"]]
+    assert [m["id"] for m in r["models"]] == ["a", "b"]
+    assert r["models"][0] == {"id": "a", "label": "A", "desc": "ay", "efforts": ["ultra", "low", "xhigh"],
+                              "default_effort": "low"}
+    assert r["efforts"] == ["low", "xhigh", "max", "ultra"] and r["modes"] == []
+    d.models("codex", ["codex", "-c", "x=1"], lambda r, e: out.append((r, e)))
+    assert len(calls) == 1 and out[-1][0] is r                 # cached
+    d.models_cache = {}
+    monkeypatch.setattr(A, "run_login_shell", lambda cmd, timeout: (_ for _ in ()).throw(RuntimeError("boom")))
+    d.models("codex", None, lambda r, e: out.append((r, e)))
+    d.tick()
+    assert out[-1][0] is None and "boom" in out[-1][1] and d.models_cache == {}
+
+
+def test_create_dedupes_resume_id(tmp_path, monkeypatch):
+    d = _daemon(tmp_path)
+    spawned = []
+
+    def spawn(self, resume=False):
+        spawned.append((self.sid, resume, dict(self.env)))
+        self.fd, self.pid = 99, 4242
+    monkeypatch.setattr(A.Session, "spawn", spawn)
+    out = []
+    d.create_or_reuse({"kind": "claude", "cwd": str(tmp_path), "resume_id": "conv-1"}, lambda *a: out.append(a))
+    s, existing, err = out[-1]
+    assert not existing and err is None and len(spawned) == 1
+    # running -> the same session, no second process
+    d.create_or_reuse({"kind": "claude", "cwd": str(tmp_path), "resume_id": "conv-1"}, lambda *a: out.append(a))
+    assert out[-1] == (s, True, None) and len(spawned) == 1 and len(d.sessions) == 1
+    # exited -> restarted in place (same sid), resuming, with the new key
+    s.fd = None
+    s.on_exit(0)
+    s.add_chat("user", "keep me")
+    d.create_or_reuse({"kind": "claude", "cwd": str(tmp_path), "resume_id": "conv-1", "env": {"K": "v2"},
+                       "key": "key2"}, lambda *a: out.append(a))
+    assert out[-1] == (s, True, None) and spawned[-1] == (s.sid, True, {"K": "v2"}) and s.key == "key2"
+    assert len(d.sessions) == 1 and any(c["text"] == "keep me" for c in s.chat) and s.restarts == 1
+    # through handle(): the reply carries existing=True
+    sent = []
+    d.send = lambda c, obj: sent.append(obj)
+    d.handle(None, {"op": "create", "req": 3, "kind": "claude", "cwd": str(tmp_path), "resume_id": "conv-1"})
+    assert sent[-1]["t"] == "created" and sent[-1]["existing"] is True and sent[-1]["s"]["sid"] == s.sid
+    d.handle(None, {"op": "create", "req": 4, "kind": "claude", "cwd": str(tmp_path)})
+    assert sent[-1]["t"] == "created" and "existing" not in sent[-1] and len(d.sessions) == 2
+
+
+def test_init_cmds_typed_after_first_session_start(tmp_path, monkeypatch):
+    d = _daemon(tmp_path)
+    monkeypatch.setattr(A.Session, "spawn", lambda self, resume=False: setattr(self, "fd", 99))
+    typed = []
+    monkeypatch.setattr(A.Daemon, "type_text", lambda self, s, text: typed.append(text))
+    s = d.create("claude", str(tmp_path), None, None, 80, 24, init_cmds=["/effort ultracode"])
+    s.event = lambda *a, **k: None
+    assert s.init_cmds == ["/effort ultracode"]
+    s.on_hook({"hook_event_name": "SessionStart", "session_id": "x"})
+    assert s.init_cmds == [] and typed == []
+    for t, fn in d.timers:
+        fn()
+    assert typed == ["/effort ultracode"]
+    d.timers = []
+    s.on_hook({"hook_event_name": "SessionStart", "session_id": "x"})    # /clear etc.: not again
+    assert d.timers == []
+    import pytest
+    for bad in (["effort"], ["/x"] * 5, ["/" + "x" * 200], "/x", ["/a\r/b"]):
+        with pytest.raises(RuntimeError):
+            d.create("claude", str(tmp_path), None, None, 80, 24, init_cmds=bad)
+    assert d.create("codex", str(tmp_path), None, None, 80, 24, init_cmds=["/x"]).init_cmds == []
+
+
+def test_control_effort_values(tmp_path):
+    d = _timer_daemon()
+    typed = []
+    d.type_text = lambda s, text: typed.append(text)
+    _, s = _session()
+    s.fd = 5
+    d.control(s, "effort", "ultracode", lambda err: typed.append(err))
+    assert typed == ["/effort ultracode", None]
+    _, cs = _session("codex")
+    restarts = []
+    cs.restart = lambda env, key, resume, done: restarts.append(resume) or done(None)
+    d.control(cs, "effort", "ultra", lambda err: restarts.append(err))
+    assert cs.overrides == {"effort": "ultra"} and restarts == [True, None]
+
+
+def _cfg(tmp_path, monkeypatch, key=None):
+    cfg = {"keys": {"env": {"claude": "ANTHROPIC_AUTH_TOKEN", "codex": "OPENAI_API_KEY"},
+                    "profiles": [{"name": "key1", "value": "v1"}, {"name": "key2", "value": "v2"}]},
+           "machines": [{"id": "M2", "type": "ssh", "presets": {"claude": {"argv": ["nope"]}}},
+                        {"id": "M1", "type": "local", "presets": {
+                            "claude": {"argv": ["claude", "--settings", "~/s.json"], "key": key},
+                            "codex": {"argv": ["codex", "--no-daemon"]}}}]}
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(cfg))
+    monkeypatch.setenv("GLIMPSE_CONFIG", str(p))
+
+
+def test_cmd_run_key_resolution(tmp_path, monkeypatch):
+    import pytest
+    _cfg(tmp_path, monkeypatch, key="key1")
+    assert A.local_launch("claude") == (["claude", "--settings", "~/s.json"], "key1", {"ANTHROPIC_AUTH_TOKEN": "v1"})
+    assert A.local_launch("claude", "key2")[1:] == ("key2", {"ANTHROPIC_AUTH_TOKEN": "v2"})
+    assert A.local_launch("claude", "none")[1:] == (None, None)
+    assert A.local_launch("codex") == (["codex", "--no-daemon"], None, None)
+    assert A.local_launch("codex", "key2")[1:] == ("key2", {"OPENAI_API_KEY": "v2"})
+    with pytest.raises(RuntimeError):
+        A.local_launch("claude", "missing")
+    monkeypatch.setenv("GLIMPSE_CONFIG", str(tmp_path / "absent.json"))
+    assert A.local_launch("claude") == (["claude"], None, None)
+
+
+def test_cmd_run_sends_key_and_attaches_existing(tmp_path, monkeypatch, capsys):
+    _cfg(tmp_path, monkeypatch, key="key1")
+    sent, attached = [], []
+
+    class FakeConn:
+        def __init__(self, sock):
+            pass
+
+        def call(self, obj, want):
+            sent.append(obj)
+            if obj["op"] == "hello":
+                return {"t": "hello"}
+            return {"t": "created", "s": {"sid": "abc"}, "existing": True}
+    monkeypatch.setattr(A, "Conn", FakeConn)
+    monkeypatch.setattr(A, "ensure_daemon", lambda: None)
+    monkeypatch.setattr(A, "attach", lambda sid: attached.append(sid))
+    monkeypatch.setattr(A.time, "sleep", lambda x: None)
+    A.cmd_run(["claude", "--resume", "conv-1", "-C", str(tmp_path)])
+    cr = sent[-1]
+    assert cr["env"] == {"ANTHROPIC_AUTH_TOKEN": "v1"} and cr["key"] == "key1" and cr["resume_id"] == "conv-1"
+    assert attached == ["abc"]
+    out = capsys.readouterr().out
+    assert "[glimpse] key: key1" in out and "v1" not in out and "already" in out
+    A.cmd_run(["codex", "-k", "key2", "-d"])
+    assert sent[-1]["key"] == "key2" and sent[-1]["env"] == {"OPENAI_API_KEY": "v2"} and attached == ["abc"]
+    import pytest
+    with pytest.raises(SystemExit):
+        A.cmd_run(["claude", "--key", "nope"])
+
+
+def test_shell_wrap_parsing():
+    w = A.split_wrap_args
+    tid = "01a0edaf-75de-7bd2-b706-c991c4118ecb"
+    assert w("codex", ["resume", tid, "--no-daemon"]) == (True, tid, ["--no-daemon"])
+    assert w("codex", ["--no-daemon"]) == (True, None, ["--no-daemon"])
+    assert w("codex", ["fix the tests"]) == (True, None, ["fix the tests"])        # prompt, not a sub-command
+    assert w("codex", ["resume", "--last"]) == (True, None, ["resume", "--last"])   # codex's own picker
+    assert w("codex", ["exec", "hi"])[0] is False
+    assert w("codex", ["login"])[0] is False
+    assert w("codex", ["--version"])[0] is False
+    assert w("claude", ["--resume", "abc-123", "--model", "opus"]) == (True, "abc-123", ["--model", "opus"])
+    assert w("claude", ["-r", "abc-123"]) == (True, "abc-123", [])
+    assert w("claude", ["--resume=abc-123"]) == (True, "abc-123", [])
+    assert w("claude", ["-r"]) == (True, None, ["-r"])                              # interactive picker
+    assert w("claude", ["-p", "hi"])[0] is False
+    assert w("claude", ["mcp", "list"])[0] is False
+    assert w("claude", []) == (True, None, [])
+
+
+def test_shell_wrap_merge_argv():
+    m = A.merge_wrap_argv
+    assert m(["codex", "--no-daemon"], ["--no-daemon"]) == ["codex", "--no-daemon"]
+    assert m(["claude", "--settings", "a.json"], ["--model", "opus"]) == ["claude", "--settings", "a.json", "--model", "opus"]
+    assert m(["claude", "--settings", "a.json"], ["--settings", "b.json"]) == ["claude", "--settings", "b.json"]
+
+
+def test_shell_init_defines_functions(capsys):
+    A.cmd_shell_init()
+    out = capsys.readouterr().out
+    assert "claude() { _glimpse_wrap claude" in out and "codex() { _glimpse_wrap codex" in out
+    assert "wrap \"$@\"" in out and "GLIMPSE_SID" in out
+    import subprocess
+    r = subprocess.run(["sh", "-n", "-c", out], capture_output=True)
+    assert r.returncode == 0, r.stderr

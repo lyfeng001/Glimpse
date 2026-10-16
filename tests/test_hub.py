@@ -94,7 +94,20 @@ def test_default_codex_key_env_and_options(hub_mod, tmp_path):
     assert opts["claude"]["models"] == ["opus"]                 # overridden list
     assert "plan" in opts["claude"]["modes"]                    # untouched default
     assert opts["codex"]["sandboxes"][0] == "read-only"
-    assert C.DEFAULTS["options"]["claude"]["models"] == ["opus", "sonnet", "haiku"]   # defaults not mutated
+    assert C.DEFAULTS["options"]["claude"]["models"][:2] == ["default", "opus"]   # defaults not mutated
+    assert opts["claude"]["efforts"] == ["low", "medium", "high", "xhigh", "max", "ultracode"]
+    assert opts["claude"]["modes"] == ["manual", "acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions"]
+    assert opts["codex"]["efforts"] == ["low", "medium", "high", "xhigh", "max", "ultra"]
+    assert opts["codex"]["approvals"] == ["untrusted", "on-request", "never"]
+    assert "minimal" not in json.dumps(opts)
+    # old defaults that an earlier save() wrote into config.json give way to the new ones
+    cfg["options"] = {"claude": {"modes": ["default", "acceptEdits", "auto", "plan", "bypassPermissions"],
+                                 "efforts": ["low", "medium", "high", "xhigh", "max"],
+                                 "models": ["opus", "sonnet", "haiku"]},
+                      "codex": {"efforts": ["minimal", "low", "medium", "high", "max"], "models": ["gpt-x"]}}
+    opts = server.Hub(cfg).options()
+    assert opts["claude"] == C.DEFAULTS["options"]["claude"]
+    assert opts["codex"]["efforts"][-1] == "ultra" and opts["codex"]["models"] == ["gpt-x"]
 
 
 def test_write_secret_atomic(hub_mod, tmp_path):
@@ -122,6 +135,12 @@ def test_build_argv_flags(hub_mod):
         b("claude", ["claude"], {"model": "opus --dangerously-skip-permissions"})
     with pytest.raises(ValueError):
         b("codex", ["codex"], {"effort": 'high" -c x="y'})
+    # ultracode has no CLI flag: xhigh on argv, the agent types /effort ultracode after start
+    assert b("claude", ["claude"], {"effort": "ultracode"}) == ["claude", "--effort", "xhigh"]
+    assert server.init_cmds("claude", {"effort": "ultracode"}) == ["/effort ultracode"]
+    assert server.init_cmds("claude", {"effort": "high"}) is None
+    assert server.init_cmds("codex", {"effort": "ultra"}) is None
+    assert b("codex", ["codex"], {"effort": "ultra"}) == ["codex", "-c", 'model_reasoning_effort="ultra"']
 
 
 def test_origin_check(hub_mod):
@@ -287,3 +306,131 @@ def test_resolve_hub_auto(hub_mod, monkeypatch):
     assert url == "https://mac.tail.ts.net:8443/?t=<run ./glimpse url>"
     assert C.token() not in url
     server.RUNTIME.clear()
+
+
+def test_create_ultracode_and_codex_ultra_control(hub_mod):
+    C, server = hub_mod
+
+    async def run():
+        hub = server.Hub(C.load())
+        m = FakeMachine()
+        m.cfg["presets"] = {"claude": {"argv": ["claude", "--settings", "s.json"]}}
+        hub.machines[m.id] = m
+        hub.order.append(m.id)
+        p = FakePhone()
+        await hub.phone_op(p, {"op": "create", "m": "M1", "kind": "claude", "effort": "ultracode"})
+        c = m.written[-1]
+        assert c["args"] == ["claude", "--settings", "s.json", "--effort", "xhigh"]
+        assert "ultracode" not in c["args"] and c["init_cmds"] == ["/effort ultracode"]
+        await hub.phone_op(p, {"op": "create", "m": "M1", "kind": "codex", "effort": "high"})
+        assert m.written[-1]["init_cmds"] is None
+        await hub.phone_op(p, {"op": "control", "m": "M1", "sid": "s1", "action": "effort", "value": "ultra"})
+        assert m.written[-1]["op"] == "control" and m.written[-1]["value"] == "ultra"
+        await hub.phone_op(p, {"op": "control", "m": "M1", "sid": "s1", "action": "effort", "value": "ultracode"})
+        assert m.written[-1]["value"] == "ultracode"
+    asyncio.run(run())
+
+
+def test_menu_op_validation_and_reply(hub_mod):
+    C, server = hub_mod
+
+    async def run():
+        hub = server.Hub(C.load())
+        m = FakeMachine()
+        hub.machines[m.id] = m
+        hub.order.append(m.id)
+        p, other = FakePhone(), FakePhone()
+        hub.phones.update([p, other])
+        await hub.phone_op(p, {"op": "menu", "m": "M1", "sid": "s1", "index": 3, "extra": "x"})
+        w = m.written[-1]
+        assert w == {"op": "menu", "sid": "s1", "index": 3, "req": w["req"]}
+        await hub.on_machine_msg(m, {"t": "ok", "req": w["req"]})
+        assert p.sent[-1] == {"t": "menu_ok", "m": "M1", "sid": "s1"} and other.sent == []
+        for key in ("esc", "s"):
+            await hub.phone_op(p, {"op": "menu", "m": "M1", "sid": "s1", "key": key})
+            assert m.written[-1]["key"] == key and "index" not in m.written[-1]
+        n = len(m.written)
+        for bad in ({"index": -1}, {"index": 31}, {"index": "2"}, {"index": True}, {"index": 1.5},
+                    {"key": "enter"}, {"key": "\x1b[A"}, {}):
+            await hub.phone_op(p, dict({"op": "menu", "m": "M1", "sid": "s1"}, **bad))
+            assert p.sent[-1]["t"] == "error", bad
+        await hub.phone_op(p, {"op": "menu", "m": "M1", "index": 0})          # no session
+        assert p.sent[-1]["t"] == "error" and len(m.written) == n
+        # agent errors (no menu on screen) go back to the asking phone
+        await hub.phone_op(p, {"op": "menu", "m": "M1", "sid": "s1", "index": 0})
+        await hub.on_machine_msg(m, {"t": "error", "req": m.written[-1]["req"], "msg": "no menu"})
+        assert p.sent[-1]["t"] == "error" and p.sent[-1]["msg"] == "no menu" and other.sent == []
+    asyncio.run(run())
+
+
+def test_session_menu_passes_through_state(hub_mod):
+    C, server = hub_mod
+    from machines import Machine
+
+    async def run():
+        cfg = C.load()
+        cfg["machines"] = [{"id": "M1", "name": "mac", "type": "local"}]
+        hub = server.Hub(cfg)
+        m = hub.machines["M1"]
+        assert isinstance(m, Machine)
+        menu = {"kind": "list", "title": "Select model", "cursor": 1, "hint": "Esc to cancel",
+                "options": [{"i": 1, "label": "Default", "desc": "", "current": True}]}
+        await m.handle({"t": "session", "s": {"sid": "s1", "status": "running", "menu": menu}})
+        st = hub.state()
+        assert st["machines"][0]["sessions"][0]["menu"] == menu
+        await m.handle({"t": "session", "s": {"sid": "s1", "status": "running", "menu": None}})
+        assert hub.state()["machines"][0]["sessions"][0]["menu"] is None
+    asyncio.run(run())
+
+
+class ModelsMachine(FakeMachine):
+    def __init__(self):
+        FakeMachine.__init__(self)
+        self.cfg["presets"] = {"codex": {"argv": ["codex", "--profile", "x"]}}
+        self.calls = []
+        self.reply = {"t": "models", "kind": "codex", "efforts": ["low", "ultra"], "modes": [],
+                      "models": [{"id": "gpt-x", "label": "GPT-X", "desc": "", "efforts": ["low", "ultra"],
+                                  "default_effort": "low"}]}
+
+    async def call(self, obj, timeout=20):
+        self.calls.append(obj)
+        await asyncio.sleep(0.01)
+        return dict(self.reply, req=obj.get("req"))
+
+
+def test_models_forwarding_and_cache(hub_mod, monkeypatch):
+    C, server = hub_mod
+
+    async def run():
+        hub = server.Hub(C.load())
+        m = ModelsMachine()
+        hub.machines[m.id] = m
+        hub.order.append(m.id)
+        p, q, other = FakePhone(), FakePhone(), FakePhone()
+        hub.phones.update([p, q, other])
+        # two phones at once -> one agent call with the preset argv
+        await asyncio.gather(hub.phone_op(p, {"op": "models", "m": "M1", "kind": "codex"}),
+                             hub.phone_op(q, {"op": "models", "m": "M1", "kind": "codex"}))
+        assert m.calls == [{"op": "models", "kind": "codex", "argv": ["codex", "--profile", "x"]}]
+        want = {"t": "models", "m": "M1", "kind": "codex", "models": m.reply["models"],
+                "efforts": ["low", "ultra"], "modes": []}
+        assert p.sent == [want] and q.sent == [want] and other.sent == []
+        await hub.phone_op(p, {"op": "models", "m": "M1", "kind": "codex"})
+        assert len(m.calls) == 1 and p.sent[-1] == want                     # cached
+        # claude falls back to [kind] when the machine has no preset
+        await hub.phone_op(p, {"op": "models", "m": "M1", "kind": "claude"})
+        assert m.calls[-1] == {"op": "models", "kind": "claude", "argv": ["claude"]}
+        # expiry after 10 minutes
+        now = server.time.time()
+        monkeypatch.setattr(server.time, "time", lambda: now + server.MODELS_TTL + 1)
+        await hub.phone_op(p, {"op": "models", "m": "M1", "kind": "codex"})
+        assert len([c for c in m.calls if c["kind"] == "codex"]) == 2
+        # errors are not cached and go only to the asker
+        hub.models_cache.clear()
+        m.reply = {"t": "error", "msg": "codex not found"}
+        await hub.phone_op(q, {"op": "models", "m": "M1", "kind": "codex"})
+        assert q.sent[-1]["t"] == "error" and q.sent[-1]["msg"] == "codex not found"
+        assert ("M1", "codex") not in hub.models_cache and other.sent == []
+        await hub.phone_op(p, {"op": "models", "m": "M1", "kind": "shell"})
+        assert p.sent[-1]["t"] == "error"
+    asyncio.run(run())

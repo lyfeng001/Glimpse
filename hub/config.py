@@ -21,12 +21,19 @@ DEFAULTS = {
     "machines": [{"id": "M1", "name": "this-mac", "type": "local", "default_cwd": "~"}],
     # choices offered by the new-session sheet and the "controls" widget (lists replace, not merge)
     "options": {
-        "claude": {"models": ["opus", "sonnet", "haiku"], "efforts": ["low", "medium", "high", "xhigh", "max"],
-                   "modes": ["default", "acceptEdits", "auto", "plan", "bypassPermissions"]},
-        "codex": {"models": [], "efforts": ["minimal", "low", "medium", "high", "max"],
+        "claude": {"models": ["default", "opus", "sonnet", "haiku", "fable", "opusplan"],
+                   "efforts": ["low", "medium", "high", "xhigh", "max", "ultracode"],
+                   "modes": ["manual", "acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions"]},
+        "codex": {"models": [], "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
                   "approvals": ["untrusted", "on-request", "never"],
                   "sandboxes": ["read-only", "workspace-write", "danger-full-access"]},
     },
+}
+# option lists older versions wrote into config.json (save() persists the merged defaults): not user choices
+LEGACY_OPTIONS = {
+    "claude": {"models": [["opus", "sonnet", "haiku"]], "efforts": [["low", "medium", "high", "xhigh", "max"]],
+               "modes": [["default", "acceptEdits", "auto", "plan", "bypassPermissions"]]},
+    "codex": {"efforts": [["minimal", "low", "medium", "high", "max"]]},
 }
 
 

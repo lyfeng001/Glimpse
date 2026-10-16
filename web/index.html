@@ -66,7 +66,10 @@
   <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/></symbol>
   <symbol id="i-widgets" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></symbol>
   <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
-  <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20.5 14.2A8.5 8.5 0 1 1 9.8 3.5a6.6 6.6 0 0 0 10.7 10.7z"/></symbol>
+  <symbol id="i-slash" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="5"/><path d="m14.5 7.5-5 9"/></symbol>
+  <symbol id="i-menu-list" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M7 9h10M7 13h10M7 17h6"/></symbol>
+  <symbol id="i-sparkle"viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></symbol>
   <symbol id="i-prompt" viewBox="0 0 24 24"><path d="m5 7 5 5-5 5M12 17h7"/></symbol>
   <symbol id="i-cloud-off" viewBox="0 0 24 24"><path d="m2 2 20 20M5.8 5.8A7 7 0 0 0 7 19h10.5M22 15.5A4.5 4.5 0 0 0 17.5 10h-1.3A7 7 0 0 0 9.6 5.1"/></symbol>
   <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></symbol>
@@ -187,7 +190,9 @@
         <button type="button" class="key" data-k="y">y</button>
         <button type="button" class="key" data-k="n">n</button>
       </div>
+      <div id="slash-pop" class="slash-pop" role="menu" aria-label="斜杠命令" hidden></div>
       <form id="composer" class="composer">
+        <button type="button" id="btn-slash" class="slash-btn" aria-label="斜杠命令" aria-haspopup="menu" aria-expanded="false" aria-controls="slash-pop">/</button>
         <div class="field">
           <label for="input" class="sr">输入指令</label>
           <textarea id="input" rows="1" placeholder="发送消息到该会话" enterkeyhint="send"
@@ -236,14 +241,15 @@
       <div id="new-adv" hidden>
         <div class="g-h">模型与模式</div>
         <div class="group">
-          <label class="cell" for="new-model"><span class="lbl">模型</span>
-            <input id="new-model" list="new-models" class="mono" placeholder="默认" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="go"></label>
+          <label class="cell" for="new-model-sel"><span class="lbl">模型</span><span class="spinner sm-spin" id="new-model-spin" aria-hidden="true" hidden></span><select id="new-model-sel"></select></label>
+          <label class="cell" for="new-model" id="new-model-row" hidden><span class="lbl">Other model id</span>
+            <input id="new-model" class="mono" placeholder="e.g. claude-opus-4-1" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="go"></label>
+          <div class="cell-note" id="new-model-desc" hidden></div>
           <label class="cell" for="new-effort"><span class="lbl">推理强度</span><select id="new-effort"></select></label>
           <label class="cell" for="new-pmode" id="new-pmode-row"><span class="lbl">权限模式</span><select id="new-pmode"></select></label>
           <label class="cell" for="new-approval" id="new-approval-row"><span class="lbl">审批</span><select id="new-approval"></select></label>
           <label class="cell" for="new-sandbox" id="new-sandbox-row"><span class="lbl">沙箱</span><select id="new-sandbox"></select></label>
         </div>
-        <datalist id="new-models"></datalist>
         <p class="g-f" id="new-adv-f">留空则使用这台机器预设里的配置。启动后也可以在会话里的“模型与模式”插件中修改。</p>
       </div>
       <p id="new-err" class="sh-err" role="alert"></p>
@@ -454,6 +460,10 @@
     <p class="g-f">开关控制首页和会话页显示哪些插件，箭头调整顺序。</p>
     <div class="g-h">外观</div>
     <div class="group">
+      <div class="cell stack"><span class="lbl" id="theme-lbl">主题</span>
+        <div class="tseg" id="opt-theme" role="radiogroup" aria-labelledby="theme-lbl">
+          <button type="button" role="radio" data-theme-v="auto">跟随系统</button><button type="button" role="radio" data-theme-v="light"><svg class="ic sm" aria-hidden="true"><use href="#i-sun"/></svg>浅色</button><button type="button" role="radio" data-theme-v="dark"><svg class="ic sm" aria-hidden="true"><use href="#i-moon"/></svg>深色</button>
+        </div></div>
       <div class="cell"><span class="grow" id="font-lbl">终端字号</span>
         <span class="stepper" role="group" aria-labelledby="font-lbl">
           <button type="button" id="font-dec" aria-label="减小字号"><svg class="ic sm"><use href="#i-minus"/></svg></button>

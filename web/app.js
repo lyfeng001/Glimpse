@@ -1,6 +1,22 @@
 'use strict';
-// Glimpse phone app (v3). State lives on the hub; this page renders it and forwards input.
-const APP_VERSION = '0.3.0';
+// Glimpse phone app (v4). State lives on the hub; this page renders it and forwards input.
+const APP_VERSION = '0.4.0';
+// ---- manual light / dark theme (Settings → 外观). Runs first so the forced theme is in place before anything renders.
+// glimpse.theme = auto | light | dark  ->  <html data-theme="light|dark"> (auto: no attribute, CSS follows prefers-color-scheme)
+const THEME_BG = { dark: '#0B0C0F', light: '#F2F2F7' };
+function themePref() { const t = window.localStorage.getItem('glimpse.theme'); return t === 'light' || t === 'dark' ? t : 'auto'; }
+function applyTheme(t) {
+  const root = document.documentElement;
+  if (t === 'light' || t === 'dark') root.setAttribute('data-theme', t); else root.removeAttribute('data-theme');
+  // status bar / browser chrome: forced = one colour for both media queries; auto = per-scheme colours again
+  for (const m of document.querySelectorAll('meta[name=theme-color]')) {
+    const scheme = /light/.test(m.media || '') ? 'light' : 'dark';
+    m.setAttribute('content', THEME_BG[t === 'auto' ? scheme : t]);
+  }
+  const cs = document.querySelector('meta[name=color-scheme]');
+  if (cs) cs.setAttribute('content', t === 'auto' ? 'dark light' : t);
+}
+applyTheme(themePref());
 const $ = (s, r) => (r || document).querySelector(s);
 const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
 const enc = new TextEncoder();
@@ -103,11 +119,17 @@ function tokTotal(u) { return u ? (u.input || 0) + (u.output || 0) + (u.cache_re
 // machine.usage_today = {day, claude:{input,output,cache_read,cache_write}, codex:{input,output,cache_read}, by_model}
 function dayTotal(ut) { return ut ? tokTotal(ut.claude) + tokTotal(ut.codex) : 0; }
 function dayIO(ut) { let n = 0; if (ut) for (const k of ['claude', 'codex']) if (ut[k]) n += (ut[k].input || 0) + (ut[k].output || 0); return n; }
-const MODE_LABEL = { default: '默认', acceptEdits: '自动接受编辑', plan: '计划模式', auto: '自动模式', bypass: '跳过权限确认',
-  bypassPermissions: '跳过权限确认', manual: '手动确认' };
-const EFFORT_LABEL = { minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '超高', max: '最高' };
-const APPROVAL_LABEL = { untrusted: '不信任', 'on-request': '按需', 'on-failure': '失败时', never: '从不' };
-const SANDBOX_LABEL = { 'read-only': '只读', 'workspace-write': '工作区可写', 'danger-full-access': '完全访问' };
+// pickers show the CLIs' own English ids; these are the short English hints shown under / next to them
+const MODE_DESC = { manual: 'ask before edits and commands', default: 'settings file default', acceptEdits: 'auto-accept file edits',
+  auto: 'auto-approve safe actions', plan: 'read-only planning', dontAsk: 'deny anything not pre-approved',
+  bypassPermissions: 'skip all permission prompts', bypass: 'skip all permission prompts' };
+const EFFORT_DESC = { none: 'no reasoning', minimal: 'fastest', low: 'fast', medium: 'balanced', high: 'thorough', xhigh: 'extra thorough',
+  max: 'maximum', ultra: 'deepest reasoning', ultracode: 'xhigh + dynamic workflows' };
+const APPROVAL_DESC = { untrusted: 'ask unless the command is trusted', 'on-request': 'model decides when to ask', 'on-failure': 'ask when a command fails',
+  never: 'never ask' };
+const SANDBOX_DESC = { 'read-only': 'no writes', 'workspace-write': 'write inside the workspace', 'danger-full-access': 'no sandbox' };
+const EFFORT_ORDER = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'ultracode'];
+function modeName(m) { return m === 'bypass' ? 'bypassPermissions' : m; }
 // session "mode" dict from the agent; falls back to the model seen in the usage stats
 function sessMode(s) { const m = Object.assign({}, (s && s.mode) || {}); if (!m.model && s && s.usage) m.model = s.usage.model; return m; }
 function shortModel(m) { return String(m || '').replace(/^claude-/, '').replace(/-\d{8}$/, ''); }
@@ -209,9 +231,9 @@ const WIDGETS = [
     render(ctx) {
       const s = ctx.s; if (!s || (s.kind !== 'claude' && s.kind !== 'codex')) return null;
       const md = sessMode(s);
-      const top = s.kind === 'claude' ? (MODE_LABEL[md.mode || 'default'] || md.mode) : (md.model ? shortModel(md.model) : '默认模型');
-      const sub = s.kind === 'claude' ? [md.model ? shortModel(md.model) : '默认模型', md.effort ? '推理 ' + (EFFORT_LABEL[md.effort] || md.effort) : ''] :
-        [md.effort ? '推理 ' + (EFFORT_LABEL[md.effort] || md.effort) : '', md.sandbox ? SANDBOX_LABEL[md.sandbox] || md.sandbox : ''];
+      const top = s.kind === 'claude' ? modeName(md.mode || 'default') : (md.model ? shortModel(md.model) : 'default model');
+      const sub = s.kind === 'claude' ? [md.model ? shortModel(md.model) : 'default model', md.effort ? 'effort ' + md.effort : ''] :
+        [md.effort ? 'effort ' + md.effort : '', md.sandbox || ''];
       return '<button type="button" class="w-tap" data-act="ctl" aria-label="模型与模式：' + esc(top) + '，点按修改"><span class="w-col"><span class="w-sub">' +
         (s.kind === 'claude' ? '模式' : '模型') + ' ' + ic('chev', 'xs') + '</span><span class="w-big" style="font-size:15px">' + esc(top) + '</span><span class="w-sub">' +
         esc(sub.filter(Boolean).join(' · ') || '点按修改') + '</span></span></button>';
@@ -526,6 +548,8 @@ function onMsg(m) {
     case 'restarted': if (RS.active && RS.m === m.m && RS.sid === m.sid) rsDone(); break;
     case 'approved': if (isView(m)) { S.view.approving = null; S.view.cardSig = null; renderCard(); } break;
     case 'history': onHistory(m); break;
+    case 'models': onModels(m, false); break;
+    case 'menu_ok': if (isView(m)) menuDone(); break;
     case 'control_ok': ctlDone(m); break;
     case 'delete_ok': onDeleted(m); break;
     case 'machine_test': mcTested(m); break;
@@ -536,6 +560,7 @@ function onMsg(m) {
       break;
     }
     case 'error':
+      if (m.op === 'models' && m.kind) { onModels(m, true); break; }
       if ($('#dlg-new').open && !m.sid) { newBusy(false); $('#new-err').textContent = m.msg; }
       else if (ADOPT.busy && $('#dlg-adopt').open && !m.sid) { adoptFail(m.msg); }
       else if (MC.busy && $('#dlg-machine').open) { mcFail(m.msg); }
@@ -788,7 +813,7 @@ function openSession(m, sid, fromRoute) {
   ensureTerm(); term.reset();
   const mode = (s && s.kind === 'shell') ? 'term' : (LS.getItem('glimpse.mode.' + m + '/' + sid) || LS.getItem('glimpse.mode') || 'chat');
   setMode(mode, true);
-  $('#input').value = ''; autoGrow();
+  $('#input').value = ''; autoGrow(); slashOpen(false);
   renderView();
   renderOutbox();
   subscribe();
@@ -861,6 +886,8 @@ function renderView() {
   else setBanner(null);
   if (s.attention && document.visibilityState === 'visible') send({ op: 'ack', m: v.m, sid: v.sid });
   renderCard();
+  $('#btn-slash').hidden = s.kind !== 'claude' && s.kind !== 'codex';
+  if (!!s.menu !== !!v.hadMenu) { v.hadMenu = !!s.menu; scheduleLive(); }
   renderViewWidgets();
   if ($('#dlg-more').open) fillMore();
 }
@@ -897,6 +924,7 @@ function setMode(mode, initial) {
   $('#chat').hidden = mode !== 'chat';
   $('#term-wrap').hidden = mode !== 'term';
   $('#jump').hidden = true;
+  if (v) { v.cardSig = null; renderCard(); }     // the menu card only shows in chat mode
   if (mode === 'term') requestAnimationFrame(() => { openTerm(); if (term) { term.refresh(0, term.rows - 1); term.scrollToBottom(); } termFollow(); });
   else { scheduleLive(); requestAnimationFrame(() => { const c = $('#chat'); c.scrollTop = c.scrollHeight; }); }
 }
@@ -1030,13 +1058,17 @@ function renderLive() {
     live = document.createElement('details'); live.className = 'livebox';
     live.innerHTML = '<summary><span class="live-dot" aria-hidden="true"></span>实时屏幕' + ic('down') + '</summary><pre aria-label="终端当前画面"></pre>';
     live.open = LS.getItem('glimpse.liveOpen') !== '0';
-    live.addEventListener('toggle', () => LS.setItem('glimpse.liveOpen', live.open ? '1' : '0'));
+    // a forced open (waiting / menu) is not the user's choice: don't persist it
+    live.addEventListener('toggle', () => { if (live._forced) { live._forced = false; return; } LS.setItem('glimpse.liveOpen', live.open ? '1' : '0'); });
     box.appendChild(live);
   }
   const waiting = s && s.status === 'waiting';
-  if (waiting && !live.open) live.open = true;
-  const stick = nearBottom(box);
-  const txt = screenText(waiting ? 30 : 14);
+  const menu = !!(s && s.menu);       // an interactive TUI menu is up: show the whole screen, not the tail
+  if ((waiting || menu) && !live.open) { live._forced = true; live.open = true; }
+  live.classList.toggle('full', menu);
+  const stick = nearBottom(box) || (menu && !live._menu);
+  live._menu = menu;
+  const txt = screenText(menu ? term.rows : waiting ? 30 : 14);
   const pre = $('pre', live); if (pre.textContent !== txt) pre.textContent = txt;
   live.hidden = !txt;
   if (stick) box.scrollTop = box.scrollHeight;
@@ -1079,11 +1111,36 @@ function renderCard() {
         esc(o.label) + '</div>' + (o.description ? '<div class="od">' + esc(o.description) + '</div>' : '') + '</span></button>').join('') +
       '<button type="button" class="opt other" data-q="other"><span class="n">…</span><span class="grow"><div class="ol">其他</div><div class="od">在下方输入框回复</div></span></button>' +
       '</div></section>';
+  } else if (s && s.menu && S.mode === 'chat' && Array.isArray(s.menu.options) && s.menu.options.length) {
+    // interactive TUI menu (claude /model, /effort slider, codex /model) detected by the agent from the screen
+    const mn = s.menu; sig = 'm:' + JSON.stringify(mn) + ':' + (v.menuBusy == null ? '' : v.menuBusy);
+    const dis = v.menuBusy != null ? ' disabled' : '';
+    const canS = s.kind === 'claude' && /s to use|s for this session/i.test(mn.hint || '');
+    const slider = mn.kind === 'slider';
+    html = '<section class="acard mcard' + (slider ? ' slider' : '') + '" role="group" aria-labelledby="mn-t">' +
+      '<div class="a-h"><span class="a-ic">' + ic(slider ? 'sliders' : 'menu-list') + '</span><div class="a-t"><div class="a-k">终端菜单 · ' + esc(KIND[s.kind] || s.kind) + '</div>' +
+      '<div class="a-s" id="mn-t">' + esc(mn.title || (slider ? 'Adjust' : 'Select')) + '</div></div></div>' +
+      '<div class="' + (slider ? 'mslider' : 'opts mopts') + '" role="listbox" aria-labelledby="mn-t">' +
+      mn.options.map((o) => {
+        const cur = o.i === mn.cursor; const busy = v.menuBusy === o.i;
+        return '<button type="button" class="opt' + (cur ? ' cursor' : '') + (o.current ? ' current' : '') + '" role="option" aria-selected="' + cur + '" data-mi="' + esc(o.i) + '"' + dis + '>' +
+          (slider ? '' : '<span class="n">' + (busy ? '<span class="spinner" aria-hidden="true"></span>' : esc(o.i + 1)) + '</span>') +
+          '<span class="grow"><div class="ol">' + (slider && busy ? '<span class="spinner" aria-hidden="true"></span>' : '') + esc(o.label) +
+          (o.current ? ' <span class="cur-tag">current</span>' : '') + '</div>' + (o.desc ? '<div class="od">' + esc(o.desc) + '</div>' : '') + '</span>' +
+          (cur && !slider ? '<span class="cur-mark" aria-hidden="true">' + ic('chev', 'sm') + '</span>' : '') + '</button>';
+      }).join('') + '</div>' +
+      (mn.hint ? '<p class="m-hint">' + esc(mn.hint) + '</p>' : '') +
+      '<div class="a-btns">' + '<button type="button" class="btn' + (canS ? '' : ' wide') + '" data-mk="esc"' + dis + '>Esc · 取消</button>' +
+      (canS ? '<button type="button" class="btn" data-mk="s"' + dis + '>s · 仅本会话</button>' : '') + '</div></section>';
   }
+  if (v && v.menuBusy != null && !(s && s.menu)) { clearTimeout(v.menuTimer); v.menuBusy = null; }   // menu closed: done
   if (v && v.cardSig === sig) return;
   if (v) v.cardSig = sig;
   const had = !!host.firstChild;
   host.innerHTML = html;
+  host.parentNode.classList.toggle('has-menu', sig.startsWith('m:'));
+  for (const b of $$('[data-mi]', host)) b.onclick = () => menuSend({ index: +b.dataset.mi }, +b.dataset.mi);
+  for (const b of $$('[data-mk]', host)) b.onclick = () => menuSend({ key: b.dataset.mk }, -1);
   for (const b of $$('[data-a]', host)) b.onclick = () => approve(b.dataset.a);
   for (const b of $$('[data-q]', host)) b.onclick = () => {
     if (b.dataset.q === 'other') { $('#input').focus(); return; }
@@ -1091,7 +1148,7 @@ function renderCard() {
     if (!s.question.multi) { v.cardSig = null; host.innerHTML = ''; }
   };
   if (html && !had) {
-    announce(s.pending ? '需要授权：' + s.pending.summary : '有问题需要回答：' + s.question.question);
+    announce(s.pending ? '需要授权：' + s.pending.summary : s.question ? '有问题需要回答：' + s.question.question : '终端菜单：' + (s.menu.title || ''));
     if (navigator.vibrate) navigator.vibrate(30);
   }
 }
@@ -1102,6 +1159,48 @@ function approve(decision) {
   if (!send({ op: 'approve', m: v.m, sid: v.sid, id: s.pending.id, decision })) { v.approving = null; renderCard(); toast('未连接', '稍后再试', null, 'error'); }
   setTimeout(() => { if (S.view === v && v.approving) { v.approving = null; v.cardSig = null; renderCard(); } }, 8000);
 }
+
+// menu card: op menu {index} moves the TUI cursor there and presses Enter; {key:'esc'|'s'} sends Esc / "s". Reply menu_ok
+function menuSend(arg, busyIdx) {
+  const v = S.view; const s = v && session(v.m, v.sid);
+  if (!s || !s.menu || v.menuBusy != null) return;
+  if (!send(Object.assign({ op: 'menu', m: v.m, sid: v.sid }, arg))) { toast('未连接', '稍后再试', null, 'error'); return; }
+  v.menuBusy = busyIdx; v.cardSig = null; renderCard();
+  clearTimeout(v.menuTimer);
+  v.menuTimer = setTimeout(() => { if (S.view === v && v.menuBusy != null) menuDone(); }, 6000);
+}
+function menuDone() {
+  const v = S.view; if (!v) return;
+  clearTimeout(v.menuTimer); v.menuBusy = null; v.cardSig = null; renderCard();
+}
+
+// ---- "/" quick slash commands: tap = type the command + Enter (same as op text); /clear only fills the composer (it wipes the context)
+const SLASH = {
+  claude: [['/model', 'switch model'], ['/effort', 'reasoning effort'], ['/compact', 'summarize the context'], ['/status', 'account, model, usage'], ['/clear', 'start a fresh context', 1]],
+  codex: [['/model', 'model and effort'], ['/status', 'session config and usage'], ['/compact', 'summarize the context']],
+};
+function slashOpen(on) {
+  const pop = $('#slash-pop'); const btn = $('#btn-slash');
+  const v = S.view; const s = v && session(v.m, v.sid);
+  const list = s && SLASH[s.kind];
+  if (on && !list) on = false;
+  pop.hidden = !on; btn.setAttribute('aria-expanded', String(!!on)); btn.classList.toggle('on', !!on);
+  if (!on) return;
+  pop.innerHTML = list.map(([c, d, fill]) => '<button type="button" role="menuitem" class="slash-it" data-cmd="' + esc(c) + '"' + (fill ? ' data-fill="1"' : '') + '>' +
+    '<span class="mono">' + esc(c) + '</span><span class="sd">' + esc(d) + '</span></button>').join('');
+  for (const b of $$('.slash-it', pop)) {
+    b.addEventListener('mousedown', (e) => e.preventDefault());
+    b.onclick = () => {
+      slashOpen(false);
+      if (b.dataset.fill) { input.value = b.dataset.cmd; autoGrow(); input.focus(); return; }
+      const vv = S.view; if (!vv) return;
+      if (!send({ op: 'text', m: vv.m, sid: vv.sid, text: b.dataset.cmd })) toast('未连接', '稍后再试', null, 'error');
+    };
+  }
+}
+$('#btn-slash').addEventListener('mousedown', (e) => e.preventDefault());
+$('#btn-slash').onclick = () => slashOpen($('#slash-pop').hidden);
+document.addEventListener('click', (e) => { if (!$('#slash-pop').hidden && !e.target.closest('#slash-pop, #btn-slash')) slashOpen(false); });
 
 // ------------------------------------------------------------------ input: quick keys + composer
 for (const b of $$('#keys .key')) {
@@ -1160,8 +1259,8 @@ function fillMore() {
   $('#act-ctl').hidden = !ai;
   if (ai) {
     const md = sessMode(s);
-    $('#act-ctl-sub').textContent = s.kind === 'claude' ? [MODE_LABEL[md.mode || 'default'], md.model ? shortModel(md.model) : '', md.effort ? EFFORT_LABEL[md.effort] || md.effort : ''].filter(Boolean).join(' · ')
-      : [md.model ? shortModel(md.model) : '默认模型', md.effort ? EFFORT_LABEL[md.effort] || md.effort : '', md.sandbox ? SANDBOX_LABEL[md.sandbox] || md.sandbox : ''].filter(Boolean).join(' · ');
+    $('#act-ctl-sub').textContent = s.kind === 'claude' ? [modeName(md.mode || 'default'), md.model ? shortModel(md.model) : '', md.effort || ''].filter(Boolean).join(' · ')
+      : [md.model ? shortModel(md.model) : 'default model', md.effort || '', md.sandbox || ''].filter(Boolean).join(' · ');
   }
   if (v) {
     $('#act-cmd').textContent = attachCmd(v.m, v.sid);
@@ -1256,39 +1355,104 @@ function fillNewDeps() {
   for (const b of $$('#new-recent .rchip')) b.onclick = () => { cwd.value = b.dataset.dir; cwd.dataset.touched = '1'; };
   fillAdv(kind);
 }
-// state.options = {claude:{models,efforts,modes}, codex:{models,efforts,approvals,sandboxes}}
+// state.options = {claude:{models,efforts,modes}, codex:{models,efforts,approvals,sandboxes}} (hub defaults / config.json)
 function opts(kind) {
   const o = (S.options && S.options[kind]) || {};
-  const d = kind === 'claude' ? { models: ['opus', 'sonnet', 'haiku'], efforts: ['low', 'medium', 'high', 'xhigh', 'max'], modes: ['default', 'acceptEdits', 'auto', 'plan', 'bypassPermissions'] }
-    : { models: [], efforts: ['minimal', 'low', 'medium', 'high', 'max'], approvals: ['untrusted', 'on-request', 'never'], sandboxes: ['read-only', 'workspace-write', 'danger-full-access'] };
+  const d = kind === 'claude' ? { models: ['default', 'opus', 'sonnet', 'haiku', 'fable', 'opusplan'], efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'],
+    modes: ['manual', 'acceptEdits', 'auto', 'plan', 'dontAsk', 'bypassPermissions'] }
+    : { models: [], efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], approvals: ['untrusted', 'on-request', 'never'], sandboxes: ['read-only', 'workspace-write', 'danger-full-access'] };
   return Object.assign(d, o);
 }
-function optList(vals, labels, keep) {
-  return '<option value="">默认</option>' + (vals || []).map((v) => '<option value="' + esc(v) + '"' + (v === keep ? ' selected' : '') + '>' +
-    esc(labels && labels[v] ? labels[v] + ' (' + v + ')' : v) + '</option>').join('');
+// ---- real model / effort / mode lists: op models {m, kind} -> {t:'models', m, kind, models:[{id,label,desc,efforts,default_effort}], efforts, modes}
+// fetched when a picker opens, cached per machine+kind for the page lifetime; state.options is the fallback while loading / on error
+const MODELS = {};          // 'M1/claude' -> {st:'loading'|'ok'|'err', data, msg, timer}
+function fetchModels(m, kind) {
+  if (!m || (kind !== 'claude' && kind !== 'codex')) return;
+  const k = m + '/' + kind; const c = MODELS[k];
+  if (c && (c.st === 'ok' || c.st === 'loading')) return;
+  if (!send({ op: 'models', m, kind })) { MODELS[k] = { st: 'err', msg: '未连接到 hub' }; return; }
+  const e = MODELS[k] = { st: 'loading' };
+  e.timer = setTimeout(() => { if (MODELS[k] === e && e.st === 'loading') { e.st = 'err'; e.msg = '超时'; modelsChanged(); } }, 50000);
+}
+function onModels(r, err) {
+  const k = r.m + '/' + r.kind; const e = MODELS[k] || (MODELS[k] = {});
+  clearTimeout(e.timer);
+  if (err) { e.st = 'err'; e.msg = r.msg; } else { e.st = 'ok'; e.data = { models: r.models || [], efforts: r.efforts || [], modes: r.modes || [] }; }
+  modelsChanged();
+}
+function modelsChanged() {
+  if ($('#dlg-new').open && newKind() !== 'shell') fillAdv(newKind());
+  if ($('#dlg-ctl').open) renderCtl();
+}
+function sortEfforts(list) {
+  const out = Array.from(new Set(list || []));
+  return out.sort((a, b) => { const x = EFFORT_ORDER.indexOf(a); const y = EFFORT_ORDER.indexOf(b); return (x < 0 ? 99 : x) - (y < 0 ? 99 : y); });
+}
+// merged picker data: fetched lists when available, else state.options. loading = request in flight and nothing fetched yet
+function catalog(m, kind) {
+  const o = opts(kind); const c = MODELS[m + '/' + kind];
+  const d = c && c.st === 'ok' ? c.data : null;
+  const models = d && d.models.length ? d.models.map((x) => ({ id: String(x.id), label: x.label || x.id, desc: x.desc || '', efforts: Array.isArray(x.efforts) && x.efforts.length ? x.efforts : null,
+    default_effort: x.default_effort || null }))
+    : (o.models || []).map((id) => ({ id, label: id, desc: '', efforts: null, default_effort: null }));
+  return { loading: !!(c && c.st === 'loading'), failed: !!(c && c.st === 'err'), models,
+    efforts: sortEfforts(d && d.efforts.length ? d.efforts : o.efforts), modes: d && d.modes.length ? d.modes : (o.modes || []),
+    approvals: o.approvals || [], sandboxes: o.sandboxes || [] };
+}
+// the catalog entry for a running session's model name ("claude-sonnet-4-5" matches "sonnet", "gpt-5-codex" matches itself)
+function findModel(cat, name) {
+  if (!name) return null;
+  return cat.models.find((x) => x.id === name) || cat.models.find((x) => shortModel(name) === x.id) ||
+    cat.models.find((x) => x.id !== 'default' && name.indexOf(x.id) >= 0) || null;
+}
+function effortsFor(cat, model) { return model && model.efforts ? sortEfforts(model.efforts) : cat.efforts; }
+function withDesc(v, desc) { return desc && desc[v] ? v + ' — ' + desc[v] : v; }
+function optList(vals, desc, keep, def) {
+  return '<option value="">默认' + (def ? ' (' + esc(def) + ')' : '') + '</option>' + (vals || []).map((v) => '<option value="' + esc(v) + '"' + (v === keep ? ' selected' : '') + '>' +
+    esc(withDesc(v, desc)) + '</option>').join('');
 }
 function fillAdv(kind) {
   const ai = kind === 'claude' || kind === 'codex';
   $('#new-adv').hidden = !ai; if (!ai) return;
-  const o = opts(kind);
-  $('#new-models').innerHTML = (o.models || []).map((m) => '<option value="' + esc(m) + '">').join('');
-  $('#new-effort').innerHTML = optList(o.efforts, EFFORT_LABEL, $('#new-effort').value);
+  const m = $('#new-machine').value;
+  fetchModels(m, kind);
+  const cat = catalog(m, kind);
+  // model: fetched list (label · id), "Other model id" reveals the free-text field
+  const sel = $('#new-model-sel'); const keep = sel.value;
+  sel.innerHTML = '<option value="">默认（机器预设）</option>' + cat.models.map((x) => '<option value="' + esc(x.id) + '">' +
+    esc(x.label !== x.id ? x.label + ' · ' + x.id : x.id) + '</option>').join('') + '<option value="__other">Other model id…</option>';
+  sel.value = keep && (keep === '__other' || cat.models.some((x) => x.id === keep)) ? keep : '';
+  sel.disabled = cat.loading && !cat.models.length;
+  $('#new-model-spin').hidden = !cat.loading;
+  $('#new-model-row').hidden = sel.value !== '__other';
+  const picked = cat.models.find((x) => x.id === sel.value) || null;
+  const nd = $('#new-model-desc');
+  nd.hidden = !picked && !cat.failed;
+  nd.innerHTML = picked ? '<code>' + esc(picked.id) + '</code>' + (picked.desc ? ' — ' + esc(picked.desc) : '')
+    : cat.failed ? '无法读取模型列表，显示的是默认选项' : '';
+  // effort: codex shows the selected model's own efforts
+  const efforts = kind === 'codex' ? effortsFor(cat, picked) : cat.efforts;
+  $('#new-effort').innerHTML = optList(efforts, EFFORT_DESC, $('#new-effort').value, picked && picked.default_effort);
   $('#new-pmode-row').hidden = kind !== 'claude';
   $('#new-approval-row').hidden = kind !== 'codex';
   $('#new-sandbox-row').hidden = kind !== 'codex';
-  if (kind === 'claude') $('#new-pmode').innerHTML = optList(o.modes, MODE_LABEL, $('#new-pmode').value);
+  if (kind === 'claude') $('#new-pmode').innerHTML = optList(cat.modes, MODE_DESC, $('#new-pmode').value);
   else {
-    $('#new-approval').innerHTML = optList(o.approvals, APPROVAL_LABEL, $('#new-approval').value);
-    $('#new-sandbox').innerHTML = optList(o.sandboxes, SANDBOX_LABEL, $('#new-sandbox').value);
+    $('#new-approval').innerHTML = optList(cat.approvals, APPROVAL_DESC, $('#new-approval').value);
+    $('#new-sandbox').innerHTML = optList(cat.sandboxes, SANDBOX_DESC, $('#new-sandbox').value);
   }
 }
+$('#new-model-sel').onchange = () => {
+  fillAdv(newKind());
+  if ($('#new-model-sel').value === '__other') $('#new-model').focus();
+};
 function openNew(mid) {
   if (mid) LS.setItem('glimpse.newMachine', mid);
   $('#new-err').textContent = ''; newBusy(false);
   const kind = LS.getItem('glimpse.newKind') || 'claude';
   for (const r of $$('#new-form input[name=kind]')) r.checked = r.value === kind;
   $('#new-cwd').dataset.touched = ''; $('#new-name').value = ''; $('#new-args').value = '';
-  for (const id of ['#new-model', '#new-effort', '#new-pmode', '#new-approval', '#new-sandbox']) $(id).value = '';
+  for (const id of ['#new-model', '#new-model-sel', '#new-effort', '#new-pmode', '#new-approval', '#new-sandbox']) $(id).value = '';
   $('#new-machine').value = '';
   fillNew();
   openSheet($('#dlg-new'));
@@ -1321,7 +1485,8 @@ $('#new-form').addEventListener('submit', (e) => {
     key: kind !== 'shell' ? ($('#new-key').value || null) : null, cols: d.cols, rows: d.rows };
   // advanced: the hub turns these into --model/--effort/--permission-mode (claude) or -m/-c/-a/-s (codex)
   if (kind !== 'shell') {
-    const model = $('#new-model').value.trim(); const effort = $('#new-effort').value;
+    const ms = $('#new-model-sel').value;
+    const model = ms === '__other' ? $('#new-model').value.trim() : ms; const effort = $('#new-effort').value;
     if (model) msg.model = model;
     if (effort) msg.effort = effort;
     if (kind === 'claude' && $('#new-pmode').value) msg.mode = $('#new-pmode').value;
@@ -1460,52 +1625,66 @@ $('#dlg-adopt').addEventListener('close', () => { clearTimeout(ADOPT.timer); ADO
 // ------------------------------------------------------------------ session controls: model / effort / mode ("模型与模式")
 // claude: applied live in the TUI (Shift+Tab for the mode, /model, /effort, /goal); codex: restart with resume + flags
 const CTL = { busy: null, m: null, sid: null, timer: null };
-function ctlChips(action, vals, cur, labels, dis) {
+function ctlChips(action, vals, cur, desc, dis) {
   return '<div class="fchips wrap" role="radiogroup">' + vals.map((v) => {
     const on = v === cur; const busy = CTL.busy && CTL.busy.action === action && CTL.busy.value === v;
-    return '<button type="button" role="radio" aria-checked="' + on + '" data-ca="' + esc(action) + '" data-cv="' + esc(v) + '"' + (dis ? ' disabled' : '') + '>' +
-      (busy ? '<span class="spinner" aria-hidden="true"></span>' : '') + esc(labels && labels[v] ? labels[v] : v) + '</button>';
+    return '<button type="button" role="radio" aria-checked="' + on + '" data-ca="' + esc(action) + '" data-cv="' + esc(v) + '"' + (dis ? ' disabled' : '') +
+      (desc && desc[v] ? ' title="' + esc(desc[v]) + '"' : '') + '>' + (busy ? '<span class="spinner" aria-hidden="true"></span>' : '') + esc(v) + '</button>';
   }).join('') + '</div>';
 }
+// one-line hint under a chip row: what the current / busy value means
+function chipHint(desc, v) { return v && desc[v] ? '<p class="g-f chint"><b>' + esc(v) + '</b> — ' + esc(desc[v]) + '</p>' : ''; }
 function ctlModeValue(m) { return m === 'bypassPermissions' ? 'bypass' : m; }   // detected footer name == control value
+function skelRows(n) { let h = ''; for (let i = 0; i < n; i++) h += '<div class="cell"><span class="skel" style="height:14px;width:' + (40 + (i * 23) % 45) + '%"></span></div>'; return '<div class="group" aria-busy="true">' + h + '</div>'; }
 function renderCtl() {
   const s = session(CTL.m, CTL.sid); const host = $('#ctl-body');
   if (!s) { host.innerHTML = '<p class="g-f">会话已不存在。</p>'; return; }
-  const md = sessMode(s); const o = opts(s.kind);
+  const md = sessMode(s); const cat = catalog(CTL.m, s.kind);
   const dead = s.status === 'exited' || s.status === 'error';
   const dis = dead || !!CTL.busy;
   let h = '';
   if (dead) h += '<div class="note-box warn">' + ic('power', 'sm') + '<div>进程已退出，重启会话后才能修改。</div></div>';
+  if (cat.failed) h += '<div class="note-box warn">' + ic('alert', 'sm') + '<div>无法读取这台机器上的模型列表，下面是默认选项。</div></div>';
   if (s.kind === 'claude') {
     const modes = [];
-    for (const m of (o.modes || [])) { const v = ctlModeValue(m); if (!modes.includes(v)) modes.push(v); }
+    for (const m of cat.modes) { const v = ctlModeValue(m); if (!modes.includes(v)) modes.push(v); }
     const cur = md.mode || 'default'; if (!modes.includes(cur)) modes.push(cur);
-    h += '<div class="g-h">模式</div><div class="group">' + modes.map((v) => {
+    h += '<div class="g-h">Permission mode</div><div class="group">' + modes.map((v) => {
       const busy = CTL.busy && CTL.busy.action === 'mode' && CTL.busy.value === v;
       return '<button type="button" class="cell radio" role="radio" aria-checked="' + (v === cur) + '" data-ca="mode" data-cv="' + esc(v) + '"' + (dis ? ' disabled' : '') + '>' +
-        '<span class="grow">' + esc(MODE_LABEL[v] || v) + '<div class="sub">' + esc(v) + '</div></span>' +
+        '<span class="grow"><span class="mono">' + esc(modeName(v)) + '</span><div class="sub">' + esc(MODE_DESC[v] || '') + '</div></span>' +
         (busy ? '<span class="spinner" aria-hidden="true"></span>' : v === cur ? ic('check', 'chk on') : '') + '</button>';
     }).join('') + '</div><p class="g-f">通过 Shift+Tab 在终端里切换，当前模式从 Claude Code 底部状态栏识别。部分模式需要在 Claude 设置里先启用才会出现在循环中。</p>';
   } else {
     h += '<div class="note-box">' + ic('refresh', 'sm') + '<div>Codex 的这些设置会<b>重启并恢复对话</b>后生效，正在进行的回复会被中断。</div></div>';
   }
-  const models = (o.models || []).slice(); const curModel = md.model || '';
-  const curIsListed = models.some((m) => m === curModel || shortModel(curModel) === m || curModel.indexOf(m) >= 0);
-  h += '<div class="g-h">模型' + (curModel ? '<span class="g-cur">当前 ' + esc(shortModel(curModel)) + '</span>' : '') + '</div>';
-  if (models.length) h += ctlChips('model', models, curIsListed ? models.find((m) => m === curModel || shortModel(curModel) === m || curModel.indexOf(m) >= 0) : null, null, dis);
-  h += '<div class="group" style="margin-top:8px"><div class="cell"><input id="ctl-model" class="mono" style="text-align:left" placeholder="其他模型名称" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="done" aria-label="其他模型名称"' + (dis ? ' disabled' : '') + '>' +
+  const curModel = md.model || ''; const curM = findModel(cat, curModel);
+  h += '<div class="g-h">Model' + (curModel ? '<span class="g-cur mono">' + esc(shortModel(curModel)) + '</span>' : '') + '</div>';
+  if (cat.loading && !MODELS[CTL.m + '/' + s.kind].data) h += skelRows(3);
+  else if (cat.models.length) {
+    h += '<div class="group">' + cat.models.map((x) => {
+      const on = curM === x; const busy = CTL.busy && CTL.busy.action === 'model' && CTL.busy.value === x.id;
+      return '<button type="button" class="cell radio" role="radio" aria-checked="' + on + '" data-ca="model" data-cv="' + esc(x.id) + '"' + (dis ? ' disabled' : '') + '>' +
+        '<span class="grow">' + esc(x.label) + (x.label !== x.id ? ' <span class="mid-id">' + esc(x.id) + '</span>' : '') +
+        (x.desc ? '<div class="sub">' + esc(x.desc) + '</div>' : '') + '</span>' +
+        (busy ? '<span class="spinner" aria-hidden="true"></span>' : on ? ic('check', 'chk on') : '') + '</button>';
+    }).join('') + '</div>';
+  }
+  h += '<div class="group" style="margin-top:8px"><div class="cell"><input id="ctl-model" class="mono" style="text-align:left" placeholder="Other model id" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="done" aria-label="Other model id"' + (dis ? ' disabled' : '') + '>' +
     '<button type="button" class="btn sm" id="ctl-model-go"' + (dis ? ' disabled' : '') + '>应用</button></div></div>';
-  h += '<div class="g-h">推理强度' + (md.effort ? '<span class="g-cur">当前 ' + esc(EFFORT_LABEL[md.effort] || md.effort) + '</span>' : '') + '</div>' +
-    ctlChips('effort', o.efforts || [], md.effort, EFFORT_LABEL, dis);
+  // codex: the efforts the current model supports
+  const efforts = s.kind === 'codex' ? effortsFor(cat, curM) : cat.efforts;
+  h += '<div class="g-h">Reasoning effort' + (md.effort ? '<span class="g-cur mono">' + esc(md.effort) + '</span>' : '') + '</div>' +
+    (cat.loading && !efforts.length ? skelRows(1) : ctlChips('effort', efforts, md.effort, EFFORT_DESC, dis)) + chipHint(EFFORT_DESC, md.effort);
   if (s.kind === 'claude') {
     h += '<div class="g-h">目标 /goal</div><div class="group"><div class="cell"><input id="ctl-goal" style="text-align:left" placeholder="例如：让所有测试通过" enterkeyhint="done" aria-label="目标"' + (dis ? ' disabled' : '') + '>' +
       '<button type="button" class="btn sm" id="ctl-goal-go"' + (dis ? ' disabled' : '') + '>设置</button></div>' +
       '<button type="button" class="cell" id="ctl-goal-clear"' + (dis ? ' disabled' : '') + '><span class="grow" style="color:var(--accent-text)">清除目标</span></button></div>';
   } else {
-    h += '<div class="g-h">审批策略' + (md.approval ? '<span class="g-cur">当前 ' + esc(APPROVAL_LABEL[md.approval] || md.approval) + '</span>' : '') + '</div>' +
-      ctlChips('approval', o.approvals || [], md.approval, APPROVAL_LABEL, dis) +
-      '<div class="g-h">沙箱' + (md.sandbox ? '<span class="g-cur">当前 ' + esc(SANDBOX_LABEL[md.sandbox] || md.sandbox) + '</span>' : '') + '</div>' +
-      ctlChips('sandbox', o.sandboxes || [], md.sandbox, SANDBOX_LABEL, dis);
+    h += '<div class="g-h">Approval policy' + (md.approval ? '<span class="g-cur mono">' + esc(md.approval) + '</span>' : '') + '</div>' +
+      ctlChips('approval', cat.approvals, md.approval, APPROVAL_DESC, dis) + chipHint(APPROVAL_DESC, md.approval) +
+      '<div class="g-h">Sandbox' + (md.sandbox ? '<span class="g-cur mono">' + esc(md.sandbox) + '</span>' : '') + '</div>' +
+      ctlChips('sandbox', cat.sandboxes, md.sandbox, SANDBOX_DESC, dis) + chipHint(SANDBOX_DESC, md.sandbox);
   }
   h += '<p id="ctl-err" class="sh-err" role="alert"></p>';
   const keep = { model: ($('#ctl-model') || {}).value, goal: ($('#ctl-goal') || {}).value, err: ($('#ctl-err') || {}).textContent };
@@ -1526,6 +1705,7 @@ function openCtl() {
   const v = S.view; const s = v && session(v.m, v.sid); if (!s || (s.kind !== 'claude' && s.kind !== 'codex')) return;
   CTL.m = v.m; CTL.sid = v.sid; CTL.busy = null;
   $('#ctl-body').innerHTML = '';
+  fetchModels(v.m, s.kind);
   renderCtl();
   openSheet($('#dlg-ctl'));
 }
@@ -1545,7 +1725,7 @@ function ctlDone(m) {
   if (b.action === 'model') { const g = $('#ctl-model'); if (g) g.value = ''; }
   if ($('#dlg-ctl').open) renderCtl();
   const what = { mode: '模式', model: '模型', effort: '推理强度', goal: '目标', approval: '审批策略', sandbox: '沙箱' }[b.action] || b.action;
-  const val = b.action === 'goal' && !b.value ? '已清除' : (MODE_LABEL[b.value] || EFFORT_LABEL[b.value] || APPROVAL_LABEL[b.value] || SANDBOX_LABEL[b.value] || b.value);
+  const val = b.action === 'goal' && !b.value ? '已清除' : b.action === 'mode' ? modeName(b.value) : b.value;
   toast(what + (s && s.kind === 'codex' ? '已更新，会话已重启' : '已更新'), val, null, 'done');
 }
 function ctlFail(msg) {
@@ -1714,7 +1894,19 @@ $('#btn-clean').onclick = async () => {
   let ok = true; for (const m of ms) ok = send({ op: 'clean_exited', m }) && ok;
   if (ok) toast('已清理', dead.length + ' 个会话', null, 'done'); else toast('未连接', '稍后再试', null, 'error');
 };
+function renderThemeSeg() {
+  const t = themePref();
+  for (const b of $$('#opt-theme [data-theme-v]')) b.setAttribute('aria-checked', String(b.dataset.themeV === t));
+}
+for (const b of $$('#opt-theme [data-theme-v]')) {
+  b.onclick = () => {
+    const t = b.dataset.themeV;
+    LS.setItem('glimpse.theme', t);
+    applyTheme(t); renderThemeSeg();
+  };
+}
 async function renderSettings() {
+  renderThemeSeg();
   $('#opt-hide-exited').checked = S.hideExited;
   $('#opt-font').textContent = String(S.fontSize);
   $('#set-ver').textContent = APP_VERSION;

@@ -1,38 +1,16 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Glimpse">
-  <!-- Glimpse mark: an eye (a quick look from afar) whose pupil is a terminal cursor.
+  <!-- Glimpse mark: a winking face built from terminal glyphs: ">" and "•" as eyes, a smile as the cursor line.
        Master artwork; scratch/make_icons.js renders the PNG sizes and maskable/full-bleed variants from it. -->
   <defs>
-    <linearGradient id="g-bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#232B3D"/>
-      <stop offset=".55" stop-color="#121722"/>
-      <stop offset="1" stop-color="#080A0F"/>
-    </linearGradient>
-    <linearGradient id="g-acc" x1="96" y1="150" x2="416" y2="362" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#5AA9FF"/>
-      <stop offset="1" stop-color="#3DDC6A"/>
-    </linearGradient>
-    <radialGradient id="g-glow" cx="256" cy="256" r="190" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#4CC2B4" stop-opacity=".30"/>
-      <stop offset="1" stop-color="#4CC2B4" stop-opacity="0"/>
-    </radialGradient>
-    <linearGradient id="g-shine" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#FFFFFF" stop-opacity=".10"/>
-      <stop offset=".5" stop-color="#FFFFFF" stop-opacity="0"/>
+    <linearGradient id="g-mark" x1="140" y1="160" x2="360" y2="380" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7AA7FF"/>
+      <stop offset="1" stop-color="#2EE6C5"/>
     </linearGradient>
   </defs>
-  <g id="bg">
-    <rect width="512" height="512" rx="114" fill="url(#g-bg)"/>
-    <rect width="512" height="512" rx="114" fill="url(#g-shine)"/>
-  </g>
-  <g id="mark">
-    <circle cx="256" cy="256" r="190" fill="url(#g-glow)"/>
-    <!-- eye outline -->
-    <path d="M84 256C142 166 196 136 256 136S370 166 428 256C370 346 316 376 256 376S142 346 84 256Z"
-          fill="none" stroke="url(#g-acc)" stroke-width="26" stroke-linejoin="round"/>
-    <!-- iris -->
-    <circle cx="256" cy="256" r="74" fill="#0B0F16" stroke="url(#g-acc)" stroke-width="18"/>
-    <!-- pupil = terminal prompt ">_" -->
-    <path d="M214 226l30 30-30 30" fill="none" stroke="#E9F2FF" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/>
-    <rect x="256" y="274" width="44" height="15" rx="7.5" fill="url(#g-acc)"/>
+  <g id="bg"><rect width="512" height="512" rx="114" fill="#0D1220"/></g>
+  <g id="mark" fill="none" stroke="url(#g-mark)" stroke-width="40" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M146 168l66 50-66 50"/>
+    <circle cx="346" cy="218" r="34" fill="url(#g-mark)" stroke="none"/>
+    <path d="M190 330q66 46 132 0"/>
   </g>
 </svg>

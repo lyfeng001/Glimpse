@@ -50,11 +50,24 @@ HISTORY_DAYS = 14                 # codex rollouts older than this are not offer
 RESUME_IMPORT = 200               # chat items imported from a resumed codex rollout
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")       # resume ids end up in argv
 VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,99}$")  # model names etc.
-CLAUDE_MODES = ("default", "acceptEdits", "auto", "plan", "bypass", "manual")
+CLAUDE_MODES = ("default", "acceptEdits", "auto", "plan", "bypass", "manual", "dontAsk")
 CLAUDE_MODE_ALIAS = {"bypassPermissions": "bypass"}
-CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultracode")
 CODEX_OVERRIDES = ("model", "effort", "approval", "sandbox")
 SHIFT_TAB = b"\x1b[Z"
+# op "models": what the pickers on the phone offer
+CLAUDE_MODEL_LIST = (("default", "Default"), ("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku"),
+                     ("fable", "Fable"), ("opusplan", "Opus Plan"))
+CLAUDE_MODEL_ENV = {"opus": "ANTHROPIC_DEFAULT_OPUS_MODEL", "sonnet": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                    "haiku": "ANTHROPIC_DEFAULT_HAIKU_MODEL"}
+CLAUDE_MODE_LIST = ("manual", "acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions")
+EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+MODELS_TTL = 600                  # codex `debug models` result cache (s)
+MODELS_TIMEOUT = 30
+MENU_SETTLE = 0.15                # the screen is parsed for a menu once output paused this long
+MENU_MAX_WAIT = 0.5               # ... or at least this often while output never pauses (claude's animated logo)
+MENU_KEYS = {"esc": b"\x1b", "s": b"s"}
+INIT_CMDS_MAX = 4
 
 
 def project_dir():
@@ -145,9 +158,11 @@ def is_user_keys(data):
     return b"\r" in data or data[:1] == b"\x1b" or b"\x03" in data
 
 
-MODE_RE = re.compile(r"(plan mode|accept edits|auto mode|bypass permissions|manual mode) on", re.I)
+MODE_RE = re.compile(r"(plan mode|accept edits|auto mode|bypass permissions|manual mode|don't ask mode|dontask mode) on",
+                     re.I)
 MODE_NAMES = {"plan mode": "plan", "accept edits": "acceptEdits", "auto mode": "auto",
-              "bypass permissions": "bypass", "manual mode": "manual"}
+              "bypass permissions": "bypass", "manual mode": "manual", "don't ask mode": "dontAsk",
+              "dontask mode": "dontAsk"}
 
 
 class Screen:
@@ -310,6 +325,118 @@ class Screen:
             if "for shortcuts" in ln:
                 return "default"
         return None
+
+    def menu(self):
+        return parse_menu(self.lines())
+
+
+# interactive pickers drawn by claude / codex (/model, /effort, approval prompts ...)
+MENU_FOOTER_RE = re.compile(r"esc to cancel|esc back|enter to confirm|enter select", re.I)
+MENU_OPT_RE = re.compile(r"^(\s*)([❯›>▶]\s*)?(\d{1,2})\.\s+(\S.*?)(?:\s{2,}(\S.*))?$")
+MENU_CURRENT_RE = re.compile(r"\s*(✔|✓|\(current\))\s*")
+BOX_ONLY_RE = re.compile(r"^[\s─-▟←-⇿·•●○◯…-]*$")
+BOX_RUN_RE = re.compile(r"[─-▟]{3}")      # separator lines (also with a status label in them)
+SLIDER_WORDS = set(EFFORT_ORDER) | {"ultracode"}
+MENU_MAX_OPTS = 20
+MENU_MAX_STR = 200
+
+
+def _menu_str(s):
+    return clip(s.strip(), MENU_MAX_STR)
+
+
+def parse_menu(lines):
+    """Screen text -> {"kind": "list"|"slider", "title", "options", "cursor", "hint"} or None (no / unsure)."""
+    foot = None
+    for i in range(len(lines) - 1, -1, -1):
+        if MENU_FOOTER_RE.search(lines[i]):
+            foot = i
+            break
+    if foot is None:
+        return None
+    hint = _menu_str(lines[foot])
+    top = max(0, foot - 40)
+    return _parse_slider(lines, top, foot, hint) or _parse_list(lines, top, foot, hint)
+
+
+def _menu_title(lines, first, top):
+    """First line of the paragraph right above the options (claude: "Select model" + a description)."""
+    j = first - 1
+    while j >= top and (not lines[j].strip() or BOX_ONLY_RE.match(lines[j]) or BOX_RUN_RE.search(lines[j])):
+        j -= 1
+    if j < top:
+        return ""
+    k = j
+    while k - 1 >= top and lines[k - 1].strip() and not BOX_RUN_RE.search(lines[k - 1]) and j - k < 3:
+        k -= 1
+    return _menu_str(lines[k])
+
+
+def _parse_list(lines, top, foot, hint):
+    blocks, cur = [], None
+    for i in range(top, foot):
+        ln = lines[i]
+        m = MENU_OPT_RE.match(ln)
+        if m:
+            indent = len(m.group(1)) + len(m.group(2) or "")
+            if cur is None:
+                cur = {"first": i, "opts": [], "indent": indent}
+                blocks.append(cur)
+            cur["opts"].append({"n": int(m.group(3)), "label": m.group(4), "desc": m.group(5) or "",
+                                "mark": bool(m.group(2)), "line": i})
+        elif cur is not None and ln.strip() and len(ln) - len(ln.lstrip()) > cur["indent"] \
+                and not BOX_ONLY_RE.match(ln):
+            o = cur["opts"][-1]
+            o["desc"] = (o["desc"] + " " + ln.strip()).strip()     # wrapped description
+        else:
+            cur = None
+    if not blocks:
+        return None
+    b = blocks[-1]                    # the block nearest the footer
+    opts = b["opts"]
+    if [o["n"] for o in opts] != list(range(opts[0]["n"], opts[0]["n"] + len(opts))) or len(opts) > MENU_MAX_OPTS:
+        return None
+    marks = [k for k, o in enumerate(opts) if o["mark"]]
+    if len(marks) != 1:
+        return None
+    out = []
+    for k, o in enumerate(opts):
+        label, current = o["label"], False
+        if MENU_CURRENT_RE.search(label):
+            current = True
+            label = MENU_CURRENT_RE.sub(" ", label).strip()
+        if MENU_CURRENT_RE.search(o["desc"]):
+            current = True
+            o["desc"] = MENU_CURRENT_RE.sub(" ", o["desc"]).strip()
+        out.append({"i": k, "label": _menu_str(label), "desc": _menu_str(o["desc"]), "current": current})
+    return {"kind": "list", "title": _menu_title(lines, b["first"], top), "options": out,
+            "cursor": marks[0], "hint": hint}
+
+
+def _parse_slider(lines, top, foot, hint):
+    for i in range(foot - 1, top - 1, -1):
+        # leading run of effort words, 2+ spaces apart (claude may put e.g. "Tab to toggle" after them)
+        words, pos, ln = [], 0, lines[i]
+        for m in re.finditer(r"\S+(?: \S+)*", ln):
+            if m.group(0) not in SLIDER_WORDS or (words and m.start() - pos < 2):
+                break
+            words.append((m.start(), m.group(0)))
+            pos = m.end()
+        if len(words) < 3:
+            continue
+        for j in (i - 1, i + 1):
+            if top <= j < foot and "▲" in lines[j]:
+                col = lines[j].index("▲")
+                cursor = min(range(len(words)), key=lambda k: abs(words[k][0] + len(words[k][1]) / 2.0 - col))
+                # skip scale captions like "Faster ...... Smarter" above the track
+                t = min(i, j) - 1
+                while t >= top and (not lines[t].strip() or BOX_ONLY_RE.match(lines[t]) or
+                                    re.search(r"\S\s{4,}\S", lines[t].strip())):
+                    t -= 1
+                return {"kind": "slider", "title": _menu_title(lines, t + 1, top),
+                        "options": [{"i": k, "label": w, "desc": ""} for k, (_, w) in enumerate(words)],
+                        "cursor": cursor, "hint": hint}
+    return None
 
 
 # --------------------------------------------------------------------------- claude transcript
@@ -1090,8 +1217,12 @@ class Session:
         self.cmode = None              # claude permission mode read from the footer
         self.hook_mode = None          # claude permission_mode reported by hooks (fallback)
         self.effort = None             # claude effort level from the transcript
-        self.screen = Screen(cols, rows) if kind == "claude" else None
+        self.screen = Screen(cols, rows) if kind in ("claude", "codex") else None
         self.screen_dirty = False
+        self.menu_dirty = False
+        self.menu_parsed = 0.0         # last parse_menu run (MENU_MAX_WAIT)
+        self.menu = None               # interactive picker visible on the screen (parse_menu)
+        self.init_cmds = []            # slash commands typed once after the first SessionStart (claude)
         self.delete_req = None         # callback(ok) while a delete waits for the process to exit
 
     # --- info
@@ -1131,7 +1262,8 @@ class Session:
                 "pending_count": len(self.pendings),
                 "question": self.question, "agent_session_id": self.agent_session_id,
                 "can_resume": bool(self.agent_session_id) and self.kind in ("claude", "codex"),
-                "key": self.key, "restarts": self.restarts, "mode": self.mode(), "overrides": dict(self.overrides)}
+                "key": self.key, "restarts": self.restarts, "mode": self.mode(), "overrides": dict(self.overrides),
+                "menu": self.menu}
 
     def touch(self):
         self.dirty = True
@@ -1212,6 +1344,7 @@ class Session:
         self.spawned_at = now()
         self.resumed_at = self.spawned_at if resume and self.agent_session_id else None
         self.cmode = None
+        self.menu = None
         if self.screen is not None:
             self.screen = Screen(self.cols, self.rows)
         if self.kind == "codex":
@@ -1395,6 +1528,7 @@ class Session:
         if self.screen is not None:
             self.screen.feed(data)
             self.screen_dirty = True     # footer re-read once per tick (output bursts)
+            self.menu_dirty = True       # menus are parsed once the output settled
         if self.status == "starting" and self.kind != "claude":
             self.set_status("idle")
         self.touch()
@@ -1427,14 +1561,45 @@ class Session:
         if self.screen is None or not self.screen_dirty:
             return
         self.screen_dirty = False
+        if self.kind != "claude":
+            return
         m = self.screen.claude_mode()
         if m is not None and m != self.cmode:
             self.cmode = m
             self.touch()
 
+    def check_menu(self, t=None):
+        """Parse the screen for an interactive picker once output paused for MENU_SETTLE."""
+        if self.screen is None or not self.menu_dirty:
+            return
+        t = t or now()
+        if t - self.activity < MENU_SETTLE and t - self.menu_parsed < MENU_MAX_WAIT:
+            return
+        self.menu_dirty = False
+        self.menu_parsed = t
+        try:
+            m = self.screen.menu()
+        except Exception:
+            m = None
+        if m != self.menu:
+            self.menu = m
+            self.touch()
+
+    def run_init_cmds(self):
+        """Type the create's init_cmds (e.g. "/effort ultracode") once claude is up."""
+        cmds, self.init_cmds = self.init_cmds, []
+        delay = 0.6                      # SessionStart fires before the prompt accepts input
+        for cmd in cmds:
+            self.d.later(delay, lambda cmd=cmd: self.fd is not None and self.d.type_text(self, cmd))
+            delay += 0.8
+        if cmds:
+            self.type_busy = now() + delay
+
     def on_exit(self, code):
         self.exit_code = code
         self.fd = None
+        if self.menu is not None:
+            self.menu = None
         self.release_pendings()
         if self.settings_file:
             try:
@@ -1648,6 +1813,8 @@ class Session:
         wait = False
         if name == "SessionStart":
             self.set_status("idle", "", None)
+            if self.init_cmds:
+                self.run_init_cmds()
         elif name == "UserPromptSubmit":
             self.question = None
             self.set_status("running", "", None)
@@ -1706,6 +1873,115 @@ class Session:
             self.event("error", "出错停止: %s" % err, det or ev.get("last_assistant_message") or "")
         self.poll_tail()
         return wait
+
+
+# --------------------------------------------------------------------------- model lists (op "models")
+
+def check_init_cmds(cmds):
+    """create's init_cmds: up to 4 slash commands, typed once claude is up."""
+    if cmds is None:
+        return []
+    if not isinstance(cmds, list) or len(cmds) > INIT_CMDS_MAX or not all(
+            isinstance(x, str) and x.startswith("/") and len(x) <= 200 and not re.search(r"[\x00-\x1f\x7f]", x)
+            for x in cmds):
+        raise RuntimeError("无效的 init_cmds")
+    return list(cmds)
+
+
+def settings_arg(argv):
+    """The value of --settings in a claude argv (path or inline JSON), or None."""
+    argv = list(argv or [])
+    for i, a in enumerate(argv):
+        if a == "--settings" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--settings="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def claude_model_env(argv):
+    """Only the three custom model names from the --settings env (the file also carries tokens)."""
+    src = settings_arg(argv)
+    if not src:
+        return {}
+    try:
+        if src.lstrip().startswith("{"):
+            data = json.loads(src)
+        else:
+            with open(os.path.expanduser(src)) as f:
+                data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    env = data.get("env") if isinstance(data, dict) else None
+    if not isinstance(env, dict):
+        return {}
+    return {k: clip(env[k], 120) for k in CLAUDE_MODEL_ENV.values() if isinstance(env.get(k), str) and env[k]}
+
+
+def claude_models(argv, current=None):
+    env = claude_model_env(argv)
+    desc = {"default": "Recommended for your account" + (" (currently %s)" % current if current else ""),
+            "opus": "Most capable", "sonnet": "Everyday tasks", "haiku": "Fastest",
+            "fable": "Fable", "opusplan": "Opus in plan mode, Sonnet otherwise"}
+    out = []
+    for mid, label in CLAUDE_MODEL_LIST:
+        d = desc[mid]
+        custom = env.get(CLAUDE_MODEL_ENV.get(mid, ""))
+        if custom:
+            d = "Custom %s model (%s)" % (label, custom)
+        out.append({"id": mid, "label": label, "desc": d, "efforts": None, "default_effort": None})
+    return {"models": out, "efforts": list(CLAUDE_EFFORTS), "modes": list(CLAUDE_MODE_LIST)}
+
+
+def codex_models_cmd(argv):
+    """`codex debug models`, keeping the preset's config flags (-c / --enable / --disable; it rejects -p)."""
+    argv = list(argv or ["codex"])
+    cmd = [argv[0] if argv else "codex", "debug", "models"]
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-c", "--config", "--enable", "--disable") and i + 1 < len(argv):
+            cmd += [a, argv[i + 1]]
+            i += 2
+            continue
+        if a.startswith(("--config=", "--enable=", "--disable=")):
+            cmd.append(a)
+        i += 1
+    return cmd
+
+
+def parse_codex_models(text):
+    i = text.find('{"models"')      # rc files of the login shell may print something first
+    i = text.find("{") if i < 0 else i
+    data = json.JSONDecoder().raw_decode(text[max(i, 0):])[0]
+    rows = [m for m in data.get("models") or [] if isinstance(m, dict) and m.get("slug")
+            and m.get("visibility", "list") == "list"]
+    rows.sort(key=lambda m: m.get("priority") if isinstance(m.get("priority"), (int, float)) else 1e9)
+    models, seen = [], set()
+    for m in rows:
+        effs = [e.get("effort") for e in m.get("supported_reasoning_levels") or []
+                if isinstance(e, dict) and isinstance(e.get("effort"), str)]
+        seen.update(effs)
+        models.append({"id": clip(str(m["slug"]), 100), "label": clip(str(m.get("display_name") or m["slug"]), 100),
+                       "desc": clip(str(m.get("description") or ""), 300), "efforts": effs or None,
+                       "default_effort": m.get("default_reasoning_level") if isinstance(
+                           m.get("default_reasoning_level"), str) else None})
+    efforts = [e for e in EFFORT_ORDER if e in seen] + sorted(e for e in seen if e not in EFFORT_ORDER)
+    return {"models": models, "efforts": efforts, "modes": []}
+
+
+def run_login_shell(cmd, timeout):
+    """Run cmd through the user's login shell (PATH as in their terminal). Returns stdout text."""
+    import subprocess
+    shell = os.environ.get("SHELL") or "/bin/sh"
+    env = {k: v for k, v in os.environ.items() if not k.startswith(STRIP_ENV)}
+    r = subprocess.run([shell, "-l", "-i", "-c", 'exec "$@"', "glimpse"] + cmd, stdin=subprocess.DEVNULL,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, env=env,
+                       cwd=os.path.expanduser("~"))
+    if r.returncode != 0:
+        err = r.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise RuntimeError("%s exited %s%s" % (cmd[0], r.returncode, (": " + clip(err[-1], 200)) if err else ""))
+    return r.stdout.decode("utf-8", "replace")
 
 
 # --------------------------------------------------------------------------- daemon
@@ -1800,6 +2076,9 @@ class Daemon:
         self.approval_wait = float(os.environ.get("GLIMPSE_APPROVAL_WAIT") or 600)
         self.net_prev = None
         self.usage_today = UsageToday()
+        self.models_cache = {}         # codex `debug models` argv -> (time, result)
+        self.models_wait = {}          # same key -> callbacks waiting for the running lookup
+        self.bg_done = []              # (callback, result, error) from worker threads, run in tick()
 
     # --- plumbing
     def listen(self):
@@ -1918,9 +2197,12 @@ class Daemon:
     def session_list(self):
         return [self.sessions[k].info() for k in self.order if k in self.sessions]
 
-    def create(self, kind, cwd, name, args, cols, rows, env=None, key=None, resume_id=None):
+    def create(self, kind, cwd, name, args, cols, rows, env=None, key=None, resume_id=None, init_cmds=None):
+        """New session. With resume_id a session that already owns that conversation is reused:
+        running -> returned as is, exited -> restarted in place (see create_or_reuse)."""
         if kind not in DEFAULT_PRESETS:
             raise RuntimeError("unknown kind %r" % kind)
+        cmds = check_init_cmds(init_cmds) if kind == "claude" else []
         if resume_id is not None:
             if kind not in ("claude", "codex") or not isinstance(resume_id, str) or not ID_RE.match(resume_id):
                 raise RuntimeError("无效的对话 id")
@@ -1942,6 +2224,7 @@ class Daemon:
         if env:
             s.env = {str(k): str(v) for k, v in env.items()}
         s.key = key
+        s.init_cmds = cmds
         if resume_id:
             s.agent_session_id = resume_id
         self.sessions[sid] = s          # before spawn: a resumed rollout is imported with send_subs etc.
@@ -1954,6 +2237,35 @@ class Daemon:
         self.sel.register(s.fd, selectors.EVENT_READ, ("pty", s))
         self.gc_exited()
         return s
+
+    def owner_of(self, kind, resume_id):
+        """The session that owns this claude / codex conversation (a running one first), or None."""
+        if not resume_id:
+            return None
+        found = [o for o in self.sessions.values() if o.kind == kind and o.agent_session_id == resume_id]
+        found.sort(key=lambda o: (o.fd is not None, o.activity))
+        return found[-1] if found else None
+
+    def create_or_reuse(self, m, done):
+        """op create. done(session, existing, err). A resumed conversation already owned by a session
+        shows up as that same session: running -> returned, exited -> restarted in place."""
+        kind = m.get("kind") or "claude"
+        resume_id = m.get("resume_id") or None
+        o = self.owner_of(kind, resume_id) if isinstance(resume_id, str) else None
+        if o is None:
+            done(self.create(kind, m.get("cwd"), m.get("name"), m.get("args"), m.get("cols"), m.get("rows"),
+                             m.get("env"), m.get("key"), resume_id, m.get("init_cmds")), False, None)
+            return
+        if o.fd is not None:
+            done(o, True, None)
+            return
+        env = m.get("env")
+        if env is not None and not isinstance(env, dict):
+            raise RuntimeError("bad env")
+        if kind == "claude":
+            o.init_cmds = check_init_cmds(m.get("init_cmds"))
+        o.restart({str(k): str(v) for k, v in (env or {}).items()} if env is not None or m.get("key") is not None
+                  else None, m.get("key"), True, lambda err: done(o, True, err))
 
     def gc_exited(self):
         dead = [k for k in self.order if self.sessions[k].fd is None]
@@ -2061,6 +2373,78 @@ class Daemon:
         else:
             raise RuntimeError("只有 Claude / Codex 会话支持")
 
+    def menu_op(self, s, index=None, key=None, gap=0.04):
+        """Operate the picker on screen: move the cursor to index with arrow keys, then Enter; or Esc / "s"."""
+        if s.fd is None:
+            raise RuntimeError("会话没有在运行")
+        s.check_menu(now() + MENU_SETTLE)        # use the latest screen, even mid-burst
+        mn = s.menu
+        if not mn:
+            raise RuntimeError("当前没有菜单")
+        if key is not None:
+            if key not in MENU_KEYS:
+                raise RuntimeError("无效的按键")
+            keys = [MENU_KEYS[key]]
+        else:
+            if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(mn["options"]):
+                raise RuntimeError("无效的选项")
+            fwd, back = (b"\x1b[C", b"\x1b[D") if mn["kind"] == "slider" else (b"\x1b[B", b"\x1b[A")
+            n = index - mn["cursor"]
+            keys = [fwd if n > 0 else back] * abs(n) + [b"\r"]
+        s.menu = None                   # re-detected from the screen once the TUI redrew
+        s.menu_dirty = True
+        s.touch()
+        s.user_input()
+        for k, data in enumerate(keys):
+            if k == 0:
+                s.write(data)
+            else:
+                self.later(gap * k, lambda data=data: s.fd is not None and s.write(data))
+        return keys
+
+    def models(self, kind, argv, done):
+        """op models: claude from the preset's --settings, codex from `codex debug models` (worker thread, cached)."""
+        if kind == "claude":
+            cur = [o for o in self.sessions.values() if o.kind == "claude" and (o.usage or {}).get("model")]
+            cur.sort(key=lambda o: o.activity)
+            argv = argv if isinstance(argv, list) else DEFAULT_PRESETS["claude"]["argv"]
+            done(claude_models([str(a) for a in argv], cur[-1].usage["model"] if cur else None), None)
+            return
+        if kind != "codex":
+            raise RuntimeError("无效的类型 %r" % kind)
+        argv = [os.path.expanduser(str(a)) if str(a).startswith("~/") else str(a)
+                for a in (argv if isinstance(argv, list) and argv else DEFAULT_PRESETS["codex"]["argv"])]
+        cmd = tuple(codex_models_cmd(argv))
+        hit = self.models_cache.get(cmd)
+        if hit and now() - hit[0] < MODELS_TTL:
+            done(hit[1], None)
+            return
+        if cmd in self.models_wait:
+            self.models_wait[cmd].append(done)
+            return
+        self.models_wait[cmd] = [done]
+
+        def finished(res, err):
+            if err is None:
+                self.models_cache[cmd] = (now(), res)
+            for cb in self.models_wait.pop(cmd, []):
+                cb(res, err)
+
+        def work():
+            try:
+                res, err = parse_codex_models(run_login_shell(list(cmd), MODELS_TIMEOUT)), None
+            except Exception as e:
+                import subprocess
+                res = None
+                err = "codex debug models 超时" if isinstance(e, subprocess.TimeoutExpired) else \
+                    "codex debug models 失败: %s" % clip(str(e), 300)
+            self.bg_done.append((finished, res, err))
+        self.background(work)
+
+    def background(self, fn):
+        import threading
+        threading.Thread(target=fn, daemon=True).start()
+
     def cycle_mode(self, s, target, done, tries=6, gap=0.3):
         """Press Shift+Tab until claude's footer shows the target mode (best effort)."""
         def step(left):
@@ -2115,11 +2499,24 @@ class Daemon:
             elif op == "usage_today":
                 self.send(c, dict(self.usage_today.scan(), t="usage_today", req=req))
             elif op == "create":
-                ns = self.create(m.get("kind") or "claude", m.get("cwd"), m.get("name"), m.get("args"),
-                                 m.get("cols"), m.get("rows"), m.get("env"), m.get("key"), m.get("resume_id") or None)
-                self.send(c, {"t": "created", "req": req, "s": ns.info()})
-                self.broadcast({"t": "session", "s": ns.info()})
-                ns.dirty = False
+                def created(ns, existing, err, c=c, req=req):
+                    if err:
+                        self.send(c, {"t": "error", "req": req, "sid": ns.sid, "msg": err})
+                        return
+                    r = {"t": "created", "req": req, "s": ns.info()}
+                    if existing:
+                        r["existing"] = True
+                    self.send(c, r)
+                    self.broadcast({"t": "session", "s": ns.info()})
+                    ns.dirty = False
+                self.create_or_reuse(m, created)
+            elif op == "models":
+                def listed(res, err, c=c, req=req, kind=m.get("kind")):
+                    if err:
+                        self.send(c, {"t": "error", "req": req, "msg": err})
+                    else:
+                        self.send(c, dict(res, t="models", req=req, kind=kind))
+                self.models(m.get("kind"), m.get("argv"), listed)
             elif op == "hook":
                 if os.environ.get("GLIMPSE_DEBUG"):
                     ev = m.get("ev") or {}
@@ -2135,7 +2532,7 @@ class Daemon:
                 self.send(c, {"t": "stats", "req": req, "stats": st})
             elif s is None:
                 if op in ("sub", "unsub", "in", "text", "resize", "kill", "forget", "rename", "ack", "replay",
-                          "approve", "restart", "control", "delete"):
+                          "approve", "restart", "control", "delete", "menu"):
                     self.send(c, {"t": "error", "req": req, "sid": sid, "msg": "no such session %s" % sid})
                 else:
                     self.send(c, {"t": "error", "req": req, "msg": "unknown op %r" % op})
@@ -2179,6 +2576,9 @@ class Daemon:
                     self.send(c, {"t": "error", "req": req, "sid": sid, "msg": err} if err else
                               {"t": "ok", "req": req, "sid": sid})
                 self.control(s, m.get("action"), m.get("value"), controlled)
+            elif op == "menu":
+                self.menu_op(s, m.get("index"), m.get("key"))
+                self.send(c, {"t": "ok", "req": req, "sid": sid})
             elif op == "rename":
                 s.name = clip(m.get("name") or s.name, 80)
                 s.touch()
@@ -2255,17 +2655,18 @@ class Daemon:
 
     def tick(self):
         t = now()
-        due = [x for x in self.timers if x[0] <= t]
-        self.timers = [x for x in self.timers if x[0] > t]
-        for _, fn in due:
+        while self.bg_done:
+            cb, res, err = self.bg_done.pop(0)
             try:
-                fn()
+                cb(res, err)
             except Exception as e:
-                sys.stderr.write("glimpse timer error: %s\n" % e)
+                sys.stderr.write("glimpse background error: %s\n" % e)
+        self.run_timers(t)
         for s in list(self.sessions.values()):
             try:
                 s.poll_tail()
                 s.check_mode()
+                s.check_menu(t)
             except Exception as e:
                 sys.stderr.write("glimpse tail error: %s\n" % e)
             if s.dirty and t - s.last_bcast >= 0.25:
@@ -2283,6 +2684,18 @@ class Daemon:
                     if c.kind == "attach":      # hub clients got it from broadcast already
                         self.send(c, {"t": "session", "s": info})
 
+    def run_timers(self, t=None):
+        t = now() if t is None else t
+        due = [x for x in self.timers if x[0] <= t]
+        if not due:
+            return
+        self.timers = [x for x in self.timers if x[0] > t]
+        for _, fn in sorted(due, key=lambda x: x[0]):
+            try:
+                fn()
+            except Exception as e:
+                sys.stderr.write("glimpse timer error: %s\n" % e)
+
     def run(self, idle_exit=None):
         self.listen()
         self.run_listening(idle_exit)
@@ -2294,8 +2707,10 @@ class Daemon:
         signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
         last_tick = 0
         while True:
+            # timers (key sequences with small gaps) fire close to their time, not once per tick
+            wait = min([0.25] + [max(0.0, x[0] - now()) for x in self.timers])
             try:
-                events = self.sel.select(timeout=0.25)
+                events = self.sel.select(timeout=wait)
             except InterruptedError:
                 events = []
             for key, mask in events:
@@ -2358,6 +2773,7 @@ class Daemon:
                             except (KeyError, ValueError):
                                 pass
             self.reap()
+            self.run_timers()
             if now() - last_tick >= 0.2:
                 last_tick = now()
                 self.tick()
@@ -2636,6 +3052,48 @@ def attach(sid=None):
     sys.stdout.write("\r\n[glimpse] %s: %s\r\n" % (reason, sid))
 
 
+KEY_ENV_DEFAULT = {"claude": "ANTHROPIC_AUTH_TOKEN", "codex": "OPENAI_API_KEY"}
+
+
+def local_launch(kind, key_name=None):
+    """Launch settings of this machine from config.json, like the hub uses them:
+    (argv, key name or None, env {var: value} or None). key_name overrides the preset key, "none" = no key.
+    Raises RuntimeError for an unknown key name. The key value is never printed."""
+    base = list(DEFAULT_PRESETS[kind]["argv"])
+    cfg, pkey = {}, None
+    try:
+        with open(os.environ.get("GLIMPSE_CONFIG") or os.path.join(project_dir(), "config.json")) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    for mc in cfg.get("machines") or []:
+        if isinstance(mc, dict) and mc.get("type") == "local":
+            pre = (mc.get("presets") or {}).get(kind)
+            if isinstance(pre, dict):
+                pkey = pre.get("key")
+                pre = pre.get("argv")
+            if isinstance(pre, list):
+                base = [str(x) for x in pre]
+            break
+    name = pkey if key_name is None else (None if key_name == "none" else key_name)
+    if not name or kind not in ("claude", "codex"):
+        if key_name not in (None, "none") and kind not in ("claude", "codex"):
+            raise RuntimeError("--key needs claude or codex")
+        return base, None, None
+    keys = cfg.get("keys") if isinstance(cfg.get("keys"), dict) else {}
+    prof = [p for p in keys.get("profiles") or [] if isinstance(p, dict) and p.get("name") == name]
+    if not prof:
+        known = [p.get("name") for p in keys.get("profiles") or [] if isinstance(p, dict) and p.get("name")]
+        raise RuntimeError("no key named %r in config.json (known: %s)" % (name, ", ".join(known) or "none"))
+    var = (keys.get("env") if isinstance(keys.get("env"), dict) else KEY_ENV_DEFAULT).get(kind)
+    value = prof[0].get("value")
+    if not var or not value:
+        return base, None, None
+    return base, name, {str(var): str(value)}
+
+
 def cmd_run(argv):
     import argparse
     ap = argparse.ArgumentParser(prog="glimpse run", description="start an AI coding session that the phone can see")
@@ -2644,6 +3102,7 @@ def cmd_run(argv):
     ap.add_argument("-C", "--cwd", default=os.getcwd())
     ap.add_argument("-d", "--detach", action="store_true", help="do not attach this terminal")
     ap.add_argument("-r", "--resume", metavar="ID", help="continue this claude session id / codex thread id")
+    ap.add_argument("-k", "--key", metavar="NAME", help="API key profile from config.json (none = no key)")
     extra = []
     if "--" in argv:                       # everything after -- goes to claude / codex untouched
         i = argv.index("--")
@@ -2652,34 +3111,138 @@ def cmd_run(argv):
     if a.resume and a.kind == "shell":
         ap.error("--resume needs claude or codex")
     args = extra
-    # same launch preset as the phone uses: config.json -> machines[type=local].presets[kind].argv
-    base = list(DEFAULT_PRESETS[a.kind]["argv"])
+    # same launch preset as the phone uses: config.json -> machines[type=local].presets[kind] argv + key
     try:
-        with open(os.environ.get("GLIMPSE_CONFIG") or os.path.join(project_dir(), "config.json")) as f:
-            for mc in json.load(f).get("machines") or []:
-                if mc.get("type") == "local":
-                    pre = (mc.get("presets") or {}).get(a.kind)
-                    pre = pre.get("argv") if isinstance(pre, dict) else pre
-                    if isinstance(pre, list):
-                        base = [str(x) for x in pre]
-                    break
-    except (OSError, ValueError):
-        pass
+        base, key, env = local_launch(a.kind, a.key)
+    except RuntimeError as e:
+        ap.error(str(e))
+    if a.kind != "shell":
+        print("[glimpse] key: %s" % (key or "none (preset / environment default)"))
+    full = (base + args) if (base or args) else None
+    start_session(a.kind, a.cwd, a.name, full, a.resume, env, key, a.detach)
+
+
+def start_session(kind, cwd, name, full, resume, env, key, detach=False):
+    """Create (or reuse, for a conversation that already has a session) and attach this terminal."""
     c = Conn(ensure_daemon())
     c.call({"op": "hello", "client": "cli"}, ("hello",))
     cols, rows = term_size()
-    full = (base + args) if (base or args) else None
-    if a.kind == "shell" and not full:
-        full = None                        # interactive login shell
-    m = c.call({"op": "create", "req": 1, "kind": a.kind, "cwd": a.cwd, "name": a.name, "args": full,
-                "cols": cols, "rows": rows, "resume_id": a.resume or None}, ("created",))
+    m = c.call({"op": "create", "req": 1, "kind": kind, "cwd": cwd, "name": name, "args": full or None,
+                "cols": cols, "rows": rows, "resume_id": resume or None, "env": env, "key": key}, ("created",))
     if m.get("t") == "error":
         raise SystemExit("glimpse: " + m.get("msg", "error"))
     sid = m["s"]["sid"]
-    print("[glimpse] session %s started (detach: Ctrl-], re-attach: glimpse attach %s)" % (sid, sid))
-    if not a.detach:
+    if m.get("existing"):
+        print("[glimpse] this conversation is already session %s, attaching (detach: Ctrl-])" % sid)
+    else:
+        print("[glimpse] session %s started (detach: Ctrl-], re-attach: glimpse attach %s)" % (sid, sid))
+    if not detach:
         time.sleep(0.1)
         attach(sid)
+
+
+# --------------------------------------------------------------------------- shell integration
+
+# claude sub-commands / flags that are not an interactive session: run the real binary untouched
+CLAUDE_PASSTHRU_CMDS = {"mcp", "plugin", "plugins", "config", "doctor", "update", "upgrade", "install", "setup-token",
+                        "migrate-installer", "agents", "auth", "login", "logout"}
+CLAUDE_PASSTHRU_FLAGS = {"-p", "--print", "-h", "--help", "-v", "--version"}
+CODEX_PASSTHRU_FLAGS = {"-h", "--help", "-V", "--version"}
+
+
+def split_wrap_args(kind, args):
+    """Raw `claude ...` / `codex ...` arguments -> (wrap?, resume id or None, remaining args)."""
+    args = list(args)
+    if kind == "codex":
+        if any(a in CODEX_PASSTHRU_FLAGS for a in args):
+            return False, None, args
+        pos = [i for i, a in enumerate(args) if not a.startswith("-")]
+        # the interactive TUI: no sub-command (a prompt is fine) or `codex resume <id>`
+        if pos and args[pos[0]] == "resume":
+            i = pos[0]
+            if i + 1 < len(args) and not args[i + 1].startswith("-") and ID_RE.match(args[i + 1]):
+                return True, args[i + 1], args[:i] + args[i + 2:]
+            return True, None, args                # `codex resume` / `--last`: codex's own picker, in a session
+        if pos and re.match(r"^[a-z][a-z-]*$", args[pos[0]]) and args[pos[0]] in CODEX_SUBCOMMANDS:
+            return False, None, args
+        return True, None, args
+    if any(a in CLAUDE_PASSTHRU_FLAGS for a in args):
+        return False, None, args
+    if args and not args[0].startswith("-") and args[0] in CLAUDE_PASSTHRU_CMDS:
+        return False, None, args
+    out, rid, i = [], None, 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("--resume="):
+            rid = a.split("=", 1)[1] or None
+        elif a in ("-r", "--resume") and i + 1 < len(args) and not args[i + 1].startswith("-") \
+                and ID_RE.match(args[i + 1]):
+            rid = args[i + 1]
+            i += 1
+        else:
+            out.append(a)
+        i += 1
+    return True, rid, out
+
+
+CODEX_SUBCOMMANDS = {"exec", "e", "review", "login", "logout", "mcp", "plugin", "app-server", "remote-control", "app",
+                     "completion", "update", "doctor", "sandbox", "debug", "apply", "a", "queue", "archive", "delete",
+                     "migrate-rollouts", "unarchive", "fork", "cloud", "exec-server", "features", "help", "agents",
+                     "mcp-server"}
+
+
+def merge_wrap_argv(base, extra):
+    """Preset argv + the user's own arguments. A flag the preset already has is not repeated (clap rejects
+    `--no-daemon` twice) and a user `--settings` replaces the preset's."""
+    base = list(base)
+    if "--settings" in extra or any(a.startswith("--settings=") for a in extra):
+        if "--settings" in base:
+            i = base.index("--settings")
+            del base[i:i + 2]
+        base = [a for a in base if not a.startswith("--settings=")]
+    bare = {a for i, a in enumerate(base) if a.startswith("--") and "=" not in a and
+            (i + 1 == len(base) or base[i + 1].startswith("-"))}
+    return base + [a for a in extra if a not in bare]
+
+
+def cmd_wrap(argv):
+    """`glimpse wrap claude|codex ARGS...`: what the shell functions from `glimpse shell-init` call.
+    The usual command line runs as a Glimpse session (visible on the phone) with this terminal attached;
+    anything that is not an interactive session runs the real program unchanged."""
+    if not argv or argv[0] not in ("claude", "codex"):
+        raise SystemExit("usage: glimpse wrap claude|codex [args...]")
+    kind, args = argv[0], argv[1:]
+    wrap, rid, extra = split_wrap_args(kind, args)
+    if not wrap or os.environ.get("GLIMPSE_SID") or os.environ.get("GLIMPSE") == "0" \
+            or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        os.execvp(kind, [kind] + args)
+    try:
+        base, key, env = local_launch(kind, os.environ.get("GLIMPSE_KEY") or None)
+    except RuntimeError as e:
+        raise SystemExit("glimpse: %s" % e)
+    full = merge_wrap_argv(base, extra)
+    print("[glimpse] %s via Glimpse%s, key: %s   (plain run: GLIMPSE=0 %s ...)" % (
+        kind, " (resume %s)" % rid if rid else "", key or "default", kind))
+    start_session(kind, os.getcwd(), None, full, rid, env, key)
+
+
+SHELL_INIT = r'''# Glimpse shell integration: `claude` and `codex` typed at the prompt run as Glimpse sessions
+# (visible on the phone). GLIMPSE=0 claude ... / command claude ... run the real program directly.
+_glimpse_wrap() {
+  if [ -n "${GLIMPSE_SID:-}" ] || [ "${GLIMPSE:-1}" = 0 ] || [ ! -t 0 ] || [ ! -t 1 ]; then
+    command "$@"
+  else
+    %(launcher)s wrap "$@"
+  fi
+}
+claude() { _glimpse_wrap claude "$@"; }
+codex() { _glimpse_wrap codex "$@"; }
+'''
+
+
+def cmd_shell_init():
+    launcher = os.path.join(project_dir(), "glimpse")
+    print(SHELL_INIT % {"launcher": shlex.quote(launcher)}, end="")
 
 
 def cmd_history(argv, adopt=False):
@@ -2735,6 +3298,10 @@ def main(argv=None):
         cmd_ls()
     elif cmd == "run":
         cmd_run(argv[1:])
+    elif cmd == "wrap":
+        cmd_wrap(argv[1:])
+    elif cmd == "shell-init":
+        cmd_shell_init()
     elif cmd == "attach":
         attach(argv[1] if len(argv) > 1 else None)
     elif cmd in ("history", "adopt"):

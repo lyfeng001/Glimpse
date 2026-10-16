@@ -32,13 +32,15 @@ Glimpse turns your phone into a remote control for those sessions. What you see 
   - **Chat** renders the Claude Code / Codex transcript as chat bubbles, with expandable tool calls and output.
   - **Terminal** is the full terminal screen, rendered with xterm.js.
 - **Type from the phone**: messages are submitted to the session's process exactly as if typed. Quick keys cover Esc, ^C, Tab, the arrow keys, 1/2/3 and more.
+- **TUI menus in chat view**: when `/model`, `/effort` or another interactive picker opens in the terminal, chat view shows it as a menu card with large tappable rows (current choice and cursor marked), plus Esc and, for Claude, "s · this session only". A "/" button in the composer types common slash commands (`/model`, `/effort`, `/compact`, `/clear`, `/status`).
 - **One-tap approvals**: when Claude Code asks for permission, an approval card offers Allow, Always allow, Deny or Handle in terminal. This uses the official `PermissionRequest` hook, not simulated key presses.
 - **Answer questions**: `AskUserQuestion` options show up as buttons.
 - **Push notifications** through standard Web Push when a turn finishes, the agent stops on an error, it needs approval or an answer, or the process exits.
 - **Swap key and restart**: when an API key runs out of credit, pick another one on the phone. Glimpse stops the old process, starts a new one and resumes the conversation (`claude --resume` / `codex resume`).
 - **Model & mode controls**:
-  - Claude Code: switch the permission mode (default / acceptEdits / auto / plan / bypass) and set `/model`, `/effort` or `/goal`.
-  - Codex: change the model, reasoning effort, approval policy or sandbox. This restarts Codex and resumes the conversation.
+  - The pickers show the real lists from each machine. Codex models and their efforts come from `codex debug models`; Claude models are default / opus / sonnet / haiku / fable / opusplan, with the custom names from your `--settings` file. Lists are cached for 10 minutes.
+  - Claude Code: permission mode (manual / acceptEdits / auto / plan / dontAsk / bypassPermissions), `/model`, effort (low / medium / high / xhigh / max / ultracode) and `/goal`. `ultracode` starts with `--effort xhigh` and then runs `/effort ultracode`.
+  - Codex: model, reasoning effort (low / medium / high / xhigh / max / ultra, as supported by the model), approval policy and sandbox. This restarts Codex and resumes the conversation.
   - All of these can also be chosen when creating a session.
 - **Continue a conversation started on the computer**: the "adopt" sheet lists recent Claude / Codex conversations on a machine. Glimpse resumes the one you pick under its control.
 - **Delete sessions**: swipe a card left, or use 会话操作 → 删除. A running process is stopped first. There's also one-tap cleanup of finished sessions.
@@ -46,6 +48,7 @@ Glimpse turns your phone into a remote control for those sessions. What you see 
 - **Widgets**: network latency and throughput, token usage (including **today's total** per machine, counted from all Claude / Codex transcripts on it), context usage, model & mode, machine CPU and memory, and session counts. Each can be toggled and reordered.
 - **Sessions outlive every connection**: an agent daemon owns the PTYs, the same idea as tmux. Restarting the hub, dropping SSH or locking the phone never stops the AI process. Output resumes from the exact byte offset on reconnect.
 - **Laptop and phone together**: `./glimpse run claude` attaches your laptop terminal to the same session. `Ctrl-]` detaches.
+- **Light / dark**: Settings → 外观 switches between follow system, light and dark. The terminal view stays dark.
 
 <p align="center"><img src="docs/img/controls.png" width="22%" alt="Model & mode"> <img src="docs/img/adopt.png" width="22%" alt="Continue a conversation"> <img src="docs/img/restart.png" width="22%" alt="Key"> <img src="docs/img/home-light.png" width="22%" alt="Light"></p>
 
@@ -116,6 +119,26 @@ scripts/install_launchd.sh       # optional (macOS): start at login and restart 
   - `./glimpse attach <id>` re-attaches, and plain `./glimpse attach` picks the latest live session. On the hub computer this also works for sessions on other machines (`./glimpse attach M2:<id>`), through the hub. The phone's 会话操作 sheet shows the exact command and a deep link for any other browser.
   - `./glimpse ls` lists all sessions.
   - Arguments after `--` go to the tool unchanged, e.g. `./glimpse run claude -- --model sonnet`.
+  - It uses the machine's preset from `config.json` (argv and default key, the same as the phone). `-k/--key NAME` picks another key, `--key none` uses none. It prints the key name, never its value.
+  - `./glimpse run claude --resume <id>` continues a conversation. If a Glimpse session already holds it, you attach to that session (restarted in place if it had exited) instead of getting a second copy.
+
+- **Shell integration (keep typing your usual commands)**: add one line to `~/.zshrc` (or `~/.bashrc`) on the hub computer:
+
+  ```sh
+  eval "$(/path/to/Glimpse/glimpse shell-init)"
+  ```
+
+  From then on the plain commands run as Glimpse sessions, with your terminal attached and the session visible on the phone:
+
+  ```sh
+  codex resume 01a0edaf-75de-7bd2-b706-c991c4118ecb --no-daemon
+  claude --resume <id>
+  claude
+  ```
+
+  - The machine preset is applied: Codex gets the preset key exported, Claude launches with the preset settings file. `GLIMPSE_KEY=key2 codex ...` picks another key for one run.
+  - A conversation that already has a Glimpse session is attached to instead of being started twice.
+  - Non-interactive uses (`claude -p`, `codex exec`, `--version`, sub-commands like `mcp`, pipes and scripts) run the real program untouched. `GLIMPSE=0 codex ...` or `command codex ...` always bypasses Glimpse.
 
 > A `claude` / `codex` you started directly in another terminal can't be attached as-is, because Glimpse doesn't own that terminal. To continue it, quit it there and pick its conversation in **接管电脑上的会话** on the phone. Glimpse then resumes it with `--resume` / `codex resume`.
 
@@ -192,7 +215,7 @@ Any device with a modern browser that is on your tailnet works: Android, iPad, o
 
 <details><summary><b>What does the logo mean?</b></summary>
 
-An eye whose pupil is a terminal prompt `>_`: a *glimpse* at your terminal sessions from wherever you are. The blue-to-green gradient follows the app's status colours, from running (blue) to done (green).
+A winking face drawn with terminal glyphs: `>` and a dot as the eyes, the cursor line bent into a smile. A friendly *glimpse* at your terminal from wherever you are.
 </details>
 
 <details><summary><b>Is it safe for my iPhone?</b></summary>
@@ -233,7 +256,7 @@ hub/machines.py          stdio channel to each machine (local subprocess / ssh)
 hub/webpush.py           Web Push (RFC 8291 encryption + RFC 8292 VAPID), no third-party push library
 hub/config.py            configuration loading
 hub/attach_client.py     `./glimpse attach` through the hub (sessions on other machines)
-web/                     the PWA (vanilla JS + xterm.js, no build step); web/icon.svg is the master logo
+web/                     the PWA (vanilla JS + xterm.js, no build step); web/icon.svg is the master logo (PNGs are generated from it)
 ```
 
 ## Acknowledgements

@@ -32,13 +32,15 @@ Glimpse 让手机变成这些会话的遥控器。手机上看到的就是它们
   - “对话”视图：根据 Claude Code / Codex 的会话记录渲染成聊天气泡，工具调用和输出可以展开。
   - “终端”视图：基于 xterm.js 显示完整的终端画面。
 - **手机上输入**：输入框发送的文字会提交到该会话的进程。另有 Esc、^C、Tab、方向键、1/2/3 等快捷键。
+- **对话视图里操作 TUI 菜单**：终端里弹出 `/model`、`/effort` 等交互菜单时，对话视图会显示成菜单卡片，选项是大按钮（标出当前值和光标），另有 Esc，Claude 还有“s · 仅本会话”。输入框旁的“/”按钮可以直接输入常用命令（`/model`、`/effort`、`/compact`、`/clear`、`/status`）。
 - **一键授权**：Claude Code 请求权限时，手机上会出现授权卡片，可以直接点允许、总是允许、拒绝或者交给终端处理。底层走官方的 `PermissionRequest` hook，不靠模拟按键。
 - **回答提问**：`AskUserQuestion` 的选项会显示成按钮。
 - **推送通知**：本轮完成、出错停止、需要授权或回答问题、进程退出时，通过标准 Web Push 发通知到 iPhone。
 - **更换 Key 并重启**：Key 余额用完时，可以在手机上换一个 Key，结束旧进程后重新启动并恢复原对话（`claude --resume` / `codex resume`）。
 - **模型与模式**：
-  - Claude Code：切换权限模式（default / acceptEdits / auto / plan / bypass），设置 `/model`、`/effort`、`/goal`。
-  - Codex：切换模型、推理强度、审批策略和沙箱，改完会重启并恢复对话。
+  - 选择列表来自各机器的真实数据：Codex 的模型和推理强度取自 `codex debug models`；Claude 的模型是 default / opus / sonnet / haiku / fable / opusplan，并显示 `--settings` 文件里配置的自定义模型名。列表缓存 10 分钟。
+  - Claude Code：权限模式（manual / acceptEdits / auto / plan / dontAsk / bypassPermissions）、`/model`、推理强度（low / medium / high / xhigh / max / ultracode）和 `/goal`。`ultracode` 会先用 `--effort xhigh` 启动，再执行 `/effort ultracode`。
+  - Codex：模型、推理强度（low / medium / high / xhigh / max / ultra，以模型支持为准）、审批策略和沙箱，改完会重启并恢复对话。
   - 这些在新建会话时也能直接选。
 - **接管电脑上的会话**：列出这台机器上最近的 Claude / Codex 对话，选中后 Glimpse 用 `--resume` / `codex resume` 接着这段对话继续。
 - **删除会话**：会话卡片左滑，或在“会话操作”里删除。正在运行的会先结束进程。另有一键清理已结束的会话。
@@ -53,6 +55,7 @@ Glimpse 让手机变成这些会话的遥控器。手机上看到的就是它们
   每个插件都可以开关和调整顺序。
 - **进程不受连接影响**：会话由 agent 守护进程托管（原理同 tmux）。hub 重启、ssh 断线、手机锁屏都不会中断 AI 进程，重连后从断点续传输出。
 - **电脑和手机同时操作**：`./glimpse run claude` 把电脑终端接到同一个会话上，按 `Ctrl-]` 断开。
+- **浅色 / 深色**：设置 → 外观里可选“跟随系统 · 浅色 · 深色”。终端视图始终是深色。
 
 <p align="center"><img src="docs/img/controls.png" width="22%" alt="模型与模式"> <img src="docs/img/adopt.png" width="22%" alt="接管电脑上的会话"> <img src="docs/img/restart.png" width="22%" alt="Key"> <img src="docs/img/home-light.png" width="22%" alt="Light"></p>
 
@@ -122,6 +125,26 @@ scripts/install_launchd.sh       # 可选（macOS）：开机自启，挂了自�
 
 - **在手机上**：点 ＋，选择机器、类型（Claude Code / Codex / Shell）、Key 和工作目录。
 - **在电脑上**：运行 `./glimpse run claude` 或 `./glimpse run codex`。当前终端会接入同一个会话，`Ctrl-]` 断开，`./glimpse attach <id>` 重新接入，不带 id 时接入最近的会话。在 hub 电脑上也能接入其他机器上的会话（`./glimpse attach M2:<id>`，经 hub 转发）。手机“会话操作”里会显示具体命令，以及给其他浏览器用的链接。`./glimpse ls` 列出所有会话。`--` 之后的参数会原样传给工具，例如 `./glimpse run claude -- --model sonnet`。
+  - 它使用 `config.json` 里这台机器的预设（argv 和默认 Key，与手机端一致）。`-k/--key 名称` 换用其他 Key，`--key none` 不用 Key。终端里只显示 Key 的名称，不显示值。
+  - `./glimpse run claude --resume <id>` 继续一段对话。如果这段对话已经在某个 Glimpse 会话里，会直接接入那个会话（已结束的会原地重启），不会再开一个副本。
+
+- **Shell 集成（继续敲原来的命令）**：在 hub 电脑的 `~/.zshrc`（或 `~/.bashrc`）里加一行：
+
+  ```sh
+  eval "$(/path/to/Glimpse/glimpse shell-init)"
+  ```
+
+  之后直接敲原来的命令就会以 Glimpse 会话运行，当前终端照常接入，手机上同时能看到：
+
+  ```sh
+  codex resume 01a0edaf-75de-7bd2-b706-c991c4118ecb --no-daemon
+  claude --resume <id>
+  claude
+  ```
+
+  - 会套用这台机器的预设：Codex 自动导出预设的 Key，Claude 照常用预设的 settings 文件启动。`GLIMPSE_KEY=key2 codex ...` 可以临时换 Key。
+  - 这段对话如果已经在某个 Glimpse 会话里，会直接接入，不会再开一个。
+  - 非交互的用法（`claude -p`、`codex exec`、`--version`、`mcp` 等子命令、管道和脚本）会直接运行原程序。`GLIMPSE=0 codex ...` 或 `command codex ...` 总是绕过 Glimpse。
 
 > 直接在别的终端里启动的 claude / codex，Glimpse 无法原样接管，因为那个终端不归它管。想在手机上继续的话，先在原终端退出，再在手机上打开“接管电脑上的会话”选中那段对话，Glimpse 会用 `--resume` / `codex resume` 接着继续。
 
@@ -197,7 +220,7 @@ Glimpse 是一个 PWA。安装后从自己的图标全屏打开，没有浏览�
 
 <details><summary><b>标志是什么意思？</b></summary>
 
-一只眼睛，瞳孔是终端提示符 `>_`，意思是不管在哪，都能“瞥一眼”（glimpse）你的终端会话。蓝到绿的渐变对应应用里的状态色：运行中（蓝）到已完成（绿）。
+一个用终端字符画出来的眨眼笑脸：`>` 和一个点是两只眼睛，光标线弯成了微笑。意思是不管在哪，都能轻松“瞥一眼”（glimpse）你的终端。
 </details>
 
 <details><summary><b>会影响我的 iPhone 吗？</b></summary>
@@ -240,7 +263,7 @@ hub/machines.py          到各台机器的 stdio 通道（本地子进程 / ssh
 hub/webpush.py           Web Push（RFC 8291 加密 + RFC 8292 VAPID），无第三方依赖
 hub/config.py            配置加载
 hub/attach_client.py     经 hub 实现 `./glimpse attach`（接入其他机器上的会话）
-web/                     PWA（原生 JS + xterm.js，无构建步骤）；web/icon.svg 是标志源文件
+web/                     PWA（原生 JS + xterm.js，无构建步骤）；web/icon.svg 是标志源文件（PNG 由它生成）
 ```
 
 ## 致谢

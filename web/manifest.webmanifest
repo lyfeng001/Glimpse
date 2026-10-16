@@ -3,20 +3,51 @@
   "name": "Glimpse",
   "short_name": "Glimpse",
   "description": "在手机上查看和操作电脑里的 Claude Code / Codex 终端会话",
-  "categories": ["developer", "productivity", "utilities"],
+  "categories": [
+    "developer",
+    "productivity",
+    "utilities"
+  ],
   "lang": "zh-CN",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
-  "display_override": ["standalone"],
+  "display_override": [
+    "standalone"
+  ],
   "orientation": "any",
   "background_color": "#0B0C0F",
   "theme_color": "#0B0C0F",
   "icons": [
-    { "src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
-    { "src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
-    { "src": "/static/icon-maskable-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
-    { "src": "/static/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
-    { "src": "/static/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+    {
+      "src": "/static/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/static/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/static/icon-maskable-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/static/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/static/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
   ]
 }

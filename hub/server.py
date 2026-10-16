@@ -35,6 +35,8 @@ HOST_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
 ARG_RE = re.compile(r"^[A-Za-z0-9_.:/\[\]@+=-]{1,120}$")   # model / effort / mode values that go on argv
 RESUME_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 CONTROL_ACTIONS = ("mode", "model", "effort", "goal", "approval", "sandbox")
+MENU_KEYS = ("esc", "s")
+MODELS_TTL = 600             # s; model / effort lists per (machine, kind) are cached this long
 RUNTIME = {}                 # resolved hub.listen / tailscale_hostname ("auto" -> tailscale), never saved
 
 
@@ -56,7 +58,9 @@ def build_argv(kind, base, msg):
     if kind == "claude":
         if val("model"):
             argv += ["--model", val("model")]
-        if val("effort"):
+        if val("effort") == "ultracode":
+            argv += ["--effort", "xhigh"]                # ultracode = xhigh + /effort ultracode typed after start
+        elif val("effort"):
             argv += ["--effort", val("effort")]
         if val("mode") and val("mode") != "default":    # "default" = keep the settings file's defaultMode
             argv += ["--permission-mode", val("mode")]
@@ -70,6 +74,13 @@ def build_argv(kind, base, msg):
         if val("sandbox"):
             argv += ["-s", val("sandbox")]
     return argv
+
+
+def init_cmds(kind, msg):
+    """Slash commands the agent types once the new session is up (only for flags with no argv equivalent)."""
+    if kind == "claude" and msg.get("effort") == "ultracode":
+        return ["/effort ultracode"]
+    return None
 
 
 def origin_ok(request):
@@ -196,6 +207,8 @@ class Hub:
         self.order = []
         self.sub_count = {}        # (m, sid) -> number of phones subscribed
         self.reply_to = {}         # (m, req) -> (phone, {"op", "sid"}) for routing the agent's reply
+        self.models_cache = {}     # (m, kind) -> (time, reply) for op "models"
+        self.models_pending = {}   # (m, kind) -> future of the in-flight agent call
         self.state_dirty = asyncio.Event()
         self.recent_push = {}
         self.http = None
@@ -272,7 +285,9 @@ class Hub:
         out = copy.deepcopy(C.DEFAULTS["options"])
         for kind, lists in (self.cfg.get("options") or {}).items():
             if isinstance(lists, dict):
-                out.setdefault(kind, {}).update({k: v for k, v in lists.items() if isinstance(v, list)})
+                legacy = C.LEGACY_OPTIONS.get(kind) or {}
+                out.setdefault(kind, {}).update({k: v for k, v in lists.items()
+                                                 if isinstance(v, list) and v not in legacy.get(k, [])})
         return out
 
     def state(self):
@@ -316,7 +331,8 @@ class Hub:
             p, info = r
             if t == "ok":
                 # confirmations the phone waits for; other ops ("in", "resize", ...) stay silent
-                name = {"approve": "approved", "control": "control_ok", "delete": "delete_ok"}.get(info.get("op"))
+                name = {"approve": "approved", "control": "control_ok", "delete": "delete_ok",
+                        "menu": "menu_ok"}.get(info.get("op"))
                 if name:
                     p.send({"t": name, "m": m.id, "sid": info.get("sid")})
                 return
@@ -324,7 +340,10 @@ class Hub:
                 p.send({"t": "history", "m": m.id, "req": msg.get("req"), "kind": info.get("kind"),
                         "items": msg.get("items") or []})
                 return
-            p.send(dict(msg, m=m.id))
+            out = dict(msg, m=m.id)
+            if t == "error" and not out.get("sid") and info.get("sid"):
+                out["sid"] = info["sid"]     # the agent may not echo it; the phone routes errors by session
+            p.send(out)
 
     async def on_event(self, m, sid, ev):
         s = m.sessions.get(sid) or {}
@@ -423,6 +442,20 @@ class Hub:
                 if action != "goal" and value and not ARG_RE.match(value):
                     raise ValueError("无效的值: %s" % value[:40])
                 self.forward(p, m, {"op": "control", "sid": sid, "action": action, "value": value})
+            elif op == "menu":
+                index, key = msg.get("index"), msg.get("key")
+                if not sid:
+                    raise ValueError("会话不存在")
+                if index is not None:
+                    if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index <= 30:
+                        raise ValueError("无效的选项")
+                    self.forward(p, m, {"op": "menu", "sid": sid, "index": index})
+                elif key in MENU_KEYS:
+                    self.forward(p, m, {"op": "menu", "sid": sid, "key": key})
+                else:
+                    raise ValueError("无效的按键")
+            elif op == "models":
+                await self.models(p, m, msg)
             elif op == "delete":
                 self.forward(p, m, {"op": "delete", "sid": sid})
             elif op == "clean_exited":
@@ -455,11 +488,41 @@ class Hub:
         r = await m.call({"op": "create", "kind": kind, "cwd": msg.get("cwd") or m.cfg.get("default_cwd"),
                           "name": msg.get("name") or None, "args": argv or None, "env": env,
                           "key": key if env else None, "cols": msg.get("cols") or 80, "rows": msg.get("rows") or 30,
-                          "resume_id": resume_id or None})
+                          "resume_id": resume_id or None, "init_cmds": init_cmds(kind, msg)})
         if r.get("t") == "created":
-            p.send({"t": "created", "m": m.id, "s": r["s"]})
+            out = {"t": "created", "m": m.id, "s": r["s"]}
+            if r.get("existing"):
+                out["existing"] = True       # the conversation already had a session: the phone just opens it
+            p.send(out)
         else:
             p.send({"t": "error", "m": m.id, "msg": r.get("msg") or "创建失败"})
+
+    async def models(self, p, m, msg):
+        """Real model / effort / mode lists from the agent (codex asks its CLI), cached per (machine, kind)."""
+        kind = msg.get("kind")
+        if kind not in ("claude", "codex"):
+            raise ValueError("无效的类型")
+        k = (m.id, kind)
+        hit = self.models_cache.get(k)
+        if hit is None or time.time() - hit[0] > MODELS_TTL:
+            fut = self.models_pending.get(k)
+            if fut is None:
+                # one agent call per (machine, kind) even when several phones open the sheet at once
+                argv = self.preset(m, kind).get("argv") or [kind]
+                fut = asyncio.ensure_future(m.call({"op": "models", "kind": kind, "argv": list(argv)}, timeout=45))
+                self.models_pending[k] = fut
+                fut.add_done_callback(lambda f: self.models_pending.pop(k, None))
+            try:
+                r = await asyncio.shield(fut)
+            except (ConnectionError, asyncio.TimeoutError) as e:
+                r = {"t": "error", "msg": "%s: %s" % (m.name, str(e) or "超时")}
+            if r.get("t") != "models":
+                p.send({"t": "error", "op": "models", "m": m.id, "kind": kind,
+                        "msg": r.get("msg") or "获取模型列表失败"})
+                return
+            hit = (time.time(), {x: r.get(x) or [] for x in ("models", "efforts", "modes")})
+            self.models_cache[k] = hit
+        p.send(dict(hit[1], t="models", m=m.id, kind=kind))
 
     async def restart(self, p, m, msg):
         sid = msg.get("sid")
@@ -560,6 +623,8 @@ class Hub:
             del self.sub_count[k]
         for k in [k for k in self.reply_to if k[0] == m.id]:
             del self.reply_to[k]
+        for k in [k for k in self.models_cache if k[0] == m.id]:
+            del self.models_cache[k]
         for ph in list(self.phones):
             ph.subs = {k for k in ph.subs if k[0] != m.id}
         await m.stop()
@@ -706,7 +771,7 @@ class Hub:
                 if not isinstance(data, dict):
                     continue
                 p.last_seen = time.time()
-                if data.get("op") in ("create", "restart", "machine_test", "machine_add", "machine_update",
+                if data.get("op") in ("create", "restart", "models", "machine_test", "machine_add", "machine_update",
                                       "machine_remove"):
                     asyncio.ensure_future(self.phone_op(p, data))
                 else:

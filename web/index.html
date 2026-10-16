@@ -72,6 +72,7 @@
   <symbol id="i-sparkle"viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></symbol>
   <symbol id="i-prompt" viewBox="0 0 24 24"><path d="m5 7 5 5-5 5M12 17h7"/></symbol>
   <symbol id="i-cloud-off" viewBox="0 0 24 24"><path d="m2 2 20 20M5.8 5.8A7 7 0 0 0 7 19h10.5M22 15.5A4.5 4.5 0 0 0 17.5 10h-1.3A7 7 0 0 0 9.6 5.1"/></symbol>
+  <symbol id="i-clipboard" viewBox="0 0 24 24"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></symbol>
   <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></symbol>
   <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></symbol>
   <symbol id="i-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 2.6-6.4L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></symbol>
@@ -103,7 +104,7 @@
       </div>
       <p id="login-err" class="err" role="alert"></p>
       <button type="submit" id="login-btn" class="btn primary lg block">登录</button>
-      <p class="foot">还没设置密码，或者是新设备？在电脑终端运行 <code>./glimpse url</code>，用手机打开输出的一次性链接（10 分钟内有效）。设置密码：<code>./glimpse password</code>。</p>
+      <p class="foot">还没设置密码，或者是新设备？在电脑终端运行 <code>glimpse url</code>，用手机打开输出的一次性链接（10 分钟内有效）。设置密码：<code>glimpse password</code>。</p>
     </form>
   </section>
 
@@ -136,6 +137,10 @@
       <div id="install" class="install" hidden role="region" aria-label="安装为 App"></div>
       <div id="home-widgets" class="widgets" role="region" aria-label="插件"></div>
       <nav id="chips" class="chips" aria-label="快速切换会话"></nav>
+      <div class="groupby" role="radiogroup" aria-label="会话分组方式">
+        <button type="button" role="radio" data-gb="machine">按机器</button>
+        <button type="button" role="radio" data-gb="status">按状态</button>
+      </div>
       <div id="groups" aria-busy="true">
         <div class="cards" style="padding-top:16px">
           <div class="skel skel-card"></div><div class="skel skel-card"></div><div class="skel skel-card"></div>
@@ -174,22 +179,7 @@
     </div>
     <div class="dock">
       <div id="v-card"></div>
-      <div id="keys" class="keys" role="toolbar" aria-label="快捷键">
-        <button type="button" class="key" data-k="esc" aria-label="Esc">Esc</button>
-        <button type="button" class="key" data-k="ctrlc" aria-label="Control C 中断">^C</button>
-        <button type="button" class="key" data-k="tab" aria-label="Tab">Tab</button>
-        <button type="button" class="key" data-k="stab" aria-label="Shift Tab">⇧Tab</button>
-        <button type="button" class="key sep" data-k="up" aria-label="上">↑</button>
-        <button type="button" class="key" data-k="down" aria-label="下">↓</button>
-        <button type="button" class="key" data-k="left" aria-label="左">←</button>
-        <button type="button" class="key" data-k="right" aria-label="右">→</button>
-        <button type="button" class="key" data-k="enter" aria-label="回车">⏎</button>
-        <button type="button" class="key sep" data-k="1">1</button>
-        <button type="button" class="key" data-k="2">2</button>
-        <button type="button" class="key" data-k="3">3</button>
-        <button type="button" class="key" data-k="y">y</button>
-        <button type="button" class="key" data-k="n">n</button>
-      </div>
+      <div id="keys" class="keys" role="toolbar" aria-label="快捷键"></div>
       <div id="slash-pop" class="slash-pop" role="menu" aria-label="斜杠命令" hidden></div>
       <form id="composer" class="composer">
         <button type="button" id="btn-slash" class="slash-btn" aria-label="斜杠命令" aria-haspopup="menu" aria-expanded="false" aria-controls="slash-pop">/</button>
@@ -359,6 +349,9 @@
       <button type="button" class="cell" id="act-ctl"><span class="cell-ic" style="background:#E8930C" aria-hidden="true"><svg class="ic"><use href="#i-sliders"/></svg></span><span class="grow">模型与模式<div class="sub" id="act-ctl-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
       <button type="button" class="cell" id="act-rename"><span class="cell-ic" aria-hidden="true"><svg class="ic"><use href="#i-pencil"/></svg></span><span class="grow">重命名</span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
       <button type="button" class="cell" id="act-restart"><span class="cell-ic" style="background:#8E5CF0" aria-hidden="true"><svg class="ic"><use href="#i-key"/></svg></span><span class="grow">更换 Key 并重启<div class="sub" id="act-restart-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
+      <div class="cell" id="act-ac-row"><span class="cell-ic" style="background:#0A84FF" aria-hidden="true"><svg class="ic"><use href="#i-refresh"/></svg></span>
+        <span class="grow">临时错误自动继续<div class="sub" id="act-ac-sub">服务器过载、流中断、输出被截断时自动发送“继续”</div></span>
+        <span class="switch"><input type="checkbox" role="switch" id="act-ac" aria-label="临时错误自动继续"><i></i></span></div>
       <button type="button" class="cell" id="act-fit"><span class="cell-ic" style="background:#2FB457" aria-hidden="true"><svg class="ic"><use href="#i-resize"/></svg></span><span class="grow">按手机屏幕调整终端尺寸<div class="sub" id="act-fit-sub"></div></span></button>
     </div>
     <div class="g-h">在其他地方打开</div>
@@ -378,6 +371,21 @@
 </dialog>
 
 <!-- rename sheet -->
+<!-- paste fallback: iOS blocks clipboard reads from a web page without a user paste gesture -->
+<dialog id="dlg-paste" class="sheet" aria-labelledby="dlg-paste-title">
+  <div class="sh-grab" aria-hidden="true"></div>
+  <div class="sh-head">
+    <button type="button" class="txt-btn l" data-close>取消</button>
+    <h2 id="dlg-paste-title">粘贴到终端</h2>
+    <button type="button" class="txt-btn strong r" id="paste-go">发送</button>
+  </div>
+  <div class="sh-body">
+    <div class="group"><label class="cell stack" for="paste-text"><span class="sr">要粘贴的内容</span>
+      <textarea id="paste-text" rows="6" class="mono" placeholder="长按这里 → 粘贴，然后点“发送”"
+        autocapitalize="off" autocorrect="off" spellcheck="false" style="width:100%;resize:vertical"></textarea></label></div>
+    <p class="g-f">内容会作为一次粘贴发送给会话，不会被逐字当成按键执行。</p>
+  </div>
+</dialog>
 <dialog id="dlg-rename" class="sheet" aria-labelledby="dlg-rename-title">
   <form id="rename-form" novalidate>
     <div class="sh-grab" aria-hidden="true"></div>
@@ -458,6 +466,16 @@
     <div class="g-h">插件</div>
     <div class="group" id="set-widgets"></div>
     <p class="g-f">开关控制首页和会话页显示哪些插件，箭头调整顺序。</p>
+    <div class="g-h">快捷键</div>
+    <div class="group" id="set-keys"></div>
+    <div class="group" style="margin-top:8px">
+      <label class="cell" for="key-label"><span class="grow">名称</span><input id="key-label" maxlength="8" placeholder="如 ^O" autocapitalize="off" autocorrect="off"></label>
+      <label class="cell" for="key-send"><span class="grow">发送</span><input id="key-send" class="mono" maxlength="500" placeholder="如 ^O、\e、/compact\r" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+      <button type="button" class="cell" id="key-add"><span class="grow" style="color:var(--accent-text)">添加自定义按键</span></button>
+      <button type="button" class="cell" id="key-reset"><span class="grow" style="color:var(--accent-text)">恢复默认按键栏</span></button>
+    </div>
+    <p class="g-f" id="key-err" role="alert"></p>
+    <p class="g-f">开关决定会话底部显示哪些键，箭头调整顺序。自定义键的写法：<code>^X</code> 是 Ctrl-X，<code>\e</code> 是 Esc，<code>\r</code> 是回车，<code>\t</code> 是 Tab，<code>\x1b</code> 这种是任意字节；其他字符原样发送。</p>
     <div class="g-h">外观</div>
     <div class="group">
       <div class="cell stack"><span class="lbl" id="theme-lbl">主题</span>
@@ -489,7 +507,7 @@
       <div id="acct-devices"></div>
       <button type="button" class="cell" id="acct-revoke-others"><span class="cell-ic" style="background:#FF453A" aria-hidden="true"><svg class="ic"><use href="#i-logout"/></svg></span><span class="grow">退出其他所有设备</span></button>
     </div>
-    <p class="g-f">每台设备单独登录，可以随时在这里把它退出。新设备在电脑上运行 <code>./glimpse url</code> 获取一次性登录链接（10 分钟内有效，只能用一次）；修改密码：<code>./glimpse password</code>。</p>
+    <p class="g-f">每台设备单独登录，可以随时在这里把它退出。新设备在电脑上运行 <code>glimpse url</code> 获取一次性登录链接（10 分钟内有效，只能用一次）；修改密码：<code>glimpse password</code>。</p>
     <div class="g-h">关于</div>
     <div class="group">
       <div class="cell"><span class="grow">Glimpse</span><span class="val" id="set-ver"></span></div>

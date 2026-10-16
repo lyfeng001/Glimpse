@@ -1,36 +1,71 @@
 #!/bin/sh
-# Glimpse launcher
-#   ./glimpse setup          create .venv and install the hub dependencies
-#   ./glimpse hub            run the hub (web app + relay) in the foreground
-#   ./glimpse url            print a one-time login link for a new device (expires in 10 minutes)
-#   ./glimpse password       set / change the login password
-#   ./glimpse devices        list logged-in devices; ./glimpse logout ID|all logs them out
-#   ./glimpse run claude     start a Claude Code session here, visible on the phone (Ctrl-] detaches)
-#   ./glimpse run codex      start a Codex session
-#   ./glimpse ls | kill ID
-#   ./glimpse shell-init     print shell functions so plain `claude` / `codex` run as Glimpse sessions
-#   ./glimpse attach [ID]    attach this terminal (no ID: most recent live session). Sessions on other machines
-#                            (ssh) are attached through the running hub: ./glimpse attach ID or M2:ID
+# Glimpse command line. Works from any directory and through a symlink on your PATH
+# (`./glimpse install` creates ~/.local/bin/glimpse -> this file).
+#
+#   glimpse setup            create .venv, install dependencies, create config.json
+#   glimpse install          put `glimpse` on your PATH (symlink in ~/.local/bin, or $GLIMPSE_BIN_DIR)
+#   glimpse uninstall        remove that symlink
+#   glimpse hub              run the hub (web app + relay) in the foreground
+#   glimpse url              one-time login link for a new device (single use, 10 minutes)
+#   glimpse password         set / change the login password
+#   glimpse devices          list logged-in devices; glimpse logout ID|all logs them out
+#   glimpse run claude       start a Claude Code session here, visible on the phone (Ctrl-] detaches)
+#   glimpse run codex        start a Codex session; glimpse run codex --resume ID continues a conversation
+#   glimpse ls | kill ID     list / stop sessions on this machine
+#   glimpse attach [ID]      attach this terminal (no ID: latest live session; M2:ID for another machine)
+#   glimpse shell-init       shell functions so plain `claude` / `codex` run as Glimpse sessions
+#   glimpse test             run the test suite
 set -e
-DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# resolve this script through any chain of symlinks, so DIR is the project root even when called as
+# ~/.local/bin/glimpse (macOS has no `readlink -f`)
+SELF="$0"
+while [ -L "$SELF" ]; do
+  LINK="$(readlink "$SELF")"
+  case "$LINK" in
+    /*) SELF="$LINK" ;;
+    *)  SELF="$(dirname "$SELF")/$LINK" ;;
+  esac
+done
+DIR="$(cd "$(dirname "$SELF")" && pwd -P)"
 PY="$DIR/.venv/bin/python"
-[ -x "$PY" ] || PY=python3
+[ -x "$PY" ] || PY="$(command -v python3 || true)"
+[ -n "$PY" ] || { echo "glimpse: python3 not found" >&2; exit 1; }
+HUB="$DIR/hub/server.py"
+AGENT="$DIR/agent/glimpse_agent.py"
+BIN_DIR="${GLIMPSE_BIN_DIR:-$HOME/.local/bin}"
+
 case "${1:-help}" in
   setup)
     [ -x "$DIR/.venv/bin/python" ] || python3 -m venv "$DIR/.venv"
     "$DIR/.venv/bin/pip" install -q -r "$DIR/requirements.txt"
-    [ -f "$DIR/config.json" ] || { cp "$DIR/config.example.json" "$DIR/config.json"; chmod 600 "$DIR/config.json"; }
-    echo "done. edit config.json, then run: ./glimpse hub" ;;
-  hub)  shift; exec "$PY" "$DIR/hub/server.py" "$@" ;;
-  url)  exec "$PY" "$DIR/hub/server.py" --print-url ;;
-  password) exec "$PY" "$DIR/hub/server.py" --set-password ;;
-  devices)  exec "$PY" "$DIR/hub/server.py" --devices ;;
-  logout)   shift; exec "$PY" "$DIR/hub/server.py" --revoke "${1:?usage: ./glimpse logout DEVICE_ID|all}" ;;
-  test) exec "$PY" -m pytest -q "$DIR/tests" ;;
+    if [ ! -f "$DIR/config.json" ]; then
+      cp "$DIR/config.example.json" "$DIR/config.json"
+      chmod 600 "$DIR/config.json"
+    fi
+    echo "done. edit $DIR/config.json, then run: glimpse hub   (glimpse install puts glimpse on your PATH)" ;;
+  install)
+    mkdir -p "$BIN_DIR"
+    ln -sf "$DIR/glimpse" "$BIN_DIR/glimpse"
+    echo "linked $BIN_DIR/glimpse -> $DIR/glimpse"
+    case ":$PATH:" in
+      *":$BIN_DIR:"*) ;;
+      *) echo "note: $BIN_DIR is not on your PATH; add this to ~/.zshrc:  export PATH=\"$BIN_DIR:\$PATH\"" ;;
+    esac ;;
+  uninstall)
+    if [ -L "$BIN_DIR/glimpse" ]; then rm -f "$BIN_DIR/glimpse"; echo "removed $BIN_DIR/glimpse"; else echo "no link at $BIN_DIR/glimpse"; fi ;;
+  hub)      shift; exec "$PY" "$HUB" "$@" ;;
+  url)      exec "$PY" "$HUB" --print-url ;;
+  password) exec "$PY" "$HUB" --set-password ;;
+  devices)  exec "$PY" "$HUB" --devices ;;
+  logout)   shift; exec "$PY" "$HUB" --revoke "${1:?usage: glimpse logout DEVICE_ID|all}" ;;
+  test)     exec "$PY" -m pytest -q "$DIR/tests" ;;
   attach)
     shift
-    # the hub fallback needs aiohttp (the .venv); without it only local sessions can be attached
+    # attaching through the hub needs aiohttp (the .venv); without it only local sessions can be attached
     if "$PY" -c "import aiohttp" 2>/dev/null; then exec "$PY" "$DIR/hub/attach_client.py" "$@"; fi
-    exec "$PY" "$DIR/agent/glimpse_agent.py" attach "$@" ;;
-  *)    exec "$PY" "$DIR/agent/glimpse_agent.py" "$@" ;;
+    exec "$PY" "$AGENT" attach "$@" ;;
+  help|-h|--help)
+    sed -n '2,/^set -e/p' "$SELF" | sed -e '/^set -e/d' -e 's/^# \{0,1\}//' ;;
+  *)        exec "$PY" "$AGENT" "$@" ;;
 esac

@@ -303,7 +303,7 @@ code, pre, kbd { font-family: var(--mono); }
 .md code { font-size: 13px; padding: 1px 5px; border-radius: 5px; background: var(--fill-2); }
 .md pre { margin: 6px 0 8px; padding: 10px var(--s3); border-radius: var(--r-sm); background: var(--term-bg); color: #DCE1E8; overflow-x: auto;
   font-size: 12.5px; line-height: 1.5; white-space: pre; position: relative; }
-.md pre .lang { position: absolute; right: 8px; top: 4px; font: 600 10px var(--font); color: #8A919B; text-transform: uppercase; letter-spacing: .5px; }
+.md pre .lang { position: absolute; right: 74px; top: 6px; font: 600 10px var(--font); color: #8A919B; text-transform: uppercase; letter-spacing: .5px; }
 .md pre code { background: none; padding: 0; font-size: inherit; }
 .md a { word-break: break-all; }
 .msg.tool { align-self: stretch; display: flex; align-items: center; gap: var(--s2); min-height: 32px; padding: 0 var(--s1);
@@ -682,3 +682,31 @@ dialog.sheet.tall { min-height: min(560px, calc(var(--app-h) - var(--safe-t) - 1
   .screen.enter, .screen.enter-back { animation: none; }
   .fab { right: calc(50% - min(720px, 100vw) / 2 + 20px); }
 }
+
+/* ------------------------------------------------------------ copy code / selectable chat text */
+.msg, .msg * { -webkit-user-select: text; user-select: text; -webkit-touch-callout: default; }
+.md pre { padding-top: 34px; }
+.copy-code { position: absolute; right: 6px; top: 5px; display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 8px;
+  border-radius: 6px; background: rgba(255,255,255,.08); color: #C9D1DB; font: 600 11px var(--font); -webkit-user-select: none; user-select: none; }
+.copy-code .ic { width: 13px; height: 13px; }
+.copy-code:active { background: rgba(255,255,255,.18); }
+.copy-code.done { color: #3DDC6A; }
+.kchip { display: inline-flex; align-items: center; justify-content: center; min-width: 40px; height: 28px; padding: 0 8px; margin-right: 10px;
+  border-radius: 7px; background: var(--fill-2); font: 600 13px var(--mono); flex: none; }
+.key.paste { gap: 4px; color: var(--accent-text); }
+
+/* ------------------------------------------------------------ home: group by machine / status */
+.groupby { display: flex; gap: 2px; margin: 4px var(--s4) 0; padding: 2px; border-radius: 9px; background: var(--fill); width: max-content; }
+.groupby button { min-height: 30px; padding: 0 14px; border-radius: 7px; font-size: 13px; font-weight: 600; color: var(--text-2); }
+.groupby button[aria-checked="true"] { background: var(--surface-3); color: var(--text); box-shadow: var(--shadow-1); }
+.shead { display: flex; align-items: center; gap: 8px; padding: var(--s4) var(--s5) var(--s2); color: var(--text-2); }
+.shead h2 { font-size: 15px; font-weight: 700; color: var(--text); }
+.shead .scount { min-width: 20px; height: 20px; padding: 0 6px; border-radius: 10px; background: var(--fill-2); font-size: 12px; font-weight: 700;
+  display: inline-flex; align-items: center; justify-content: center; color: var(--text-2); }
+.sg-attn .shead, .sg-waiting .shead { color: var(--c-wait); }
+.sg-error .shead { color: var(--c-err); }
+.sg-running .shead { color: var(--c-run); }
+.sg-idle .shead { color: var(--c-ok); }
+.kbars { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.kbar { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-2); }
+.kbar .kb-l { width: 42px; flex: none; } .kbar .meter { flex: 1; } .kbar .kb-r { width: 82px; flex: none; text-align: right; }

@@ -17,7 +17,9 @@ DEFAULTS = {
     "hub": {"listen": [{"host": "auto", "port": 8443}, {"host": "127.0.0.1", "port": 8443}],
             "tailscale_hostname": "auto", "caffeinate": True,
             "push_subject": "mailto:glimpse@users.noreply.github.com", "approval_wait_seconds": 600},
-    "keys": {"env": {"claude": "ANTHROPIC_AUTH_TOKEN", "codex": "OPENAI_API_KEY"}, "profiles": []},
+    # usage_url: optional key-usage API (POST <url>/limit and /summary with the key as Bearer),
+    # e.g. "https://api.funcloud.ai/v1/model/key-usage"; empty = no usage shown
+    "keys": {"env": {"claude": "ANTHROPIC_AUTH_TOKEN", "codex": "OPENAI_API_KEY"}, "profiles": [], "usage_url": ""},
     "machines": [{"id": "M1", "name": "this-mac", "type": "local", "default_cwd": "~"}],
     # choices offered by the new-session sheet and the "controls" widget (lists replace, not merge)
     "options": {

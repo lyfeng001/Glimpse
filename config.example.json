@@ -14,7 +14,8 @@
     "profiles": [
       {"name": "key1", "value": "sk-..."},
       {"name": "key2", "value": "sk-..."}
-    ]
+    ],
+    "usage_url": ""
   },
   "machines": [
     {

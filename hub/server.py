@@ -105,7 +105,7 @@ def origin_ok(request):
     """Cross-site websocket hijacking guard: browsers always send Origin, it must name this host."""
     origin = request.headers.get("Origin")
     if not origin:
-        return True                  # non-browser clients (./glimpse attach, tests)
+        return True                  # non-browser clients (glimpse attach, tests)
     try:
         return urlsplit(origin).netloc.lower() == (request.host or "").lower()
     except ValueError:
@@ -232,6 +232,8 @@ class Hub:
         self.state_dirty = asyncio.Event()
         self.recent_push = {}
         self.http = None
+        self.key_usage = {}        # key name -> {limits, today_tokens, ...} from keys.usage_url
+        self.key_usage_wake = asyncio.Event()
         self.bg = []
         for mc in cfg.get("machines", []):
             if mc.get("enabled", True) is False:
@@ -289,7 +291,60 @@ class Hub:
         return out
 
     def keys_view(self):
-        return [{"name": p["name"]} for p in self.cfg["keys"].get("profiles") or [] if p.get("name")]
+        """Key names (never values) + the last usage numbers fetched for each."""
+        out = []
+        for p in self.cfg["keys"].get("profiles") or []:
+            if p.get("name"):
+                k = {"name": p["name"]}
+                u = self.key_usage.get(p["name"])
+                if u:
+                    k["usage"] = u
+                out.append(k)
+        return out
+
+    async def fetch_key_usage(self, value):
+        """One key's quota + today's usage from keys.usage_url (a key-usage API like funcloud's:
+        POST <url>/limit and <url>/summary with the key as Bearer). Returns a small dict or {"error"}."""
+        base = str(self.cfg["keys"].get("usage_url") or "").rstrip("/")
+        hdr = {"Authorization": "Bearer " + value, "Content-Type": "application/json"}
+        out = {"ts": time.time()}
+        for ep in ("limit", "summary"):
+            try:
+                async with self.http.post(base + "/" + ep, json={"data": {}}, headers=hdr,
+                                          timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    j = await r.json(content_type=None)
+                if not isinstance(j, dict) or j.get("code") != 200:
+                    msg = (j.get("code_reason") or j.get("code_msg")) if isinstance(j, dict) else None
+                    msg = "Key 无效或已停用" if str(msg).strip().lower() == "no response" else msg
+                    return {"ts": time.time(), "error": str(msg or "查询失败")[:80]}
+                d = j.get("resp_data") or {}
+                if ep == "limit":
+                    out["windows"] = [{"limit": w.get("limit"), "used": round(float(w.get("used") or 0), 2),
+                                       "percent": round(float(w.get("percent") or 0), 1),
+                                       "window_sec": w.get("window_sec"),
+                                       "reset_at": (w.get("next_reset_at") or 0) / 1000.0}
+                                      for w in d.get("windows") or [] if w.get("enabled", True)]
+                else:
+                    out["today_tokens"] = int(d.get("today_tokens") or 0)
+                    out["today_cost"] = round(float(d.get("today_cost") or 0), 2)
+                    out["today_requests"] = int(d.get("today_req_cnt") or 0)
+                    out["total_cost"] = round(float(d.get("total_cost") or 0), 2)
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as e:
+                return {"ts": time.time(), "error": "查询失败：%s" % (str(e) or type(e).__name__)[:80]}
+        return out
+
+    async def key_usage_loop(self):
+        """Refresh every key's usage every 5 minutes (or right away when a phone asks)."""
+        while True:
+            for p in list(self.cfg["keys"].get("profiles") or []):
+                if p.get("name") and p.get("value"):
+                    self.key_usage[p["name"]] = await self.fetch_key_usage(p["value"])
+                    self.state_dirty.set()
+            self.key_usage_wake.clear()
+            try:
+                await asyncio.wait_for(self.key_usage_wake.wait(), 300)
+            except asyncio.TimeoutError:
+                pass
 
     def env_for(self, kind, key_name):
         if kind not in ("claude", "codex") or not key_name:
@@ -418,6 +473,9 @@ class Hub:
         if op == "ping":
             p.send({"t": "pong", "ts": msg.get("ts")})
             return
+        if op == "key_usage":
+            self.key_usage_wake.set()         # refresh now; the result arrives with the next state
+            return
         if op == "visible":
             p.visible = bool(msg.get("v"))
             return
@@ -449,6 +507,8 @@ class Hub:
             elif op in ("in", "text", "resize", "kill", "forget", "ack", "rename"):
                 fwd = {k: v for k, v in msg.items() if k in ("op", "sid", "d", "text", "cols", "rows", "name")}
                 self.forward(p, m, fwd)
+            elif op == "auto_continue":
+                self.forward(p, m, {"op": "auto_continue", "sid": sid, "on": bool(msg.get("on"))})
             elif op == "approve":
                 self.forward(p, m, {"op": "approve", "sid": sid, "id": msg.get("id"),
                                     "decision": msg.get("decision"), "message": msg.get("message")})
@@ -683,7 +743,7 @@ class Hub:
             return False
         if self.auth.device_for(tok):
             return True
-        # the CLI token in data/token is for this computer only (./glimpse attach); never valid over the network
+        # the CLI token in data/token is for this computer only (glimpse attach); never valid over the network
         return self.is_local(request) and hmac.compare_digest(tok.encode(), self.token.encode())
 
     def set_cookie(self, resp, tok):
@@ -892,6 +952,8 @@ class Hub:
     async def startup(self, app):
         self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
         self.bg = [asyncio.ensure_future(self.state_loop())]
+        if self.cfg["keys"].get("usage_url"):
+            self.bg.append(asyncio.ensure_future(self.key_usage_loop()))
         for m in self.machines.values():
             m.start()
 
@@ -1058,7 +1120,7 @@ def main():
         for d in devs:
             print("%s  %-24s last seen %s  %s" % (d["id"], d["name"], time.strftime("%m-%d %H:%M",
                   time.localtime(d["last_seen"])), d["ip"]))
-        print("%d device(s)%s" % (len(devs), "" if auth.has_password() else "; no password set (./glimpse password)"))
+        print("%d device(s)%s" % (len(devs), "" if auth.has_password() else "; no password set (glimpse password)"))
         return
     if a.revoke:
         if a.revoke == "all":

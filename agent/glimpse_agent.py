@@ -1203,6 +1203,9 @@ class Session:
         self.key = None                # key profile name shown in the UI
         self.agent_session_id = None   # claude session id / codex thread id, for resume
         self.restarts = 0
+        self.auto_continue = False     # retry transient errors by typing "继续"
+        self.ac_count = 0              # consecutive auto-continues (reset when a turn completes)
+        self.ac_pending = False
         self.restart_req = None        # (resume, callback) while a restart is in progress
         self.usage = None
         # approvals by id, oldest first: {"id", "tool", "summary", "detail", "can_always", "ts", "suggestions",
@@ -1262,7 +1265,7 @@ class Session:
                 "pending_count": len(self.pendings),
                 "question": self.question, "agent_session_id": self.agent_session_id,
                 "can_resume": bool(self.agent_session_id) and self.kind in ("claude", "codex"),
-                "key": self.key, "restarts": self.restarts, "mode": self.mode(), "overrides": dict(self.overrides),
+                "key": self.key, "restarts": self.restarts, "auto_continue": self.auto_continue, "ac_count": self.ac_count, "mode": self.mode(), "overrides": dict(self.overrides),
                 "menu": self.menu}
 
     def touch(self):
@@ -1649,6 +1652,34 @@ class Session:
             self.preview = clip(text.replace("\n", " "), 300)
         return it
 
+    def maybe_auto_continue(self, err):
+        """Transient error + auto-continue on: type "继续" after a backoff instead of stopping.
+        Returns True when a retry was scheduled (the caller then skips the error status / push)."""
+        if not self.auto_continue or self.kind not in ("claude", "codex") or self.fd is None or self.ac_pending:
+            return False
+        if not is_transient_error(err) or self.ac_count >= AUTO_CONTINUE_MAX:
+            if self.ac_count >= AUTO_CONTINUE_MAX:
+                self.event("error", "自动继续已达上限（%d 次）" % AUTO_CONTINUE_MAX, err)
+            return False
+        delay = AUTO_CONTINUE_DELAYS[min(self.ac_count, len(AUTO_CONTINUE_DELAYS) - 1)]
+        self.ac_count += 1
+        self.ac_pending = True
+        n = self.ac_count
+        self.set_status("waiting", "临时错误，%d 秒后自动继续（第 %d/%d 次）" % (delay, n, AUTO_CONTINUE_MAX), None)
+        it = self.add_chat("system", "—— %s：%d 秒后自动发送“%s”（第 %d 次）——"
+                           % (clip(err, 120), delay, AUTO_CONTINUE_TEXT, n))
+        if it:
+            self.d.send_subs(self, {"t": "chat", "sid": self.sid, "items": [it]})
+
+        def fire():
+            self.ac_pending = False
+            if self.fd is None or not self.auto_continue or self.status == "running":
+                return              # process gone, switched off, or someone already continued it
+            self.d.type_text(self, AUTO_CONTINUE_TEXT)
+            self.set_status("running", "", None)
+        self.d.later(delay, fire)
+        return True
+
     def event(self, kind, title, body):
         body = clip((body or "").strip(), 400)
         key = (kind, body)
@@ -1775,11 +1806,13 @@ class Session:
                     self.d.send_subs(self, {"t": "chat", "sid": self.sid, "items": new})
                     new = []
                 if role == "@done":
+                    self.ac_count = 0
                     self.set_status("idle", "", "done")
                     self.event("done", "已完成本轮", text or self.preview)
                 elif role == "@error":
-                    self.set_status("error", clip(text, 200), "error")
-                    self.event("error", "出错停止", text)
+                    if not self.maybe_auto_continue(text):
+                        self.set_status("error", clip(text, 200), "error")
+                        self.event("error", "出错停止", text)
                 elif role == "@aborted":
                     self.set_status("idle", "已中断")
                 else:
@@ -1862,6 +1895,7 @@ class Session:
             msg = ev.get("last_assistant_message") or self.preview
             if msg:
                 self.preview = clip(msg.replace("\n", " "), 300)
+            self.ac_count = 0
             self.set_status("idle", "", "done")
             self.event("done", "已完成本轮", msg)
         elif name == "StopFailure":
@@ -1869,10 +1903,34 @@ class Session:
             det = ev.get("error_details") or ""
             if not isinstance(det, str):
                 det = json.dumps(det, ensure_ascii=False)
-            self.set_status("error", clip("%s %s" % (err, det), 200), "error")
-            self.event("error", "出错停止: %s" % err, det or ev.get("last_assistant_message") or "")
+            if not self.maybe_auto_continue("%s %s" % (err, det)):
+                self.set_status("error", clip("%s %s" % (err, det), 200), "error")
+                self.event("error", "出错停止: %s" % err, det or ev.get("last_assistant_message") or "")
         self.poll_tail()
         return wait
+
+
+# --------------------------------------------------------------------------- auto-continue
+
+# Errors worth simply retrying with "继续": provider overload, dropped streams, gateway errors.
+TRANSIENT_ERR_RE = re.compile(
+    r"overloaded|stream disconnected|stream closed|disconnected before completion|try again later|"
+    r"temporarily unavailable|server error|internal error|bad gateway|gateway time-?out|service unavailable|"
+    r"\b50[0234]\b|\b529\b|timed? ?out|connection reset|econnreset|server_error|overloaded_error|"
+    r"incomplete response|max_output_tokens|connection failed|error sending request|connection (refused|closed|error)|"
+    r"response\.completed|network error|broken pipe", re.I)
+# Never retried: the user must act (top up / swap the key, fix auth). Checked first.
+FATAL_ERR_RE = re.compile(
+    r"余额不足|额度|insufficient|balance|quota|billing|credit|权限验证失败|unauthori[sz]ed|invalid.{0,10}key|"
+    r"authentication|\b401\b|\b403\b|forbidden|context.{0,20}(length|window)|prompt is too long", re.I)
+AUTO_CONTINUE_TEXT = "继续"
+AUTO_CONTINUE_MAX = 5            # consecutive retries per session before giving up and notifying
+AUTO_CONTINUE_DELAYS = (15, 30, 60, 120, 240)   # seconds before each retry
+
+
+def is_transient_error(text):
+    t = text or ""
+    return not FATAL_ERR_RE.search(t) and bool(TRANSIENT_ERR_RE.search(t))
 
 
 # --------------------------------------------------------------------------- model lists (op "models")
@@ -2531,7 +2589,7 @@ class Daemon:
                 st, self.net_prev = sys_stats(self.net_prev)
                 self.send(c, {"t": "stats", "req": req, "stats": st})
             elif s is None:
-                if op in ("sub", "unsub", "in", "text", "resize", "kill", "forget", "rename", "ack", "replay",
+                if op in ("sub", "unsub", "in", "text", "resize", "kill", "forget", "rename", "ack", "replay", "auto_continue",
                           "approve", "restart", "control", "delete", "menu"):
                     self.send(c, {"t": "error", "req": req, "sid": sid, "msg": "no such session %s" % sid})
                 else:
@@ -2582,6 +2640,12 @@ class Daemon:
             elif op == "rename":
                 s.name = clip(m.get("name") or s.name, 80)
                 s.touch()
+            elif op == "auto_continue":
+                s.auto_continue = bool(m.get("on"))
+                if not s.auto_continue:
+                    s.ac_count = 0
+                s.touch()
+                self.send(c, {"t": "ok", "req": req, "sid": sid})
             elif op == "ack":
                 s.attention = None
                 s.touch()

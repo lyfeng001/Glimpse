@@ -951,3 +951,47 @@ def test_shell_init_defines_functions(capsys):
     import subprocess
     r = subprocess.run(["sh", "-n", "-c", out], capture_output=True)
     assert r.returncode == 0, r.stderr
+
+
+def test_transient_error_classification():
+    t = A.is_transient_error
+    assert t("stream disconnected before completion: Our servers are currently overloaded. Please try again later.")
+    assert t("unexpected status 502 Bad Gateway")
+    assert t("overloaded_error")
+    assert not t('unexpected status 666: {"code":9000,"code_msg":"服务器异常","code_reason":"Key余额不足，无法完成当前操作"}')
+    assert not t("API KEY 权限验证失败，请检查header")
+    assert not t("401 Unauthorized")
+    assert not t("rate limit reached for your plan quota")
+    assert not t("")
+    # the four wordings reported from real codex runs: all retried with "继续"
+    assert t("Incomplete response returned, reason: max_output_tokens")
+    assert t("Connection failed: error sending request for url (https://api.example.com/v1/responses)")
+    assert t("stream disconnected before completion: Service temporarily unavailable")
+    assert t("stream disconnected before completion: stream closed before response.completed")
+
+
+def test_auto_continue_retries_transient_only():
+    d, s = _session("codex")
+    s.fd = 99
+    timers, typed = [], []
+    d.later = lambda delay, fn: timers.append((delay, fn))
+    d.type_text = lambda ss, t: typed.append(t)
+    overload = "stream disconnected before completion: Our servers are currently overloaded."
+    assert s.maybe_auto_continue(overload) is False          # off by default
+    s.auto_continue = True
+    assert s.maybe_auto_continue(overload) is True
+    assert s.status == "waiting" and timers[0][0] == 15
+    timers[0][1]()
+    assert typed == ["继续"] and s.status == "running"
+    # no balance: never retried, the user has to act
+    s.status = "error"
+    assert s.maybe_auto_continue("Key余额不足，无法完成当前操作") is False
+    # backoff grows on consecutive failures, then gives up
+    for _ in range(2, A.AUTO_CONTINUE_MAX + 1):
+        s.status = "error"
+        assert s.maybe_auto_continue(overload) is True
+        timers[-1][1]()
+    s.status = "error"
+    assert s.maybe_auto_continue(overload) is False and s.ac_count == A.AUTO_CONTINUE_MAX
+    assert [t[0] for t in timers] == list(A.AUTO_CONTINUE_DELAYS)
+

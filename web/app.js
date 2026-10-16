@@ -34,6 +34,7 @@ const S = {
   machines: [], byId: {}, keys: [], hub: null, options: null, haveState: false,
   view: null,           // per-open-session stream state
   hideExited: LS.getItem('glimpse.hideExited') === '1',
+  groupBy: LS.getItem('glimpse.groupBy') === 'status' ? 'status' : 'machine',
   fontSize: parseInt(LS.getItem('glimpse.font') || '11', 10),
   stripOpen: LS.getItem('glimpse.strip') !== '0',
   net: { rtt: [], rx: [], rxBytes: 0, rxT: performance.now() },
@@ -395,7 +396,7 @@ async function boot() {
   const pair = u.searchParams.get('pair');
   if (u.searchParams.has('t')) u.searchParams.delete('t');             // links from older versions: ignored
   if (pair) {
-    try { await loginWith({ pair }); } catch (e) { S.pairErr = e.status === 429 ? '尝试次数过多，请稍后再试' : '登录链接无效或已过期，请在电脑上重新运行 ./glimpse url'; }
+    try { await loginWith({ pair }); } catch (e) { S.pairErr = e.status === 429 ? '尝试次数过多，请稍后再试' : '登录链接无效或已过期，请在电脑上重新运行 glimpse url'; }
     u.searchParams.delete('pair');
   }
   if (pair || location.search) history.replaceState(null, '', u.pathname + u.hash);
@@ -657,6 +658,13 @@ function renderHome() {
     setHTML(groups, '<div class="empty"><div class="art">' + ic('server', 'lg') + '</div><h3>还没有机器</h3><p>在 hub 的配置文件里添加机器后会显示在这里。</p></div>');
     return;
   }
+  if (S.groupBy === 'status') renderGroupsByStatus(groups); else renderGroupsByMachine(groups);
+  const waiting = allSessions().filter(([, s]) => s.attention || s.pending || s.question).length;
+  document.title = waiting ? '(' + waiting + ') Glimpse' : 'Glimpse';
+  if (navigator.setAppBadge) { try { (waiting ? navigator.setAppBadge(waiting) : navigator.clearAppBadge()).catch(() => {}); } catch (_) {} }
+}
+function renderGroupsByMachine(groups) {
+  if (groups._st) { groups._st = false; groups._h = null; groups.innerHTML = ''; }
   if (groups._h) { groups._h = null; groups.innerHTML = ''; }
   keyedList(groups, S.machines, (mc) => 'm:' + mc.id, (mc) => {
     const g = document.createElement('section'); g.className = 'mgroup';
@@ -683,26 +691,68 @@ function renderHome() {
       return;
     }
     if (cards._h) { cards._h = null; cards.innerHTML = ''; }
-    keyedList(cards, ss, (s) => s.sid, (s) => {
-      // swipe row: the delete action sits behind the card and is revealed by swiping the card left
-      const row = document.createElement('div'); row.className = 'swipe';
-      row.innerHTML = '<button type="button" class="sw-del" tabindex="-1">' + ic('trash') + '<span>删除</span></button><button type="button" class="card"></button>';
-      const b = row.lastChild;
-      b.onclick = () => { if (swipeConsumed(row)) return; openSession(mc.id, s.sid); };
-      row.firstChild.onclick = () => { swipeClose(row); deleteSession(mc.id, s.sid); };
-      swipeable(row, b);
-      return row;
-    }, (row, s) => {
-      const b = row.lastChild;
-      b.className = 'card ' + (s.attention ? 'attn-' + s.attention : '') + (s.pending || s.question ? ' attn-question' : '') + (s.status === 'exited' ? ' exited' : '');
-      b.setAttribute('aria-label', s.name + '，' + (KIND[s.kind] || s.kind) + '，' + statusLine(s) + '，' + ago(s.activity));
-      row.firstChild.setAttribute('aria-label', '删除 ' + s.name);
-      setHTML(b, cardHTML(mc, s));
-    });
+    renderCards(cards, ss.map((s) => [mc, s]));
   });
-  const waiting = allSessions().filter(([, s]) => s.attention || s.pending || s.question).length;
-  document.title = waiting ? '(' + waiting + ') Glimpse' : 'Glimpse';
-  if (navigator.setAppBadge) { try { (waiting ? navigator.setAppBadge(waiting) : navigator.clearAppBadge()).catch(() => {}); } catch (_) {} }
+}
+function renderGroupBy() {
+  for (const b of $$('.groupby [data-gb]')) b.setAttribute('aria-checked', String(b.dataset.gb === S.groupBy));
+}
+for (const b of $$('.groupby [data-gb]')) b.onclick = () => {
+  S.groupBy = b.dataset.gb; LS.setItem('glimpse.groupBy', S.groupBy); renderGroupBy(); renderHome();
+};
+renderGroupBy();
+// one card per [machine, session]; keyed so cards keep their DOM (and swipe state) across updates
+function renderCards(cards, items) {
+  keyedList(cards, items, ([mc, s]) => mc.id + '/' + s.sid, ([mc, s]) => {
+    // swipe row: the delete action sits behind the card and is revealed by swiping the card left
+    const row = document.createElement('div'); row.className = 'swipe';
+    row.innerHTML = '<button type="button" class="sw-del" tabindex="-1">' + ic('trash') + '<span>删除</span></button><button type="button" class="card"></button>';
+    const b = row.lastChild;
+    b.onclick = () => { if (swipeConsumed(row)) return; openSession(mc.id, s.sid); };
+    row.firstChild.onclick = () => { swipeClose(row); deleteSession(mc.id, s.sid); };
+    swipeable(row, b);
+    return row;
+  }, (row, [mc, s]) => {
+    const b = row.lastChild;
+    b.className = 'card ' + (s.attention ? 'attn-' + s.attention : '') + (s.pending || s.question ? ' attn-question' : '') + (s.status === 'exited' ? ' exited' : '');
+    b.setAttribute('aria-label', mc.id + ' ' + s.name + '，' + (KIND[s.kind] || s.kind) + '，' + statusLine(s) + '，' + ago(s.activity));
+    row.firstChild.setAttribute('aria-label', '删除 ' + s.name);
+    setHTML(b, cardHTML(mc, s));
+  });
+}
+// status groups, most urgent first; a session needing an answer counts as "waiting" whatever its status
+const STATUS_GROUPS = [
+  { id: 'attn', title: '需要处理', icon: 'alert', test: (s) => !!(s.pending || s.question || s.attention === 'question') },
+  { id: 'error', title: '出错', icon: 'x-c', test: (s) => s.status === 'error' || s.attention === 'error' },
+  { id: 'running', title: '进行中', icon: 'pulse', test: (s) => s.status === 'running' || s.status === 'starting' },
+  { id: 'waiting', title: '等待回复', icon: 'help', test: (s) => s.status === 'waiting' },
+  { id: 'idle', title: '空闲', icon: 'check-c', test: (s) => s.status === 'idle' },
+  { id: 'exited', title: '已结束', icon: 'power', test: () => true },
+];
+function renderGroupsByStatus(groups) {
+  if (!groups._st) { groups._st = true; groups._h = null; groups.innerHTML = ''; }
+  const buckets = STATUS_GROUPS.map((g) => ({ g, items: [] }));
+  for (const mc of S.machines) {
+    for (const s of visibleSessions(mc)) buckets.find((b) => b.g.test(s)).items.push([mc, s]);
+  }
+  for (const b of buckets) b.items.sort((x, y) => (y[1].activity || 0) - (x[1].activity || 0));
+  const shown = buckets.filter((b) => b.items.length);
+  if (!shown.length) {
+    setHTML(groups, '<div class="empty"><div class="art">' + ic('inbox', 'lg') + '</div><h3>还没有会话</h3><p>点右下角 ＋ 新建一个会话。</p></div>');
+    groups._st = false;
+    return;
+  }
+  if (groups._h) { groups._h = null; groups.innerHTML = ''; }
+  keyedList(groups, shown, (b) => 'st:' + b.g.id, (b) => {
+    const g = document.createElement('section'); g.className = 'mgroup sgroup sg-' + b.g.id;
+    g.innerHTML = '<header class="shead">' + ic(b.g.icon, 'sm') + '<h2></h2><span class="scount"></span></header><div class="cards"></div>';
+    return g;
+  }, (g, b) => {
+    $('h2', g).textContent = b.g.title;
+    $('.scount', g).textContent = b.items.length;
+    g.setAttribute('aria-label', b.g.title + ' ' + b.items.length + ' 个会话');
+    renderCards($('.cards', g), b.items);
+  });
 }
 // ---- swipe-left to reveal 删除 on a session card (touch only; keyboard / screen readers use 会话操作 → 删除会话)
 const SW_W = 88;
@@ -960,7 +1010,9 @@ function md(text) {
     if (i % 2) {
       const m = p.match(/^([\w+#.-]*)\n/); const lang = m ? m[1] : '';
       const body = m ? p.slice(m[0].length) : p;
-      h += '<pre>' + (lang ? '<span class="lang">' + esc(lang) + '</span>' : '') + '<code>' + esc(body.replace(/\n$/, '')) + '</code></pre>';
+      h += '<pre>' + (lang ? '<span class="lang">' + esc(lang) + '</span>' : '') +
+        '<button type="button" class="copy-code" aria-label="复制代码">' + ic('copy', 'sm') + '<span>复制</span></button>' +
+        '<code>' + esc(body.replace(/\n$/, '')) + '</code></pre>';
       return;
     }
     let list = null;
@@ -1035,6 +1087,16 @@ function chatEmptyState() {
     '还没有对话。<br>在下面输入第一条指令吧') + '</div>');
 }
 $('#chat').addEventListener('scroll', (e) => { if (nearBottom(e.target)) $('#jump').hidden = true; }, { passive: true });
+// copy a code block (delegated: messages are re-rendered). The text comes from the <code>, not the button label
+$('#chat').addEventListener('click', (e) => {
+  const b = e.target.closest('.copy-code'); if (!b) return;
+  e.preventDefault(); e.stopPropagation();
+  const code = b.parentElement.querySelector('code');
+  copyText(code ? code.textContent : '', '代码').then(() => {
+    b.classList.add('done'); b.lastChild.textContent = '已复制';
+    setTimeout(() => { b.classList.remove('done'); b.lastChild.textContent = '复制'; }, 1500);
+  });
+});
 $('#jump').onclick = () => { const c = $('#chat'); c.scrollTo({ top: c.scrollHeight, behavior: reduceMotion() ? 'auto' : 'smooth' }); $('#jump').hidden = true; };
 
 // ------------------------------------------------------------------ live screen (tail of the terminal under the chat)
@@ -1214,10 +1276,82 @@ $('#btn-slash').onclick = () => slashOpen($('#slash-pop').hidden);
 document.addEventListener('click', (e) => { if (!$('#slash-pop').hidden && !e.target.closest('#slash-pop, #btn-slash')) slashOpen(false); });
 
 // ------------------------------------------------------------------ input: quick keys + composer
-for (const b of $$('#keys .key')) {
-  b.addEventListener('click', (e) => { e.preventDefault(); const k = KEYS[b.dataset.k]; if (k) sendBytes(enc.encode(k)); });
-  b.addEventListener('mousedown', (e) => e.preventDefault());   // keep the keyboard open
+// ---- quick keys: user-configurable bar (Settings → 快捷键). Built-ins by id, plus custom keys {label, send}.
+const KEY_CATALOG = [
+  { id: 'paste', label: '粘贴', aria: '粘贴剪贴板' },
+  { id: 'esc', label: 'Esc' }, { id: 'ctrlc', label: '^C', aria: 'Control C 中断' }, { id: 'tab', label: 'Tab' },
+  { id: 'stab', label: '⇧Tab', aria: 'Shift Tab' }, { id: 'up', label: '↑', aria: '上' }, { id: 'down', label: '↓', aria: '下' },
+  { id: 'left', label: '←', aria: '左' }, { id: 'right', label: '→', aria: '右' }, { id: 'enter', label: '⏎', aria: '回车' },
+  { id: '1', label: '1' }, { id: '2', label: '2' }, { id: '3', label: '3' }, { id: 'y', label: 'y' }, { id: 'n', label: 'n' },
+  { id: 'ctrld', label: '^D', aria: 'Control D' }, { id: 'ctrll', label: '^L', aria: 'Control L 清屏' },
+  { id: 'ctrlr', label: '^R', aria: 'Control R' }, { id: 'ctrlz', label: '^Z', aria: 'Control Z' },
+  { id: 'ctrlu', label: '^U', aria: 'Control U 清空输入' }, { id: 'pgup', label: 'PgUp' }, { id: 'pgdn', label: 'PgDn' },
+  { id: 'home', label: 'Home' }, { id: 'end', label: 'End' }, { id: 'slash', label: '/' }, { id: 'bang', label: '!' },
+];
+Object.assign(KEYS, { ctrld: '\x04', ctrll: '\x0c', ctrlr: '\x12', ctrlz: '\x1a', ctrlu: '\x15', pgup: '\x1b[5~', pgdn: '\x1b[6~',
+  home: '\x1b[H', end: '\x1b[F', slash: '/', bang: '!' });
+const DEFAULT_KEYBAR = ['paste', 'esc', 'ctrlc', 'tab', 'stab', 'up', 'down', 'left', 'right', 'enter', '1', '2', '3', 'y', 'n'];
+// custom key: {id:'c:<n>', label, send} where send is text with escapes: \e \r \n \t ^X (ctrl), \xNN
+function keyBytes(id) {
+  if (KEYS[id] != null) return KEYS[id];
+  const c = customKeys().find((k) => k.id === id);
+  return c ? unescapeKey(c.send) : null;
 }
+function unescapeKey(t) {
+  return String(t || '').replace(/\\(e|r|n|t|\\|x[0-9a-fA-F]{2})|\^([A-Za-z@\[\]\\^_?])/g, (m, a, c) => {
+    if (c) return c === '?' ? '\x7f' : String.fromCharCode(c.toUpperCase().charCodeAt(0) & 0x1f);
+    if (a === 'e') return '\x1b'; if (a === 'r') return '\r'; if (a === 'n') return '\n'; if (a === 't') return '\t';
+    if (a === '\\') return '\\'; return String.fromCharCode(parseInt(a.slice(1), 16));
+  });
+}
+function customKeys() { try { const v = JSON.parse(LS.getItem('glimpse.customKeys') || '[]'); return Array.isArray(v) ? v : []; } catch (_) { return []; } }
+function keybar() {
+  try { const v = JSON.parse(LS.getItem('glimpse.keybar') || 'null'); if (Array.isArray(v)) return v; } catch (_) { /* default */ }
+  return DEFAULT_KEYBAR.slice();
+}
+function keyDef(id) { return KEY_CATALOG.find((k) => k.id === id) || customKeys().find((k) => k.id === id) || null; }
+function renderKeybar() {
+  const host = $('#keys');
+  const ids = keybar().filter(keyDef);
+  host.innerHTML = ids.map((id, i) => {
+    const k = keyDef(id);
+    const sep = i && ['up', '1', 'paste'].includes(id) ? ' sep' : '';
+    return '<button type="button" class="key' + sep + (id === 'paste' ? ' paste' : '') + '" data-k="' + esc(id) + '" aria-label="' +
+      esc(k.aria || k.label) + '">' + (id === 'paste' ? ic('clipboard', 'xs') : '') + esc(k.label) + '</button>';
+  }).join('');
+}
+async function pasteToSession() {
+  let t = '';
+  try { t = await navigator.clipboard.readText(); } catch (_) { t = ''; }
+  if (!t) { openPasteSheet(); return; }          // no clipboard access (http, denied): paste into a box instead
+  sendPaste(t);
+}
+function sendPaste(t) {
+  const v = S.view; if (!v || !t) return;
+  // bracketed paste so TUIs (claude / codex / vim) take it as one paste, not keystrokes
+  sendBytes(enc.encode('\x1b[200~' + t.replace(/\r\n/g, '\n') + '\x1b[201~'));
+  toast('已粘贴', t.length > 80 ? t.slice(0, 77) + '…' : t, null, 'done');
+}
+$('#keys').addEventListener('mousedown', (e) => { if (e.target.closest('.key')) e.preventDefault(); });   // keep the keyboard open
+$('#keys').addEventListener('click', (e) => {
+  const b = e.target.closest('.key'); if (!b) return;
+  e.preventDefault();
+  if (b.dataset.k === 'paste') { pasteToSession(); return; }
+  const k = keyBytes(b.dataset.k); if (k) sendBytes(enc.encode(k));
+});
+renderKeybar();
+function openPasteSheet() {
+  const d = $('#dlg-paste'); const ta = $('#paste-text');
+  ta.value = ''; openSheet(d);
+  setTimeout(() => ta.focus(), 120);       // long-press -> 粘贴 works in a textarea even when clipboard API does not
+}
+$('#paste-go').onclick = () => { const t = $('#paste-text').value; closeSheet($('#dlg-paste')); sendPaste(t); };
+// paste straight into the terminal view (desktop browsers / iPad with a keyboard: Cmd-V)
+document.addEventListener('paste', (e) => {
+  if (!S.view || S.mode !== 'term' || e.target.closest('textarea, input')) return;
+  const t = e.clipboardData && e.clipboardData.getData('text');
+  if (t) { e.preventDefault(); sendPaste(t); }
+});
 const input = $('#input');
 function autoGrow() {
   input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 140) + 'px';
@@ -1263,6 +1397,12 @@ function fillMore() {
   $('#act-restart').hidden = !ai;
   $('#act-restart-sub').textContent = s ? '当前：' + (s.key || '默认') + (s.can_resume ? ' · 可恢复对话' : '') : '';
   $('#act-fit-sub').textContent = s ? '当前 ' + s.cols + '×' + s.rows : '';
+  $('#act-ac-row').hidden = !ai;
+  if (ai) {
+    $('#act-ac').checked = !!s.auto_continue;
+    $('#act-ac-sub').textContent = s.auto_continue ? (s.ac_count ? '已自动继续 ' + s.ac_count + ' 次（成功一轮后清零，最多连续 5 次）' : '已开启：遇到临时错误会自动发送“继续”')
+      : '服务器过载、流中断、输出被截断时自动发送“继续”；Key 余额不足等仍会通知你';
+  }
   const running = s && s.status !== 'exited' && s.status !== 'error';
   $('#act-kill').hidden = !running;
   $('#act-delete').disabled = !s;
@@ -1278,8 +1418,8 @@ function fillMore() {
     $('#act-link-sub').textContent = deepLink(v.m, v.sid);
   }
 }
-// `./glimpse attach <sid>` on the hub computer finds the session on any machine (local daemon first, then through the hub)
-function attachCmd(m, sid) { return './glimpse attach ' + sid; }
+// `glimpse attach <sid>` on the hub computer finds the session on any machine (local daemon first, then through the hub)
+function attachCmd(m, sid) { return 'glimpse attach ' + sid; }
 function deepLink(m, sid) { return location.origin + '/#' + m + '/' + sid; }
 async function copyText(t, what) {
   let ok = false;
@@ -1290,8 +1430,15 @@ async function copyText(t, what) {
     try { ok = document.execCommand('copy'); } catch (__) { ok = false; }
     ta.remove();
   }
-  if (ok) toast('已复制' + (what ? what : ''), t, null, 'done'); else toast('无法复制', '请长按选中后手动复制：' + t, null, 'error');
+  const preview = t.length > 120 ? t.slice(0, 117).replace(/\s+/g, ' ') + '…' : t;
+  if (ok) toast('已复制' + (what ? what : ''), preview, null, 'done'); else toast('无法复制', '请长按选中后手动复制', null, 'error');
+  return ok;
 }
+$('#act-ac').onchange = (e) => {
+  const v = S.view; if (!v) return;
+  send({ op: 'auto_continue', m: v.m, sid: v.sid, on: e.target.checked });
+  toast(e.target.checked ? '已开启自动继续' : '已关闭自动继续', '', null, 'done');
+};
 $('#act-cmd-copy').onclick = () => { const v = S.view; if (v) copyText(attachCmd(v.m, v.sid), '命令'); };
 $('#act-link').onclick = () => { const v = S.view; if (v) copyText(deepLink(v.m, v.sid), '链接'); };
 $('#act-ctl').onclick = () => { closeSheet($('#dlg-more')); setTimeout(openCtl, 230); };
@@ -1358,7 +1505,7 @@ function fillNewDeps() {
   $('#new-key-row').hidden = !ai || !S.keys.length;
   const def = mc && mc.presets && mc.presets[kind] && mc.presets[kind].key;
   $('#new-key').innerHTML = '<option value="">默认' + (def ? '（' + esc(def) + '）' : '') + '</option>' +
-    S.keys.map((k) => '<option value="' + esc(k.name) + '">' + esc(k.name) + '</option>').join('');
+    S.keys.map((k) => '<option value="' + esc(k.name) + '">' + esc(k.name) + (keyUsageText(k) ? '  ·  ' + esc(keyUsageText(k)) : '') + '</option>').join('');
   const rec = mc ? recentDirs(mc.id) : [];
   const cwd = $('#new-cwd');
   if (!cwd.dataset.touched) cwd.value = rec[0] || (mc && mc.default_cwd) || '~';
@@ -1510,16 +1657,36 @@ $('#new-form').addEventListener('submit', (e) => {
 });
 
 // ------------------------------------------------------------------ restart with another key
+// key usage (hub polls keys.usage_url; optional): quota windows (e.g. 5 h / 7 d) + today's tokens and cost
+function winName(sec) { return !sec ? '' : sec % 86400 === 0 ? (sec / 86400) + ' 天' : sec % 3600 === 0 ? (sec / 3600) + ' 小时' : Math.round(sec / 60) + ' 分钟'; }
+function keyUsageText(k) {
+  const u = k && k.usage; if (!u) return '';
+  if (u.error) return u.error;
+  const w = (u.windows || []).map((x) => winName(x.window_sec) + ' 已用 ' + Math.round(x.percent) + '%');
+  if (u.today_tokens != null) w.push('今日 ' + fmtNum(u.today_tokens) + ' tokens' + (u.today_cost ? ' · $' + u.today_cost : ''));
+  return w.join(' · ');
+}
+function keyUsageBars(u) {
+  if (!u || !u.windows || !u.windows.length) return '';
+  return '<div class="kbars">' + u.windows.map((x) => '<span class="kbar"><span class="kb-l">' + esc(winName(x.window_sec)) + '</span>' + meter(x.percent) +
+    '<span class="kb-r">' + (x.percent >= 100 ? (x.reset_at ? ago2(x.reset_at) + '重置' : '已用完') : Math.round(100 - x.percent) + '% 剩余') + '</span></span>').join('') + '</div>';
+}
+function ago2(t) {
+  const d = Math.max(0, t - Date.now() / 1000);
+  return d < 3600 ? Math.ceil(d / 60) + ' 分钟后' : d < 86400 ? Math.round(d / 3600) + ' 小时后' : Math.round(d / 86400) + ' 天后';
+}
 const RS = { active: false, m: null, sid: null, timer: null };
 function openRestart() {
   const v = S.view; const s = v && session(v.m, v.sid); if (!s) return;
   if ($('#dlg-more').open) closeSheet($('#dlg-more'));
   RS.active = false; RS.m = v.m; RS.sid = v.sid;
   const opts = [{ v: '', l: '保持当前', d: s.key ? '继续使用 ' + s.key : '使用默认配置' }]
-    .concat(S.keys.map((k) => ({ v: k.name, l: k.name, d: k.name === s.key ? '当前使用中' : '' })))
+    .concat(S.keys.map((k) => ({ v: k.name, l: k.name, d: [k.name === s.key ? '当前使用中' : '', keyUsageText(k)].filter(Boolean).join(' · '),
+      u: k.usage })))
     .concat([{ v: '__new', l: '输入新的 Key', d: '临时使用或保存到列表' }]);
   $('#rs-keys').innerHTML = opts.map((o, i) => '<label class="cell radio"><input type="radio" name="rskey" value="' + esc(o.v) + '"' + (i === 0 ? ' checked' : '') + '>' +
-    '<span class="grow">' + esc(o.l) + (o.d ? '<div class="sub">' + esc(o.d) + '</div>' : '') + '</span>' + ic('check', 'chk') + '</label>').join('');
+    '<span class="grow">' + esc(o.l) + (o.d ? '<div class="sub">' + esc(o.d) + '</div>' : '') + keyUsageBars(o.u) + '</span>' + ic('check', 'chk') + '</label>').join('');
+  send({ op: 'key_usage' });                       // refresh the numbers while the sheet is open
   for (const r of $$('#rs-keys input')) r.onchange = () => { $('#rs-new').hidden = rsKey() !== '__new'; if (!$('#rs-new').hidden) $('#rs-value').focus(); };
   $('#rs-new').hidden = true; $('#rs-value').value = ''; $('#rs-save').value = '';
   const rz = $('#rs-resume'); rz.checked = !!s.can_resume; rz.disabled = !s.can_resume;
@@ -1810,6 +1977,43 @@ function renderSettingsWidgets() {
   for (const b of $$('[data-dn]', host)) b.onclick = () => { const i = +b.dataset.dn; [p.order[i + 1], p.order[i]] = [p.order[i], p.order[i + 1]]; apply(); };
   for (const c of $$('[data-w]', host)) c.onchange = () => { p.on[c.dataset.w] = c.checked; apply(); };
 }
+// quick-key bar editor: every built-in + custom key, on/off + order; custom keys can be added / deleted
+function renderSettingsKeys() {
+  const host = $('#set-keys');
+  const on = keybar();
+  const all = on.concat(KEY_CATALOG.map((k) => k.id).concat(customKeys().map((k) => k.id)).filter((id) => !on.includes(id)));
+  host.innerHTML = all.filter(keyDef).map((id) => {
+    const k = keyDef(id); const i = on.indexOf(id); const custom = id.startsWith('c:');
+    return '<div class="cell"><span class="kchip">' + esc(k.label) + '</span><span class="grow">' + esc(k.aria || k.label) +
+      (custom ? '<div class="sub mono">' + esc(k.send) + '</div>' : '') + '</span>' +
+      (i >= 0 ? '<button type="button" class="icon-btn plain" data-ku="' + esc(id) + '" aria-label="上移"' + (i === 0 ? ' disabled' : '') + '>' + ic('up', 'sm') + '</button>' +
+        '<button type="button" class="icon-btn plain" data-kd="' + esc(id) + '" aria-label="下移"' + (i === on.length - 1 ? ' disabled' : '') + '>' + ic('down', 'sm') + '</button>' : '') +
+      (custom ? '<button type="button" class="icon-btn plain" data-kx="' + esc(id) + '" aria-label="删除 ' + esc(k.label) + '">' + ic('trash', 'sm') + '</button>' : '') +
+      '<span class="switch"><input type="checkbox" role="switch" data-kk="' + esc(id) + '" aria-label="显示 ' + esc(k.label) + '"' + (i >= 0 ? ' checked' : '') + '><i></i></span></div>';
+  }).join('');
+  const save = (ids) => { LS.setItem('glimpse.keybar', JSON.stringify(ids)); renderKeybar(); renderSettingsKeys(); };
+  const move = (id, d) => { const ids = keybar(); const i = ids.indexOf(id); const j = i + d; if (i < 0 || j < 0 || j >= ids.length) return; [ids[i], ids[j]] = [ids[j], ids[i]]; save(ids); };
+  for (const b of $$('[data-ku]', host)) b.onclick = () => move(b.dataset.ku, -1);
+  for (const b of $$('[data-kd]', host)) b.onclick = () => move(b.dataset.kd, 1);
+  for (const c of $$('[data-kk]', host)) c.onchange = () => { const ids = keybar().filter((x) => x !== c.dataset.kk); if (c.checked) ids.push(c.dataset.kk); save(ids); };
+  for (const b of $$('[data-kx]', host)) b.onclick = () => {
+    LS.setItem('glimpse.customKeys', JSON.stringify(customKeys().filter((k) => k.id !== b.dataset.kx)));
+    save(keybar().filter((x) => x !== b.dataset.kx));
+  };
+}
+$('#key-add').onclick = () => {
+  const label = $('#key-label').value.trim(); const sendv = $('#key-send').value;
+  if (!label || !sendv) { $('#key-err').textContent = '名称和发送内容都要填'; return; }
+  if (label.length > 8) { $('#key-err').textContent = '名称最多 8 个字'; return; }
+  const ks = customKeys(); const id = 'c:' + Date.now().toString(36);
+  ks.push({ id, label, send: sendv.slice(0, 500) });
+  LS.setItem('glimpse.customKeys', JSON.stringify(ks));
+  LS.setItem('glimpse.keybar', JSON.stringify(keybar().concat([id])));
+  $('#key-label').value = ''; $('#key-send').value = ''; $('#key-err').textContent = '';
+  renderKeybar(); renderSettingsKeys();
+};
+$('#key-reset').onclick = () => { LS.removeItem('glimpse.keybar'); renderKeybar(); renderSettingsKeys(); };
+
 function renderSettingsMachines() {
   const host = $('#set-machines');
   setHTML(host, S.machines.map((m) => '<div class="cell"><span class="cell-ic" aria-hidden="true">' + ic(m.type === 'ssh' ? 'server' : 'laptop') + '</span>' +
@@ -1922,7 +2126,7 @@ async function renderSettings() {
   $('#opt-font').textContent = String(S.fontSize);
   $('#set-ver').textContent = APP_VERSION;
   $('#set-hubver').textContent = S.hub && S.hub.version ? S.hub.version : '—';
-  renderSettingsWidgets(); renderSettingsMachines(); renderAccount();
+  renderSettingsWidgets(); renderSettingsKeys(); renderSettingsMachines(); renderAccount();
   $('#btn-install-sub').textContent = standalone() ? '已作为 App 运行 ✓' : isIOS() ? 'Safari：分享 → 添加到主屏幕' : INST.prompt ? '可以直接安装' : '查看安装方法';
   $('#set-push').textContent = await pushState();
 }
@@ -1930,7 +2134,7 @@ async function renderSettings() {
 async function renderAccount() {
   let r;
   try { r = await api('/api/devices'); } catch (e) { $('#acct-pw-sub').textContent = '无法读取'; return; }
-  $('#acct-pw-sub').textContent = r.has_password ? '已设置' : '未设置（只能用一次性链接登录），在电脑上运行 ./glimpse password';
+  $('#acct-pw-sub').textContent = r.has_password ? '已设置' : '未设置（只能用一次性链接登录），在电脑上运行 glimpse password';
   const host = $('#acct-devices');
   host.innerHTML = r.devices.map((d) => '<div class="cell"><span class="cell-ic" style="background:#5C636E" aria-hidden="true">' + ic(/iPhone|Android|iPad/.test(d.name) ? 'phone' : 'laptop') + '</span>' +
     '<span class="grow">' + esc(d.name) + (d.current ? ' <span class="tag">本机</span>' : '') +

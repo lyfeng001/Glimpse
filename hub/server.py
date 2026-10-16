@@ -35,6 +35,7 @@ CERT_RENEW = 12 * 3600
 HOST_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
 ARG_RE = re.compile(r"^[A-Za-z0-9_.:/\[\]@+=-]{1,120}$")   # model / effort / mode values that go on argv
 RESUME_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+MEMORY_ACTIONS = ("overview", "memories", "context", "sessions", "search", "compact", "budget")
 CONTROL_ACTIONS = ("mode", "model", "effort", "goal", "approval", "sandbox")
 MENU_KEYS = ("esc", "s")
 MODELS_TTL = 600             # s; model / effort lists per (machine, kind) are cached this long
@@ -333,6 +334,48 @@ class Hub:
                 return {"ts": time.time(), "error": "查询失败：%s" % (str(e) or type(e).__name__)[:80]}
         return out
 
+    async def config_watch_loop(self):
+        """config.json edited by hand: reload the keys (names, values, usage_url) and memory settings without a
+        restart. Machines / listen addresses still need a restart. A file that doesn't parse is ignored."""
+        last = self.config_mtime()
+        while True:
+            await asyncio.sleep(2)
+            mt = self.config_mtime()
+            if mt == last:
+                continue
+            last = mt
+            try:
+                new = C.load()
+            except (OSError, ValueError) as e:
+                log.warning("config.json not reloaded: %s", e)
+                continue
+            keys_changed = new["keys"] != self.cfg["keys"]
+            mem_changed = new.get("memory") != self.cfg.get("memory")
+            if not keys_changed and not mem_changed:
+                continue
+            self.cfg["keys"], self.cfg["memory"] = new["keys"], new.get("memory")
+            log.info("config.json reloaded (%s)", ", ".join(n for n, c in (("keys", keys_changed), ("memory", mem_changed)) if c))
+            if keys_changed:
+                names = {x.get("name") for x in self.cfg["keys"].get("profiles") or []}
+                self.key_usage = {k: v for k, v in self.key_usage.items() if k in names}
+                if self.cfg["keys"].get("usage_url") and not any(getattr(t, "_kul", False) for t in self.bg):
+                    t = asyncio.ensure_future(self.key_usage_loop())
+                    t._kul = True
+                    self.bg.append(t)
+                self.key_usage_wake.set()
+            if mem_changed:
+                for m in self.machines.values():
+                    if m.online:
+                        asyncio.ensure_future(self.memory_config(m))
+            self.state_dirty.set()
+
+    @staticmethod
+    def config_mtime():
+        try:
+            return os.stat(C.CONFIG).st_mtime_ns
+        except OSError:
+            return None
+
     async def key_usage_loop(self):
         """Refresh every key's usage every 5 minutes (or right away when a phone asks)."""
         while True:
@@ -390,6 +433,7 @@ class Hub:
                     m.write({"op": "sub", "sid": sid})
             for p in list(self.phones):
                 p.send({"t": "resync", "m": m.id})
+            asyncio.ensure_future(self.memory_config(m))
             return
         if t in ("out", "chat"):
             key = (m.id, msg.get("sid"))
@@ -536,6 +580,8 @@ class Hub:
                     raise ValueError("无效的按键")
             elif op == "models":
                 await self.models(p, m, msg)
+            elif op == "memory":
+                await self.memory(p, m, msg)
             elif op == "delete":
                 self.forward(p, m, {"op": "delete", "sid": sid})
             elif op == "clean_exited":
@@ -554,6 +600,35 @@ class Hub:
             p.send({"t": "error", "m": m.id, "sid": sid, "msg": "%s: %s" % (m.name, str(e) or "超时")})
         except ValueError as e:
             p.send({"t": "error", "m": m.id, "sid": sid, "msg": str(e)})
+
+    def memory_cfg(self, m):
+        """hub-wide memory settings, overridden per machine by machines[].memory."""
+        cfg = dict(self.cfg.get("memory") or {})
+        cfg.update(m.cfg.get("memory") or {})
+        return cfg
+
+    async def memory_config(self, m):
+        try:
+            r = await m.call({"op": "memory_config", "cfg": self.memory_cfg(m)}, timeout=90)
+        except (ConnectionError, asyncio.TimeoutError):
+            return
+        if r.get("t") == "memory_status":
+            m.memory = {k: v for k, v in r.items() if k not in ("t", "req", "store")}
+            self.state_dirty.set()
+
+    async def memory(self, p, m, msg):
+        action = msg.get("action")
+        if action not in MEMORY_ACTIONS:
+            raise ValueError("无效的记忆操作")
+        q = {k: msg.get(k) for k in ("project", "q", "budget", "dry_run") if msg.get(k) is not None}
+        r = await m.call(dict(q, op="memory", action=action), timeout=900 if action == "compact" else 90)
+        if r.get("t") != "memory":
+            raise ValueError(r.get("msg") or "记忆查询失败")
+        st = r.get("status") or {}
+        m.memory = {k: v for k, v in st.items() if k != "store"}
+        p.send({"t": "memory", "m": m.id, "action": action, "project": msg.get("project"), "data": r.get("data")})
+        if action in ("budget", "compact"):
+            self.state_dirty.set()
 
     async def create(self, p, m, msg):
         kind = msg.get("kind") if msg.get("kind") in ("claude", "codex", "shell") else "claude"
@@ -951,9 +1026,11 @@ class Hub:
 
     async def startup(self, app):
         self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
-        self.bg = [asyncio.ensure_future(self.state_loop())]
+        self.bg = [asyncio.ensure_future(self.state_loop()), asyncio.ensure_future(self.config_watch_loop())]
         if self.cfg["keys"].get("usage_url"):
-            self.bg.append(asyncio.ensure_future(self.key_usage_loop()))
+            t = asyncio.ensure_future(self.key_usage_loop())
+            t._kul = True
+            self.bg.append(t)
         for m in self.machines.values():
             m.start()
 

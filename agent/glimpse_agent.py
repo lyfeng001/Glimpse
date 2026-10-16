@@ -624,7 +624,7 @@ def private_dir():
     return _PRIV
 
 
-def prepare_claude_argv(argv, sid, sdir, env_extra=None, approval_wait=600):
+def prepare_claude_argv(argv, sid, sdir, env_extra=None, approval_wait=600, allow=None):
     """Merge our hooks into the --settings file the user launches claude with.
 
     claude only honours the last --settings flag, so the user's file (which carries
@@ -654,6 +654,10 @@ def prepare_claude_argv(argv, sid, sdir, env_extra=None, approval_wait=600):
     for ev, entry in claude_hook_settings(approval_wait).items():
         hooks.setdefault(ev, []).extend(entry)
     merged["hooks"] = hooks
+    if allow:
+        perms = dict(merged.get("permissions") or {})
+        perms["allow"] = list(perms.get("allow") or []) + [a for a in allow if a not in (perms.get("allow") or [])]
+        merged["permissions"] = perms
     if env_extra:
         # settings env wins over the process env in claude, so a key swap must go here too
         merged["env"] = dict(merged.get("env") or {}, **env_extra)
@@ -1206,6 +1210,8 @@ class Session:
         self.auto_continue = False     # retry transient errors by typing "继续"
         self.ac_count = 0              # consecutive auto-continues (reset when a turn completes)
         self.ac_pending = False
+        self.memory_project = None     # AMem project this session reads / writes (None = memory off)
+        self.memory_root = None
         self.restart_req = None        # (resume, callback) while a restart is in progress
         self.usage = None
         # approvals by id, oldest first: {"id", "tool", "summary", "detail", "can_always", "ts", "suggestions",
@@ -1266,7 +1272,7 @@ class Session:
                 "question": self.question, "agent_session_id": self.agent_session_id,
                 "can_resume": bool(self.agent_session_id) and self.kind in ("claude", "codex"),
                 "key": self.key, "restarts": self.restarts, "auto_continue": self.auto_continue, "ac_count": self.ac_count, "mode": self.mode(), "overrides": dict(self.overrides),
-                "menu": self.menu}
+                "memory": self.memory_project, "menu": self.menu}
 
     def touch(self):
         self.dirty = True
@@ -1306,9 +1312,13 @@ class Session:
         if self.kind != "claude":
             env.update(self.env)     # codex: export OPENAI_API_KEY=... ; claude: key goes into the settings file only
         argv = self.launch_argv(resume)
+        self.d.memory.attach(self)
+        if self.kind == "codex" and argv:
+            argv = argv[:1] + self.d.memory.codex_args(self) + argv[1:]
         if self.kind == "claude":
+            argv = argv[:1] + self.d.memory.claude_args(self) + argv[1:] if argv else argv
             argv, self.settings_file = prepare_claude_argv(argv, self.sid, self.d.sdir, self.env,
-                                                           self.d.approval_wait)
+                                                           self.d.approval_wait, self.d.memory.claude_allow(self))
         shell = env.get("SHELL")
         if not shell:
             try:
@@ -1807,6 +1817,7 @@ class Session:
                     new = []
                 if role == "@done":
                     self.ac_count = 0
+                    self.d.memory.capture(self)
                     self.set_status("idle", "", "done")
                     self.event("done", "已完成本轮", text or self.preview)
                 elif role == "@error":
@@ -1896,6 +1907,7 @@ class Session:
             if msg:
                 self.preview = clip(msg.replace("\n", " "), 300)
             self.ac_count = 0
+            self.d.memory.capture(self)
             self.set_status("idle", "", "done")
             self.event("done", "已完成本轮", msg)
         elif name == "StopFailure":
@@ -1931,6 +1943,258 @@ AUTO_CONTINUE_DELAYS = (15, 30, 60, 120, 240)   # seconds before each retry
 def is_transient_error(text):
     t = text or ""
     return not FATAL_ERR_RE.search(t) and bool(TRANSIENT_ERR_RE.search(t))
+
+
+# --------------------------------------------------------------------------- memory (optional AMem)
+# Persistent cross-session memory through AMem (https://github.com/lyfeng001/AMem), when installed.
+# Glimpse never imports it: it runs `python -m agent_memory` from the configured environment.
+# Sessions of the same project share one memory; nothing is written into the project directory.
+
+MEMORY_DEFAULT = {"enabled": False, "python": "", "store": "", "budget": "20G", "keep_days": 30}
+MEMORY_TIMEOUT = 60
+MEMORY_PROMPT = (
+    "You have persistent project memory (AMem MCP server `{server}`, project `{project}`), shared with every "
+    "earlier and later Claude Code / Codex session of this project on any machine.\n"
+    "- At the start of a task call memory_context; use memory_search / memory_read when earlier work may matter.\n"
+    "- Priority: the user's current request and the live repository state always win. Memory is background "
+    "evidence: it can be stale, check dates and verify before relying on it, and ignore records that are not "
+    "relevant to the current task.\n"
+    "- When you reach a verified, durable conclusion (a decision, a constraint, a root cause, a finished "
+    "milestone, a handoff for the next session) save it with memory_save under a short stable key "
+    "(read the current version first and pass its ID as expected_parents). Do not save guesses, secrets "
+    "or step-by-step logs; the full history is captured automatically.")
+PROJECT_ID_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
+
+
+def memory_project_id(cwd):
+    """Stable project id: git remote name (same on every machine), else the git top-level / cwd basename."""
+    import subprocess
+    top, remote = None, None
+    try:
+        top = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"], capture_output=True,
+                             text=True, timeout=5).stdout.strip() or None
+        if top:
+            remote = subprocess.run(["git", "-C", top, "remote", "get-url", "origin"], capture_output=True,
+                                    text=True, timeout=5).stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if remote:
+        name = remote.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+        name = name[:-4] if name.endswith(".git") else name
+    else:
+        name = os.path.basename(top or cwd.rstrip("/")) or "home"
+    name = PROJECT_ID_RE.sub("-", name).strip("-._")[:80] or "project"
+    if not name[0].isalnum():
+        name = "p" + name[:79]
+    return name, top or cwd
+
+
+def memory_external(top):
+    """The project already wires AMem itself (its own .mcp.json / .codex/config.toml): leave it alone."""
+    for rel in (".mcp.json", os.path.join(".codex", "config.toml")):
+        try:
+            with open(os.path.join(top, rel), errors="replace") as f:
+                if "agent_memory" in f.read(65536):
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+class Memory:
+    """Per-daemon AMem integration: config from the hub, availability probe, launch args, capture, queries."""
+
+    def __init__(self, daemon):
+        self.d = daemon
+        self.cfg = dict(MEMORY_DEFAULT)
+        self.version = None            # AMem version once the probe succeeded
+        self.error = None
+        self.probing = False
+        self.running = set()           # projects with a capture in flight
+        self.again = set()             # ... and a turn that finished meanwhile
+        self.bound = {}                # project -> root registered with `amem init`
+
+    def store(self):
+        return os.path.expanduser(self.cfg.get("store") or os.path.join(project_dir(), "data", "memory"))
+
+    def python(self):
+        return os.path.expanduser(self.cfg.get("python") or "python3")
+
+    def on(self):
+        return bool(self.cfg.get("enabled")) and bool(self.version)
+
+    def status(self):
+        return {"enabled": bool(self.cfg.get("enabled")), "available": bool(self.version), "version": self.version,
+                "error": self.error, "store": self.store(), "budget": self.cfg.get("budget"),
+                "keep_days": self.cfg.get("keep_days")}
+
+    def configure(self, cfg, done=None):
+        self.cfg = dict(MEMORY_DEFAULT, **{k: v for k, v in (cfg or {}).items() if k in MEMORY_DEFAULT})
+        self.version, self.error = None, None
+        if not self.cfg["enabled"]:
+            if done:
+                done()
+            return
+
+        def probed(res, err):
+            self.probing = False
+            if err:
+                self.error = err
+            else:
+                self.version = res.strip()
+                b = str(self.cfg.get("budget") or "0")
+                self.run(["budget", "--max-bytes", b, "--keep-days", str(int(self.cfg.get("keep_days") or 30))],
+                         lambda r, e: setattr(self, "error", e) if e else None)
+            if done:
+                done()
+        self.probing = True
+        self.exec_py(["-c", "import agent_memory, mcp, sys; sys.stdout.write(agent_memory.__version__)"], probed,
+                     "AMem 不可用（需要 Python 3.11+ 且安装 agent-memory-local[mcp]）")
+
+    def exec_py(self, args, done, fail=None, timeout=MEMORY_TIMEOUT):
+        import subprocess
+        cmd = [self.python()] + args
+
+        def work():
+            try:
+                r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout,
+                                   cwd=os.path.expanduser("~"))
+                out, err = r.stdout.decode("utf-8", "replace"), None
+                if r.returncode != 0:
+                    msg = r.stderr.decode("utf-8", "replace").strip().splitlines()
+                    err = fail or clip(msg[-1] if msg else "exit %s" % r.returncode, 300)
+            except (OSError, subprocess.SubprocessError) as e:
+                out, err = None, fail or clip(str(e), 300)
+            self.d.bg_done.append((done, out, err))
+        self.d.background(work)
+
+    def run(self, args, done, timeout=MEMORY_TIMEOUT):
+        """amem <args> against the store; done(parsed JSON or text, error)."""
+        def parsed(out, err):
+            if err:
+                done(None, err)
+                return
+            try:
+                done(json.loads(out), None)
+            except ValueError:
+                done(out, None)
+        self.exec_py(["-m", "agent_memory", "--store", self.store()] + args, parsed, timeout=timeout)
+
+    # --- per session
+    def attach(self, s):
+        """At spawn: decide the session's memory project (None = memory off / project wires AMem itself)."""
+        s.memory_project = None
+        if not self.on() or s.kind not in ("claude", "codex"):
+            return
+        project, top = memory_project_id(s.cwd)
+        if memory_external(top) or memory_external(os.path.expanduser("~")):
+            return
+        s.memory_project, s.memory_root = project, top
+
+    def server_entry(self, project):
+        return {"command": self.python(),
+                "args": ["-m", "agent_memory", "--store", self.store(), "serve", "--project", project, "--no-context"]}
+
+    def prompt(self, project):
+        return MEMORY_PROMPT.format(server="amem", project=project)
+
+    def claude_args(self, s):
+        """Extra claude argv: the MCP server and the memory instructions."""
+        if not getattr(s, "memory_project", None):
+            return []
+        cfg = json.dumps({"mcpServers": {"amem": self.server_entry(s.memory_project)}})
+        return ["--mcp-config", cfg, "--append-system-prompt", self.prompt(s.memory_project)]
+
+    def claude_allow(self, s):
+        """Tools pre-approved in the merged settings, so memory calls never stop on a permission prompt."""
+        if not getattr(s, "memory_project", None):
+            return []
+        return ["mcp__amem__" + t for t in ("memory_context", "memory_search", "memory_read", "memory_save",
+                                             "memory_status")]
+
+    def codex_args(self, s):
+        if not getattr(s, "memory_project", None):
+            return []
+        e = self.server_entry(s.memory_project)
+        return ["-c", "mcp_servers.amem.command=%s" % json.dumps(e["command"]),
+                "-c", "mcp_servers.amem.args=%s" % json.dumps(e["args"]),
+                "-c", "mcp_servers.amem.default_tools_approval_mode=\"approve\"",
+                "-c", "developer_instructions=%s" % json.dumps(self.prompt(s.memory_project), ensure_ascii=False)]
+
+    def capture(self, s):
+        """A turn ended: archive the new transcript lines (and enforce the budget). One run per project at a time."""
+        project = getattr(s, "memory_project", None)
+        if not project or not self.on():
+            return
+        if project in self.running:
+            self.again.add(project)
+            return
+        self.running.add(project)
+        root = s.memory_root
+
+        def finished(_res, err):
+            self.running.discard(project)
+            if err:
+                self.error = "记忆采集失败: %s" % err
+            if project in self.again:
+                self.again.discard(project)
+                self.capture(s)
+
+        def refresh(_res=None, err=None):
+            if err:
+                finished(None, err)
+                return
+            self.bound[project] = root
+            self.run(["refresh", "--project", project, "--quiet", "--no-context"], finished, timeout=600)
+        if self.bound.get(project) == root:
+            refresh()
+        else:
+            self.run(["init", "--project", project, "--root", root], refresh)
+
+    # --- op "memory" (phone)
+    def query(self, m, done):
+        if not self.cfg.get("enabled"):
+            done(None, "记忆功能未开启（config.json 里的 memory.enabled）")
+            return
+        if not self.version:
+            done(None, self.error or "AMem 还没准备好")
+            return
+        action, project = m.get("action"), m.get("project")
+        if project is not None and (not isinstance(project, str) or not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$", project)):
+            done(None, "无效的项目")
+            return
+        q = m.get("q")
+        if action == "overview":
+            args = ["vault"]
+        elif action == "memories" and project:
+            args = ["memories", "--project", project]
+        elif action == "context" and project:
+            args = ["context", "--project", project, "--chars", "20000"]
+        elif action == "sessions" and project:
+            args = ["sessions", "--project", project, "--limit", "20"]
+        elif action == "search" and project and isinstance(q, str) and q.strip() and len(q) <= 200:
+            args = ["search", "--project", project, "--limit", "30", q]
+        elif action == "compact":
+            args = ["compact"] + (["--dry-run"] if m.get("dry_run") else [])
+        elif action == "budget":
+            b = m.get("budget")
+            if not isinstance(b, str) or not re.match(r"^(0|\d+(\.\d+)?\s*[KMGT]i?B?)$", b.strip(), re.I):
+                done(None, "无效的上限（例如 20G）")
+                return
+            args = ["budget", "--max-bytes", b.strip(), "--keep-days", str(int(self.cfg.get("keep_days") or 30))]
+        else:
+            done(None, "无效的记忆操作")
+            return
+        if action == "search":
+            # results can be long tool outputs: the phone only needs a preview
+            def trimmed(res, err):
+                if isinstance(res, list):
+                    for r in res:
+                        r["text"] = clip(r.get("text") or "", 600)
+                done(res, err)
+            self.run(args, trimmed)
+        else:
+            self.run(args, done, timeout=900 if action == "compact" else MEMORY_TIMEOUT)
 
 
 # --------------------------------------------------------------------------- model lists (op "models")
@@ -2137,6 +2401,7 @@ class Daemon:
         self.models_cache = {}         # codex `debug models` argv -> (time, result)
         self.models_wait = {}          # same key -> callbacks waiting for the running lookup
         self.bg_done = []              # (callback, result, error) from worker threads, run in tick()
+        self.memory = Memory(self)     # optional AMem integration (configured by the hub)
 
     # --- plumbing
     def listen(self):
@@ -2554,6 +2819,17 @@ class Daemon:
                 kind = m.get("kind") if m.get("kind") in ("claude", "codex") else None
                 owned = [o.agent_session_id for o in self.sessions.values() if o.agent_session_id and o.fd is not None]
                 self.send(c, {"t": "history", "req": req, "items": list_history(kind, m.get("limit") or 30, owned)})
+            elif op == "memory_config":
+                self.memory.configure(m.get("cfg") or {},
+                                      lambda c=c, req=req: self.send(c, dict(self.memory.status(), t="memory_status", req=req)))
+            elif op == "memory":
+                def answered(res, err, c=c, req=req, action=m.get("action")):
+                    if err:
+                        self.send(c, {"t": "error", "req": req, "msg": err})
+                    else:
+                        self.send(c, {"t": "memory", "req": req, "action": action, "data": res,
+                                      "status": self.memory.status()})
+                self.memory.query(m, answered)
             elif op == "usage_today":
                 self.send(c, dict(self.usage_today.scan(), t="usage_today", req=req))
             elif op == "create":

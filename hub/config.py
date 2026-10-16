@@ -21,6 +21,11 @@ DEFAULTS = {
     # e.g. "https://api.funcloud.ai/v1/model/key-usage"; empty = no usage shown
     "keys": {"env": {"claude": "ANTHROPIC_AUTH_TOKEN", "codex": "OPENAI_API_KEY"}, "profiles": [], "usage_url": ""},
     "machines": [{"id": "M1", "name": "this-mac", "type": "local", "default_cwd": "~"}],
+    # optional persistent memory through AMem (https://github.com/lyfeng001/AMem), off by default.
+    # python: an interpreter with agent-memory-local[mcp] installed (per machine: machines[].memory.python);
+    # store: the vault ("" = data/memory in the project on this computer, ~/.glimpse/data/memory on ssh machines);
+    # budget: vault size limit, oldest tool output / tool calls are compacted away beyond it
+    "memory": {"enabled": False, "python": "", "store": "", "budget": "20G", "keep_days": 30},
     # choices offered by the new-session sheet and the "controls" widget (lists replace, not merge)
     "options": {
         "claude": {"models": ["default", "opus", "sonnet", "haiku", "fable", "opusplan"],

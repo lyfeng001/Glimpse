@@ -53,6 +53,7 @@ Glimpse turns your phone into a remote control for those sessions. What you see 
 - **Manage machines from the phone**: add, edit, remove and test SSH machines. The hub's existing SSH keys are used, and host names are validated.
 - **Group by machine or by status**: the home screen can group sessions by status (needs attention, errors, running, waiting, idle, finished) instead of by machine.
 - **Key usage (optional)**: if your keys come from a relay with a usage API, set `keys.usage_url` and the key pickers show each key's quota windows and today's spend, refreshed every 5 minutes. Leave it empty to turn this off.
+- **Persistent memory (optional, [AMem](https://github.com/lyfeng001/AMem))**: every Claude Code / Codex session of the same project shares one long-term memory, across sessions and machines. The assistant reads earlier conclusions at the start of a task and saves verified ones (decisions, root causes, handoffs) itself; the full history is captured after every turn and searchable. The injected instructions tell the assistant that the current request and the live repository always outrank memory, and to ignore memories that don't matter for the task. Settings → 记忆 shows storage use against the budget (default 20 GB), each project's saved memories and a search. Beyond the budget the oldest tool output and tool calls are compacted away; memories and conversation are never removed. See [Memory](#memory).
 - **Widgets**: network latency and throughput, token usage (including **today's total** per machine, counted from all Claude / Codex transcripts on it), context usage, model & mode, machine CPU and memory, and session counts. Each can be toggled and reordered.
 - **Sessions outlive every connection**: an agent daemon owns the PTYs, the same idea as tmux. Restarting the hub, dropping SSH or locking the phone never stops the AI process. Output resumes from the exact byte offset on reconnect.
 - **Laptop and phone together**: `glimpse run claude` attaches your laptop terminal to the same session. `Ctrl-]` detaches.
@@ -183,6 +184,7 @@ Every setting, including secrets such as API keys, lives in one file: `config.js
     "profiles": [{"name": "key1", "value": "sk-..."}],
     "usage_url": ""                  // optional: a key-usage API (POST <url>/limit and <url>/summary, Bearer key); "" = off
   },
+  "memory": {"enabled": false, "python": "", "budget": "20G"},   // optional persistent memory, see Memory below
   "machines": [
     {"id": "M1", "name": "mac", "type": "local", "default_cwd": "~/code",
      "presets": {
@@ -198,6 +200,33 @@ Every setting, including secrets such as API keys, lives in one file: `config.js
 
 - **Claude Code** always starts with a `--settings` file. Glimpse reads your own settings file from the preset and writes the selected key into its `env`. It then adds Glimpse's hooks and saves the result as a temporary file (`0600`, deleted when the process exits). The key never appears in the process environment or on the command line.
 - **Codex** gets the key as an environment variable (the equivalent of `export OPENAI_API_KEY=...`), named in `keys.env.codex`. The variable is set after your shell rc files run, so a stale key exported in `~/.bashrc` can't override it. If your Codex setup needs extra flags (e.g. `--no-daemon`), add them to `argv`.
+
+**Editing config.json**: changes to `keys` and `memory` are picked up within a few seconds, no restart needed. Changes to `hub` and `machines` need `glimpse hub` restarted (sessions keep running).
+
+## Memory
+
+Optional. Glimpse uses [AMem](https://github.com/lyfeng001/AMem) (Python 3.11+) as a separate program and never bundles it.
+
+```sh
+uv venv .amem --python 3.13
+VIRTUAL_ENV=$PWD/.amem uv pip install "agent-memory-local[mcp] @ git+https://github.com/lyfeng001/AMem.git"
+```
+
+```jsonc
+"memory": {
+  "enabled": true,
+  "python": "/path/to/Glimpse/.amem/bin/python",   // the interpreter that has AMem installed
+  "store": "",                                     // "" = data/memory (one vault for every project)
+  "budget": "20G",                                 // compaction starts beyond this
+  "keep_days": 30                                  // records newer than this are never compacted
+}
+```
+
+A machine can override any field with `machines[].memory` (for example its own `python`).
+
+- **Project identity**: the git `origin` repository name, otherwise the folder name, so the same project on two machines maps to the same memory.
+- **Launch**: Claude Code gets the AMem MCP server through `--mcp-config` and the memory instructions through `--append-system-prompt`; Codex gets `-c mcp_servers.amem.*` and `developer_instructions`. Memory tools are pre-approved. Nothing is written into the project directory, and a project that already wires AMem itself (its own `.mcp.json` / `.codex/config.toml`) is left alone.
+- **Capture**: after every turn the agent archives the new transcript lines (`amem refresh`) and enforces the budget.
 
 ## Security
 

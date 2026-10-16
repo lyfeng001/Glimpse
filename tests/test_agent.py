@@ -106,6 +106,7 @@ class FakeDaemon:
     approval_wait = 600
 
     def __init__(self):
+        self.memory = A.Memory(self)      # disabled: capture() is a no-op
         self.sent = []
 
     def send(self, c, obj):
@@ -995,3 +996,71 @@ def test_auto_continue_retries_transient_only():
     assert s.maybe_auto_continue(overload) is False and s.ac_count == A.AUTO_CONTINUE_MAX
     assert [t[0] for t in timers] == list(A.AUTO_CONTINUE_DELAYS)
 
+
+
+def test_memory_project_id_and_launch_args(tmp_path):
+    import subprocess
+    repo = tmp_path / "work" / "checkout"
+    repo.mkdir(parents=True)
+    (repo / "sub").mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "git@github.com:someone/My Repo.git"], check=True)
+    # same project id from any subdirectory and on any machine (from the remote name)
+    assert A.memory_project_id(str(repo / "sub")) == ("My-Repo", os.path.realpath(str(repo)))
+    plain = tmp_path / "plain dir"
+    plain.mkdir()
+    assert A.memory_project_id(str(plain))[0] == "plain-dir"
+    d, s = _session("claude")
+    s.cwd = str(repo)
+    mem = A.Memory(d)
+    mem.cfg = dict(A.MEMORY_DEFAULT, enabled=True, python="/opt/py", store=str(tmp_path / "vault"))
+    mem.attach(s)
+    assert s.memory_project is None                     # not probed yet: memory stays off
+    mem.version = "0.4.0"
+    mem.attach(s)
+    assert s.memory_project == "My-Repo"
+    args = mem.claude_args(s)
+    cfg = json.loads(args[args.index("--mcp-config") + 1])["mcpServers"]["amem"]
+    assert cfg["command"] == "/opt/py" and cfg["args"][-3:] == ["--project", "My-Repo", "--no-context"]
+    assert "the live repository state always win" in args[args.index("--append-system-prompt") + 1]
+    assert "mcp__amem__memory_save" in mem.claude_allow(s)
+    c = mem.codex_args(s)
+    assert 'mcp_servers.amem.command="/opt/py"' in c and any(x.startswith("developer_instructions=") for x in c)
+    # a project that wires AMem itself is left alone
+    (repo / ".mcp.json").write_text('{"mcpServers": {"x": {"args": ["-m", "agent_memory"]}}}')
+    mem.attach(s)
+    assert s.memory_project is None and mem.claude_args(s) == []
+    # shells never get memory
+    d2, sh = _session("shell")
+    mem.attach(sh)
+    assert sh.memory_project is None
+
+
+def test_memory_settings_allow_merge(tmp_path):
+    src = tmp_path / "s.json"
+    src.write_text(json.dumps({"permissions": {"allow": ["Bash(ls:*)"]}, "env": {"A": "1"}}))
+    argv, path = A.prepare_claude_argv(["claude", "--settings", str(src)], "x1", str(tmp_path),
+                                       allow=["mcp__amem__memory_save"])
+    merged = json.load(open(path))
+    assert merged["permissions"]["allow"] == ["Bash(ls:*)", "mcp__amem__memory_save"]
+    assert merged["env"] == {"A": "1"}
+
+
+def test_memory_query_validation():
+    d, s = _session("claude")
+    mem = A.Memory(d)
+    out = []
+    mem.query({"action": "overview"}, lambda r, e: out.append(e))
+    assert "未开启" in out[-1]
+    mem.cfg["enabled"], mem.version = True, "0.4.0"
+    ran = []
+    mem.run = lambda args, done, timeout=60: ran.append(args)
+    for bad in ({"action": "search", "project": "p", "q": ""}, {"action": "search", "project": "../x", "q": "a"},
+                {"action": "budget", "budget": "20G; rm -rf"}, {"action": "nope"}):
+        mem.query(bad, lambda r, e: out.append(e))
+        assert out[-1]
+    assert ran == []
+    mem.query({"action": "search", "project": "p", "q": "build fail"}, lambda r, e: None)
+    mem.query({"action": "budget", "budget": "20G"}, lambda r, e: None)
+    assert ran[0] == ["search", "--project", "p", "--limit", "30", "build fail"]
+    assert ran[1][:3] == ["budget", "--max-bytes", "20G"]

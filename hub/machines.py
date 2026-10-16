@@ -44,13 +44,14 @@ class Machine:
         self.proc = None
         self.task = None
         self.req = 0
+        self.memory = None             # AMem status reported by the agent (None = not configured / old agent)
         self.waiters = {}
         self.wake = asyncio.Event()
 
     def info(self, presets_view):
         return {"id": self.id, "name": self.name, "type": self.cfg.get("type"), "online": self.online,
                 "error": self.error, "version": self.version, "host": self.host, "stats": self.stats,
-                "usage_today": self.usage_today, "ssh_host": self.cfg.get("host"), "port": self.cfg.get("port"),
+                "usage_today": self.usage_today, "memory": self.memory, "ssh_host": self.cfg.get("host"), "port": self.cfg.get("port"),
                 "presets": presets_view, "default_cwd": self.cfg.get("default_cwd"),
                 "sessions": [self.sessions[k] for k in self.order if k in self.sessions]}
 

@@ -561,6 +561,7 @@ function onMsg(m) {
     case 'approved': if (isView(m)) { S.view.approving = null; S.view.cardSig = null; renderCard(); } break;
     case 'history': onHistory(m); break;
     case 'models': onModels(m, false); break;
+    case 'memory': onMemory(m); break;
     case 'menu_ok': if (isView(m)) menuDone(); break;
     case 'control_ok': ctlDone(m); break;
     case 'delete_ok': onDeleted(m); break;
@@ -578,6 +579,7 @@ function onMsg(m) {
       else if (MC.busy && $('#dlg-machine').open) { mcFail(m.msg); }
       else if (RS.active && $('#dlg-restart').open) { rsFail(m.msg); }
       else if (CTL.busy && $('#dlg-ctl').open) { ctlFail(m.msg); }
+      else if ($('#dlg-mem').open && !m.sid) { MEM.busy = false; toast('记忆', m.msg, null, 'error'); }
       else toast('出错了', m.msg, null, 'error');
       if (S.view) { S.view.approving = null; renderCard(); }
       break;
@@ -2126,7 +2128,7 @@ async function renderSettings() {
   $('#opt-font').textContent = String(S.fontSize);
   $('#set-ver').textContent = APP_VERSION;
   $('#set-hubver').textContent = S.hub && S.hub.version ? S.hub.version : '—';
-  renderSettingsWidgets(); renderSettingsKeys(); renderSettingsMachines(); renderAccount();
+  renderSettingsWidgets(); renderSettingsKeys(); renderSettingsMachines(); renderSettingsMemory(); renderAccount();
   $('#btn-install-sub').textContent = standalone() ? '已作为 App 运行 ✓' : isIOS() ? 'Safari：分享 → 添加到主屏幕' : INST.prompt ? '可以直接安装' : '查看安装方法';
   $('#set-push').textContent = await pushState();
 }
@@ -2146,6 +2148,125 @@ async function renderAccount() {
   };
   $('#acct-revoke-others').hidden = r.devices.filter((d) => !d.current).length === 0;
 }
+// ---- memory (optional AMem): per-machine status in settings, a sheet with projects / memories / search / compaction
+function fmtBytes(b) {
+  b = Number(b) || 0;
+  const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0;
+  while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+  return (i ? b.toFixed(b < 10 ? 2 : b < 100 ? 1 : 0) : String(Math.round(b))) + ' ' + u[i];
+}
+const MEM = { m: null, view: 'home', project: null, data: {}, busy: false, q: '' };
+function memMachines() { return S.machines.filter((mc) => mc.memory && mc.memory.enabled); }
+function renderSettingsMemory() {
+  const list = memMachines();
+  for (const id of ['#set-mem-h', '#set-mem', '#set-mem-f']) $(id).hidden = !list.length;
+  setHTML($('#set-mem'), list.map((mc) => {
+    const st = mc.memory; const ov = MEM.data[mc.id + ':overview'];
+    const sub = !mc.online ? '机器离线' : st.available ? (ov ? fmtBytes(ov.size.total) + (ov.budget ? ' / ' + fmtBytes(ov.budget.max_bytes) : '') + ' · ' + ov.projects.length + ' 个项目' : 'AMem ' + esc(st.version || '')) : esc(st.error || '不可用');
+    return '<button type="button" class="cell" data-mem="' + esc(mc.id) + '"><span class="cell-ic" style="background:#8E5CF7" aria-hidden="true">' + ic('sparkle') + '</span>' +
+      '<span class="grow">' + esc(mc.id) + ' · ' + esc(mc.name) + '<div class="sub">' + sub + '</div>' + (ov ? memMeter(ov) : '') + '</span>' +
+      '<svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>';
+  }).join(''));
+  for (const b of $$('[data-mem]', $('#set-mem'))) b.onclick = () => openMemory(b.dataset.mem);
+  for (const mc of list) if (mc.online && mc.memory.available && !MEM.data[mc.id + ':overview']) memAsk(mc.id, 'overview');
+}
+function memMeter(ov) {
+  if (!ov.budget) return '';
+  const pct = Math.min(100, (ov.size.total / ov.budget.max_bytes) * 100);
+  return '<div class="kbars"><span class="kbar"><span class="kb-l">存储</span>' + meter(pct) + '<span class="kb-r">' + (pct < 1 ? '<1' : Math.round(pct)) + '%</span></span></div>';
+}
+function memAsk(m, action, extra) {
+  send(Object.assign({ op: 'memory', m, action }, extra || {}));
+}
+function onMemory(m) {
+  const key = m.m + ':' + m.action + (m.project ? ':' + m.project : '');
+  MEM.data[key] = m.data;
+  if (m.action === 'overview') MEM.data[m.m + ':overview'] = m.data;
+  if (m.action === 'compact' || m.action === 'budget') {
+    MEM.busy = false;
+    if (m.action === 'compact') {
+      const r = m.data || {}; const n = Object.values(r.removed || {}).reduce((a, b) => a + b, 0);
+      toast(r.dry_run ? '预估清理' : n ? '已清理' : '无需清理', n ? n + ' 条记录 · ' + fmtBytes(r.before.total) + ' → ' + fmtBytes(r.after.total) : '当前用量在上限之内', null, 'done');
+    } else toast('已更新存储上限', '', null, 'done');
+    memAsk(m.m, 'overview');
+  }
+  if ($('#dlg-settings').open) renderSettingsMemory();
+  if ($('#dlg-mem').open && MEM.m === m.m) renderMemory();
+}
+function openMemory(m) {
+  MEM.m = m; MEM.view = 'home'; MEM.project = null;
+  memAsk(m, 'overview');
+  renderMemory();
+  openSheet($('#dlg-mem'));
+}
+const KIND_NAMES = { message: '对话', tool_call: '工具调用', tool_result: '工具输出', document: '文档', memory: '记忆' };
+function renderMemory() {
+  const body = $('#mem-body'); const mc = S.byId[MEM.m];
+  $('#mem-back').style.visibility = MEM.view === 'home' ? 'hidden' : '';   // keep the title centred
+  if (!mc || !mc.memory) { setHTML(body, '<p class="g-f">这台机器没有开启记忆功能。</p>'); return; }
+  const ov = MEM.data[MEM.m + ':overview'];
+  if (MEM.view === 'home') {
+    $('#dlg-mem-title').textContent = '记忆 · ' + mc.id;
+    if (!ov) { setHTML(body, '<div class="empty">' + (mc.memory.available ? '读取中…' : esc(mc.memory.error || '不可用')) + '</div>'); return; }
+    const last = ov.last_compact;
+    let h = '<div class="g-h">存储</div><div class="group">' +
+      '<div class="cell stack"><span class="grow">已用 ' + fmtBytes(ov.size.total) + (ov.budget ? ' / 上限 ' + fmtBytes(ov.budget.max_bytes) : '（未设上限）') +
+      '<div class="sub">记录 ' + fmtBytes(ov.size.objects) + ' · 索引 ' + fmtBytes(ov.size.index) + (last ? ' · 上次清理 ' + esc(ago(Date.parse(last.utc) / 1000)) : '') + '</div>' + memMeter(ov) + '</span></div>' +
+      '<div class="cell"><span class="grow" id="mem-budget-lbl">存储上限</span><input id="mem-budget" class="mono" style="width:90px;text-align:right" value="' + esc(ov.budget ? fmtBytes(ov.budget.max_bytes).replace(/\.0+ /, ' ').replace(' ', '') : '') + '" placeholder="20G" aria-labelledby="mem-budget-lbl" autocapitalize="off" autocorrect="off" spellcheck="false">' +
+      '<button type="button" class="btn sm" id="mem-budget-save">保存</button></div>' +
+      '<button type="button" class="cell" id="mem-compact"><span class="cell-ic" style="background:#5C636E" aria-hidden="true">' + ic('broom') + '</span><span class="grow">立即整理<div class="sub">超过上限时清理最旧的工具输出和工具调用；记忆和对话不会被删</div></span></button>' +
+      '</div><div class="g-h">项目</div><div class="group">';
+    h += ov.projects.length ? ov.projects.map((p) => '<button type="button" class="cell" data-proj="' + esc(p.project) + '"><span class="grow">' + esc(p.project) +
+      '<div class="sub">' + p.memories + ' 条记忆 · ' + fmtNum(p.records) + ' 条记录 · ' + fmtBytes(p.object_bytes) + (p.last ? ' · ' + esc(ago(Date.parse(p.last) / 1000)) : '') + '</div></span>' +
+      '<svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>').join('') : '<div class="cell"><span class="grow sub">还没有记忆。开启后新建的 Claude Code / Codex 会话会自动记录。</span></div>';
+    h += '</div>';
+    setHTML(body, h);
+    for (const b of $$('[data-proj]', body)) b.onclick = () => memOpenProject(b.dataset.proj);
+    $('#mem-budget-save').onclick = () => {
+      const v = $('#mem-budget').value.trim();
+      if (!/^(0|\d+(\.\d+)?\s*[KMGT]i?B?)$/i.test(v)) { toast('格式不对', '例如 20G、500M，0 表示不设上限', null, 'error'); return; }
+      MEM.busy = true; memAsk(MEM.m, 'budget', { budget: v });
+    };
+    $('#mem-compact').onclick = async () => {
+      if (MEM.busy) return;
+      if (!(await confirmSheet('立即整理记忆？', '只在超过上限时删除最旧的工具输出和工具调用。整理过的记忆、对话和最近 ' + ((mc.memory.keep_days) || 30) + ' 天的记录都会保留。', '整理'))) return;
+      MEM.busy = true; memAsk(MEM.m, 'compact'); toast('整理中…', '', null, 'info');
+    };
+    return;
+  }
+  const p = MEM.project; const proj = ov && ov.projects.find((x) => x.project === p);
+  $('#dlg-mem-title').textContent = p;
+  const mems = MEM.data[MEM.m + ':memories:' + p];
+  const hits = MEM.data[MEM.m + ':search:' + p];
+  let h = '<div class="group"><div class="cell"><svg class="ic sm" aria-hidden="true"><use href="#i-search"/></svg>' +
+    '<input id="mem-q" type="search" class="grow mem-q" placeholder="搜索这个项目的历史（命令、输出、对话）" value="' + esc(MEM.q) + '" enterkeyhint="search" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="搜索记忆"></div></div>';
+  if (proj) h += '<p class="g-f">' + Object.entries(proj.kinds).map(([k, n]) => esc(KIND_NAMES[k] || k) + ' ' + fmtNum(n)).join(' · ') + (proj.pruned ? ' · 已清理 ' + fmtNum(proj.pruned) : '') + '</p>';
+  if (hits && MEM.q) {
+    h += '<div class="g-h">搜索结果</div><div class="group">' + (hits.length ? hits.map((r) => '<div class="cell stack"><span class="grow"><span class="tag">' + esc(KIND_NAMES[r.kind] || r.kind) + '</span> <span class="sub">' + esc(ago(Date.parse(r.timestamp) / 1000)) + ' · ' + esc(r.source) + '</span>' +
+      '<div class="mem-text">' + esc(r.text) + '</div></span></div>').join('') : '<div class="cell"><span class="grow sub">没有找到</span></div>') + '</div>';
+  }
+  h += '<div class="g-h">已保存的记忆</div><div class="group">';
+  h += !mems ? '<div class="cell"><span class="grow sub">读取中…</span></div>' : mems.length ? mems.map((r) => '<div class="cell stack"><span class="grow"><b>' + esc(r.memory_key) + '</b>' + (r.conflict ? ' <span class="tag">冲突</span>' : '') +
+    ' <span class="sub">' + esc(ago(Date.parse(r.timestamp) / 1000)) + '</span><div class="mem-text md">' + md(r.text) + '</div></span></div>').join('') :
+    '<div class="cell"><span class="grow sub">还没有保存的结论。助手确认重要结论后会自动保存；完整历史已在后台记录，可以在上面搜索。</span></div>';
+  h += '</div>';
+  setHTML(body, h);
+  const q = $('#mem-q');
+  q.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); memSearch(q.value); } };
+  q.onsearch = () => memSearch(q.value);
+}
+function memSearch(v) {
+  MEM.q = v.trim().slice(0, 200);
+  if (MEM.q) memAsk(MEM.m, 'search', { project: MEM.project, q: MEM.q });
+  else renderMemory();
+}
+function memOpenProject(p) {
+  MEM.view = 'project'; MEM.project = p; MEM.q = '';
+  delete MEM.data[MEM.m + ':search:' + p];
+  memAsk(MEM.m, 'memories', { project: p });
+  renderMemory();
+}
+$('#mem-back').onclick = () => { MEM.view = 'home'; MEM.project = null; renderMemory(); };
 $('#acct-revoke-others').onclick = async () => {
   if (!(await confirmSheet('退出其他所有设备？', '除了这台以外，所有设备都需要重新登录。', '全部退出'))) return;
   try { await api('/api/devices/revoke', { all: true }); toast('已退出其他设备', '', null, 'done'); renderAccount(); } catch (e) { toast('操作失败', e.message, null, 'error'); }

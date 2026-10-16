@@ -710,3 +710,6 @@ dialog.sheet.tall { min-height: min(560px, calc(var(--app-h) - var(--safe-t) - 1
 .kbars { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
 .kbar { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-2); }
 .kbar .kb-l { width: 42px; flex: none; } .kbar .meter { flex: 1; } .kbar .kb-r { width: 82px; flex: none; text-align: right; }
+.mem-text { margin-top: 4px; font-size: 13px; color: var(--text-1); white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow: auto; }
+.mem-text.md { white-space: normal; }
+.mem-q { border: 0; background: transparent; color: var(--text-1); font: inherit; font-size: 15px; padding: 4px 0; outline: none; -webkit-appearance: none; appearance: none; }

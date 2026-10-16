@@ -386,6 +386,15 @@
     <p class="g-f">内容会作为一次粘贴发送给会话，不会被逐字当成按键执行。</p>
   </div>
 </dialog>
+<dialog id="dlg-mem" class="sheet tall" aria-labelledby="dlg-mem-title">
+  <div class="sh-grab" aria-hidden="true"></div>
+  <div class="sh-head">
+    <button type="button" class="txt-btn l" id="mem-back" style="visibility:hidden">返回</button>
+    <h2 id="dlg-mem-title">记忆</h2>
+    <button type="button" class="txt-btn strong r" data-close>完成</button>
+  </div>
+  <div class="sh-body" id="mem-body" aria-live="polite"></div>
+</dialog>
 <dialog id="dlg-rename" class="sheet" aria-labelledby="dlg-rename-title">
   <form id="rename-form" novalidate>
     <div class="sh-grab" aria-hidden="true"></div>
@@ -497,6 +506,9 @@
       <button type="button" class="cell" id="btn-add-machine"><span class="cell-ic" aria-hidden="true"><svg class="ic"><use href="#i-plus"/></svg></span><span class="grow" style="color:var(--accent-text)">添加机器</span></button>
       <button type="button" class="cell" id="btn-clean"><span class="cell-ic" style="background:#5C636E" aria-hidden="true"><svg class="ic"><use href="#i-broom"/></svg></span><span class="grow">清理已结束的会话<div class="sub" id="btn-clean-sub"></div></span></button>
     </div>
+    <div class="g-h" id="set-mem-h" hidden>记忆</div>
+    <div class="group" id="set-mem" hidden></div>
+    <p class="g-f" id="set-mem-f" hidden>同一个项目的所有 Claude Code / Codex 会话共享一份长期记忆（AMem）：助手会读取之前的结论，并把确认过的结论存下来。超过存储上限时，会先清理最旧的工具输出。</p>
     <div class="g-h">App</div>
     <div class="group">
       <button type="button" class="cell" id="btn-install"><span class="cell-ic" style="background:#0A84FF" aria-hidden="true"><svg class="ic"><use href="#i-phone"/></svg></span><span class="grow">添加到主屏幕<div class="sub" id="btn-install-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>

@@ -17,6 +17,7 @@
     ],
     "usage_url": ""
   },
+  "memory": {"enabled": false, "python": "", "store": "", "budget": "20G", "keep_days": 30},
   "machines": [
     {
       "id": "M1",

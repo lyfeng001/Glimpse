@@ -53,6 +53,7 @@ Glimpse 让手机变成这些会话的遥控器。手机上看到的就是它们
 - **在手机上管理机器**：添加、编辑、删除 SSH 机器并测试连接。用的是 hub 电脑已有的 SSH 密钥，主机名会做校验。
 - **按机器或按状态分组**：首页可以按状态分组（需要处理、出错、进行中、等待回复、空闲、已结束），不再只按机器。
 - **Key 用量（可选）**：如果你的 Key 来自带用量接口的中转站，配置 `keys.usage_url` 后，选择 Key 时会显示每个 Key 的额度窗口和今日花费，每 5 分钟刷新。留空即关闭。
+- **长期记忆（可选，[AMem](https://github.com/lyfeng001/AMem)）**：同一个项目的所有 Claude Code / Codex 会话共享一份长期记忆，跨会话、跨机器。助手开始任务时会读取之前的结论，得到确认过的结论（决定、根因、交接）时自己保存；完整历史在每轮结束后自动记录，可以搜索。注入的说明会告诉助手：当前的要求和仓库的实际状态永远优先于记忆，和当前任务无关的记忆直接忽略。设置 → 记忆 里可以看到存储用量和上限（默认 20 GB）、每个项目已保存的记忆，以及搜索。超过上限时会清理最旧的工具输出和工具调用，记忆和对话永远不会被删。详见[长期记忆](#长期记忆)。
 - **插件**：首页和会话页可以显示：
   - 网络延迟与速率
   - Token 用量，包括每台机器**今日总用量**（统计这台机器上所有 Claude / Codex 记录）
@@ -188,6 +189,7 @@ Glimpse 是一个 PWA。安装后从自己的图标全屏打开，没有浏览�
     "profiles": [{"name": "key1", "value": "sk-..."}],
     "usage_url": ""                  // 可选：Key 用量接口（POST <url>/limit 和 <url>/summary，Bearer key）；留空 = 关闭
   },
+  "memory": {"enabled": false, "python": "", "budget": "20G"},   // 可选的长期记忆，见下文
   "machines": [
     {"id": "M1", "name": "mac", "type": "local", "default_cwd": "~/code",
      "presets": {
@@ -203,6 +205,33 @@ Glimpse 是一个 PWA。安装后从自己的图标全屏打开，没有浏览�
 
 - **Claude Code**：始终通过 `--settings` 文件启动。Glimpse 读取 preset 里你自己的 settings 文件，把选中的 Key 写进它的 `env`，再加上 Glimpse 的 hooks，合并成一个临时文件（`0600`，进程退出后删除）。Key 不会出现在进程环境变量或命令行参数里。
 - **Codex**：以环境变量的方式注入（相当于 `export OPENAI_API_KEY=...`），变量名在 `keys.env.codex` 里配置。注入发生在 shell 的 rc 文件执行之后，所以 `~/.bashrc` 里写死的旧 Key 不会把它覆盖。如果你的 Codex 需要额外参数（例如 `--no-daemon`），直接写进 `argv`。
+
+**修改 config.json**：`keys` 和 `memory` 的修改几秒内自动生效，不用重启。`hub` 和 `machines` 的修改需要重启 `glimpse hub`（会话不会中断）。
+
+## 长期记忆
+
+可选功能。Glimpse 把 [AMem](https://github.com/lyfeng001/AMem)（需要 Python 3.11+）当作独立程序调用，不打包它的代码。
+
+```sh
+uv venv .amem --python 3.13
+VIRTUAL_ENV=$PWD/.amem uv pip install "agent-memory-local[mcp] @ git+https://github.com/lyfeng001/AMem.git"
+```
+
+```jsonc
+"memory": {
+  "enabled": true,
+  "python": "/path/to/Glimpse/.amem/bin/python",   // 装了 AMem 的 Python
+  "store": "",                                     // 留空 = data/memory（所有项目共用一个记忆库）
+  "budget": "20G",                                 // 超过后开始整理
+  "keep_days": 30                                  // 这么多天内的记录永远不会被清理
+}
+```
+
+每台机器都可以用 `machines[].memory` 覆盖任意字段（比如它自己的 `python`）。
+
+- **项目识别**：取 git `origin` 的仓库名，没有就用文件夹名，所以同一个项目在两台机器上对应同一份记忆。
+- **启动注入**：Claude Code 通过 `--mcp-config` 加载 AMem 的 MCP 服务，通过 `--append-system-prompt` 加入记忆说明；Codex 用 `-c mcp_servers.amem.*` 和 `developer_instructions`。记忆工具预先授权。不会往项目目录里写任何文件；项目自己已经配置了 AMem（有自己的 `.mcp.json` / `.codex/config.toml`）的，Glimpse 不会再注入。
+- **采集**：每轮结束后，agent 会把新增的对话记录归档（`amem refresh`），并检查存储上限。
 
 ## 安全
 

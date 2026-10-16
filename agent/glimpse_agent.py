@@ -1971,6 +1971,11 @@ MEMORY_PROMPT = (
     "(read the current version first and pass its ID as expected_parents). Do not save guesses, secrets "
     "or step-by-step logs; the full history is captured automatically.")
 PROJECT_ID_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
+# availability probe: AMem version + the projects already bound in the vault (folder -> project id)
+MEMORY_PROBE = ("import json, sys, agent_memory, mcp\n"
+                "from agent_memory.store import Store\n"
+                "s = Store(sys.argv[1])\n"
+                "print(json.dumps({'version': agent_memory.__version__, 'projects': s.projects()}))")
 
 
 def memory_project_id(cwd):
@@ -2049,35 +2054,30 @@ class Memory:
             if err:
                 self.error = err
             else:
-                self.version = res.strip()
-                self.load_roots()
+                info = json.loads(res)
+                self.set_roots(info.get("projects"))
+                self.version = info["version"]
                 b = str(self.cfg.get("budget") or "0")
                 self.run(["budget", "--max-bytes", b, "--keep-days", str(int(self.cfg.get("keep_days") or 30))],
                          lambda r, e: setattr(self, "error", e) if e else None)
             if done:
                 done()
         self.probing = True
-        self.exec_py(["-c", "import agent_memory, mcp, sys; sys.stdout.write(agent_memory.__version__)"], probed,
-                     "AMem 不可用（需要 Python 3.11+ 且安装 agent-memory-local[mcp]）")
+        self.exec_py(["-c", MEMORY_PROBE, self.store()], probed, "AMem 不可用（需要 Python 3.11+ 且安装 agent-memory-local[mcp]）")
 
     def configure_now(self, cfg):
         """Blocking variant of configure() (daemon start, before any session is restored)."""
         import subprocess
         self.cfg = dict(MEMORY_DEFAULT, **{k: v for k, v in (cfg or {}).items() if k in MEMORY_DEFAULT})
         try:
-            r = subprocess.run([self.python(), "-c", "import agent_memory, mcp, sys; sys.stdout.write(agent_memory.__version__)"],
+            r = subprocess.run([self.python(), "-c", MEMORY_PROBE, self.store()],
                                stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
             if r.returncode == 0:
-                self.version, self.error = r.stdout.decode().strip(), None
-                r = subprocess.run([self.python(), "-m", "agent_memory", "--store", self.store(), "projects"],
-                                   stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
-                if r.returncode == 0:
-                    self.set_roots(json.loads(r.stdout or b"{}"))
+                info = json.loads(r.stdout)
+                self.set_roots(info.get("projects"))
+                self.version, self.error = info["version"], None
         except (OSError, subprocess.SubprocessError) as e:
             self.error = clip(str(e), 300)
-
-    def load_roots(self):
-        self.run(["projects"], lambda res, err: self.set_roots(res) if isinstance(res, dict) else None)
 
     def set_roots(self, projects):
         self.roots = {os.path.realpath(v["root"]): k for k, v in (projects or {}).items()
@@ -2596,9 +2596,10 @@ class Daemon:
             rows = saved.get("sessions") or []
         except (OSError, ValueError):
             return
-        if isinstance(saved.get("memory"), dict) and saved["memory"].get("enabled") and rows:
+        mcfg = saved.get("memory") if isinstance(saved.get("memory"), dict) else local_memory_config()
+        if mcfg and mcfg.get("enabled") and rows:
             # the hub sends the memory settings only after it connected: restored sessions need them at spawn
-            self.memory.configure_now(saved["memory"])
+            self.memory.configure_now(mcfg)
         for r in rows:
             try:
                 if not isinstance(r, dict) or r.get("kind") not in ("claude", "codex") or r.get("sid") in self.sessions:
@@ -3501,6 +3502,22 @@ def attach(sid=None):
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
     sys.stdout.write("\r\n[glimpse] %s: %s\r\n" % (reason, sid))
+
+
+def local_memory_config():
+    """config.json memory settings for this machine (hub-wide `memory` + the local machine's override)."""
+    try:
+        with open(os.environ.get("GLIMPSE_CONFIG") or os.path.join(project_dir(), "config.json")) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("memory"), dict):
+        return None
+    out = dict(cfg["memory"])
+    for mc in cfg.get("machines") or []:
+        if isinstance(mc, dict) and mc.get("type") == "local" and isinstance(mc.get("memory"), dict):
+            out.update(mc["memory"])
+    return out
 
 
 KEY_ENV_DEFAULT = {"claude": "ANTHROPIC_AUTH_TOKEN", "codex": "OPENAI_API_KEY"}

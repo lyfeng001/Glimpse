@@ -1141,3 +1141,20 @@ def test_claude_stop_failure_no_balance_is_not_retried():
     s.preview = "API Error: 401 权限验证失败"
     s.on_hook({"hook_event_name": "StopFailure", "error": "server_error"})
     assert timers == [] and s.status == "error"
+
+
+def test_memory_probe_reports_bound_projects(tmp_path, monkeypatch):
+    # the probe output carries the bound folders, so the very first session after start uses them
+    d, s = _session("codex")
+    mem = A.Memory(d)
+    root = tmp_path / "sim"
+    root.mkdir()
+    out = json.dumps({"version": "0.4.0", "projects": {"echo-sim": {"root": str(root)}}})
+    mem.exec_py = lambda args, done, fail=None, timeout=60: done(out, None)
+    mem.run = lambda args, done, timeout=60: None
+    mem.configure({"enabled": True, "python": "/x/py"})
+    assert mem.version == "0.4.0" and mem.roots == {os.path.realpath(str(root)): "echo-sim"}
+    s.cwd = str(root)
+    mem.capture = lambda ss: None
+    mem.attach(s)
+    assert s.memory_project == "echo-sim"

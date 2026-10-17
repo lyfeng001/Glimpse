@@ -42,6 +42,8 @@ Glimpse 让手机变成这些会话的遥控器。手机上看到的就是它们
 - **回答提问**：`AskUserQuestion` 的选项会显示成按钮。
 - **推送通知**：本轮完成、出错停止、需要授权或回答问题、进程退出时，通过标准 Web Push 发通知到 iPhone。
 - **自动继续**（默认关闭，在“会话操作”里按会话开启）：一轮因临时错误停下时（`stream disconnected`、`overloaded`、`Service temporarily unavailable`、`Incomplete response … max_output_tokens`、`Connection failed: error sending request`、5xx 等），Glimpse 会退避后自动发送“继续”（15 秒、30 秒、60 秒、120 秒、240 秒，连续最多 5 次）。余额不足、Key 无效、上下文已满这类需要你处理的错误不会重试，照常通知。
+- **不重启切换 Key**：Claude Code 通过 `apiKeyHelper`、Codex（使用自定义 provider 时）通过 provider 的 `auth.command`，从每个会话单独的 `0600` 文件读取 Key。换 Key 只改这个文件，下一次请求就用新 Key，会话不中断。其他会话仍然是重启并恢复对话。
+- **Key 均衡（可选，默认关闭）**：设置 → Key。“没余额时自动换”：会话的 Key 余额不足或被拒绝时，自动换成另一个可用的 Key 并继续。“按用量分配”：另外，新会话自动用用量最低的 Key，某个 Key 快用完时在一轮结束后把会话换走（配置了 `keys.usage_url` 时按真实用量）。可以排除不想被自动选中的 Key。
 - **更换 Key 并重启**：Key 余额用完时，可以在手机上换一个 Key，结束旧进程后重新启动并恢复原对话（`claude --resume` / `codex resume`）。
 - **模型与模式**：
   - 选择列表来自各机器的真实数据：Codex 的模型和推理强度取自 `codex debug models`；Claude 的模型是 default / opus / sonnet / haiku / fable / opusplan，并显示 `--settings` 文件里配置的自定义模型名。列表缓存 10 分钟。

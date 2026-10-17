@@ -2171,7 +2171,7 @@ function renderKeyPage() {
     if (on) el.insertAdjacentHTML('beforeend', ic('check', 'chk on'));
   }
   $('#kb-note').textContent = b.mode === 'least_used' && !b.usage
-    ? '没有配置 keys.usage_url，看不到各 Key 的用量：会按每个 Key 上的会话数平均分配。' : '';
+    ? '没有配置 keys.usage_url，看不到各 Key 的用量：会按每个 Key 上的会话数平均分配。5 小时额度不参与均衡，用完时由“没余额时自动换”处理。' : '';
   const keys = S.keys || [];
   setHTML($('#kb-keys'), keys.length ? keys.map((k) => {
     const inPool = !b.exclude.includes(k.name);

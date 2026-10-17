@@ -547,7 +547,7 @@
     <div class="group" id="kb-modes" role="radiogroup" aria-label="Key 均衡策略">
       <button type="button" class="cell radio" role="radio" data-kb="off"><span class="grow">关闭<div class="sub">由你手动选择每个会话用哪个 Key</div></span></button>
       <button type="button" class="cell radio" role="radio" data-kb="on_exhausted"><span class="grow">没余额时自动换<div class="sub">会话报余额不足或 Key 被拒绝时，换成另一个可用的 Key 并发送“继续”</div></span></button>
-      <button type="button" class="cell radio" role="radio" data-kb="least_used"><span class="grow">按用量分配<div class="sub">另外：新会话选“默认”时用用量最低的 Key；某个 Key 快用完时，在一轮结束后把会话换走</div></span></button>
+      <button type="button" class="cell radio" role="radio" data-kb="least_used"><span class="grow">按用量分配<div class="sub">另外按 7 天额度让所有 Key 的消耗节奏一致：新会话选“默认”时放到最不紧张的 Key；某个 Key 明显比其他的烧得快时，在一轮结束后把一个会话换过去（同一会话 30 分钟内最多换一次）</div></span></button>
     </div>
     <p class="g-f" id="kb-note"></p>
     <div class="g-h">参与均衡的 Key</div>

@@ -9,7 +9,7 @@ import time
 MODES = ("off", "on_exhausted", "least_used")
 EXHAUSTED_TTL = 30 * 60          # a key that ran out is skipped this long (or until its usage shows room again)
 SWAP_LIMIT, SWAP_WINDOW = 3, 10 * 60   # automatic swaps per session in that window, then the user decides
-REBALANCE_AT, REBALANCE_TO = 90.0, 60.0   # least_used: move a session off a key above 90 % onto one below 60 %
+REBALANCE_GAP = 30 * 60           # least_used: a session moves at most once in this time
 
 # the key itself is the problem: no balance / quota, rejected / invalid / disabled key
 KEY_FATAL_RE = re.compile(
@@ -30,6 +30,53 @@ def usage_percent(u):
         return None
     ws = [w.get("percent") for w in u.get("windows") or [] if isinstance(w.get("percent"), (int, float))]
     return max(ws) if ws else None
+
+
+def week_window(u):
+    """The longest quota window (the 7-day one) of a key's usage, or None."""
+    if not isinstance(u, dict) or u.get("error"):
+        return None
+    ws = [w for w in u.get("windows") or [] if isinstance(w.get("window_sec"), (int, float)) and w["window_sec"] >= 86400]
+    return max(ws, key=lambda w: w["window_sec"]) if ws else None
+
+
+def capacity(u, now=None):
+    """Sustainable spend rate of a key: what is left of its 7-day quota per second until that window resets.
+    None = unknown (no usage data / no long window)."""
+    w = week_window(u)
+    if not w or not isinstance(w.get("limit"), (int, float)) or w["limit"] <= 0:
+        return None
+    now = time.time() if now is None else now
+    left = max(0.0, float(w["limit"]) - float(w.get("used") or 0))
+    secs = (w.get("reset_at") or 0) - now
+    if secs <= 0:
+        secs = float(w.get("window_sec") or 7 * 86400)
+    return left / max(secs, 3600.0)
+
+
+class RateTracker:
+    """Measured spend rate per key from successive 7-day 'used' readings (EWMA; a reset restarts it)."""
+    ALPHA = 0.3
+
+    def __init__(self):
+        self.last = {}      # name -> (ts, used)
+        self.rate = {}      # name -> per second
+
+    def observe(self, name, u):
+        w = week_window(u)
+        ts = u.get("ts") if isinstance(u, dict) else None
+        if not w or not isinstance(ts, (int, float)):
+            return
+        used = float(w.get("used") or 0)
+        prev = self.last.get(name)
+        self.last[name] = (ts, used)
+        if not prev or ts <= prev[0]:
+            return
+        if used < prev[1]:              # window reset
+            self.rate.pop(name, None)
+            return
+        r = (used - prev[1]) / (ts - prev[0])
+        self.rate[name] = r if name not in self.rate else self.ALPHA * r + (1 - self.ALPHA) * self.rate[name]
 
 
 def mode_of(cfg):
@@ -57,31 +104,80 @@ def live_exhausted(exhausted, usage, now=None):
     return out
 
 
-def pick_key(names, usage, exhausted=(), in_use=None, avoid=()):
-    """Best key among names: not exhausted / invalid / spent, lowest window use, then fewest sessions on it,
-    then config order. None when no key qualifies."""
+def loads(names, usage, rates, in_use, now=None):
+    """Per key: (capacity, measured rate, sessions). The per-session rate of a key is its rate / sessions."""
+    out = {}
+    for n in names:
+        out[n] = (capacity(usage.get(n), now), (rates or {}).get(n), (in_use or {}).get(n, 0))
+    return out
+
+
+def per_session_rate(ld):
+    """Typical spend of one session: the average over keys with measured rate and sessions (None = unknown)."""
+    xs = [r / k for c, r, k in ld.values() if r is not None and k > 0]
+    return sum(xs) / len(xs) if xs else None
+
+
+def ratio(c, r, k, sess_rate, extra=0):
+    """Load ratio of a key with `extra` more sessions: spend / sustainable spend. Lower is better."""
+    if c is None:
+        return None
+    spend = (r if r is not None else (k * sess_rate if sess_rate else 0.0)) + extra * (sess_rate or 0.0)
+    if c <= 0:
+        return float("inf")
+    return spend / c
+
+
+def usable(n, usage, exhausted, avoid):
+    if n in avoid or n in exhausted:
+        return False
+    u = usage.get(n)
+    if isinstance(u, dict) and u.get("error"):
+        return False                    # the usage API says the key is invalid / disabled
+    w = week_window(u)
+    return not (w and isinstance(w.get("percent"), (int, float)) and w["percent"] >= 100)
+
+
+def pick_key(names, usage, exhausted=(), in_use=None, avoid=(), rates=None, now=None):
+    """Key for one more session: the one whose 7-day load ratio is lowest after adding it (keeps all keys
+    burning at the same relative pace). Without usage data: fewest sessions. Then config order."""
     in_use = in_use or {}
+    ld = loads(names, usage, rates, in_use, now)
+    sr = per_session_rate(ld) or 1.0
     best = None
     for i, n in enumerate(names):
-        if n in avoid or n in exhausted:
+        if not usable(n, usage, exhausted, avoid):
             continue
-        u = usage.get(n)
-        if isinstance(u, dict) and u.get("error"):
-            continue                    # the usage API says the key is invalid / disabled
-        pct = usage_percent(u)
-        if pct is not None and pct >= 100:
-            continue
-        score = (pct if pct is not None else 50.0, in_use.get(n, 0), i)
+        c, r, k = ld[n]
+        q = ratio(c, r, k, sr, extra=1)
+        score = (0 if q is not None else 1, q if q is not None else 0.0, k, i)
         if best is None or score < best[0]:
             best = (score, n)
     return best[1] if best else None
 
 
-def should_rebalance(cur, names, usage, exhausted=(), in_use=None):
-    """least_used, between turns: a better key when the current one is nearly spent (else None)."""
-    pct = usage_percent(usage.get(cur))
-    if pct is None or pct < REBALANCE_AT:
+def should_rebalance(cur, names, usage, exhausted=(), in_use=None, rates=None, now=None, gain=0.2):
+    """Between turns: another key for one session on `cur` when moving it lowers the higher of the two
+    load ratios by at least `gain` (20 %). None = stay. Needs 7-day usage on both keys."""
+    in_use = in_use or {}
+    ld = loads(names, usage, rates, in_use, now)
+    if cur not in ld or ld[cur][0] is None:
         return None
-    alt = pick_key(names, usage, exhausted, in_use, avoid=(cur,))
-    alt_pct = usage_percent(usage.get(alt)) if alt else None
-    return alt if alt and alt_pct is not None and alt_pct <= REBALANCE_TO else None
+    sr = per_session_rate(ld)
+    if not sr:
+        return None
+    c0, r0, k0 = ld[cur]
+    before_cur = ratio(c0, r0, k0, sr)
+    after_cur = ratio(c0, r0, k0, sr, extra=-1)
+    best = None
+    for n in names:
+        if n == cur or not usable(n, usage, exhausted, ()):
+            continue
+        c, r, k = ld[n]
+        if c is None:
+            continue
+        before = max(before_cur, ratio(c, r, k, sr))
+        after = max(after_cur, ratio(c, r, k, sr, extra=1))
+        if before > 0 and after <= before * (1 - gain) and (best is None or after < best[0]):
+            best = (after, n)
+    return best[1] if best else None

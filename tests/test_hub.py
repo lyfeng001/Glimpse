@@ -509,27 +509,66 @@ def test_cli_token_only_from_localhost(hub_mod):
     assert hub.authed(Req("100.64.1.2")) is False                 # over Tailscale the file token is useless
 
 
-def test_keybalance_pick_and_fatal():
+def _wk(limit, used, days_left, now=1000.0, ts=None, pct=None):
+    """usage dict with one 7-day window"""
+    return {"ts": now if ts is None else ts, "windows": [{"window_sec": 18000, "percent": 10, "limit": 100, "used": 10, "reset_at": now + 3600},
+                                         {"window_sec": 604800, "limit": limit, "used": used, "reset_at": now + days_left * 86400,
+                                          "percent": pct if pct is not None else 100.0 * used / limit}]}
+
+
+def test_keybalance_capacity_and_rates():
     import keybalance as KB
-    u = {"k1": {"ts": 1, "windows": [{"percent": 100}]},           # spent
-         "k2": {"ts": 1, "windows": [{"percent": 40}, {"percent": 70}]},
-         "k3": {"ts": 1, "windows": [{"percent": 20}]},
-         "k4": {"ts": 1, "error": "Key 无效或已停用"}}
-    names = ["k1", "k2", "k3", "k4", "k5"]
-    assert KB.pick_key(names, u) == "k3"
-    assert KB.pick_key(names, u, exhausted={"k3": 1}) == "k5"          # unknown usage counts as 50 %
-    assert KB.pick_key(names, u, avoid=("k3", "k5")) == "k2"
-    assert KB.pick_key(["k1", "k4"], u) is None
-    assert KB.pick_key(["a", "b"], {}, in_use={"a": 2}) == "b"          # no usage data: fewest sessions
+    now = 1000.0
+    # 70 left, 7 days to the reset -> 10 per day
+    assert abs(KB.capacity(_wk(100, 30, 7), now) - 70 / (7 * 86400)) < 1e-12
+    assert KB.capacity({"ts": 1, "windows": [{"window_sec": 18000, "limit": 1, "used": 0}]}, now) is None   # 5 h only
+    t = KB.RateTracker()
+    t.observe("a", _wk(100, 10, 7, ts=0))
+    t.observe("a", _wk(100, 13, 7, ts=300))            # 3 per 300 s
+    assert abs(t.rate["a"] - 0.01) < 1e-12
+    t.observe("a", _wk(100, 1, 7, ts=600))             # window reset: rate starts over
+    assert "a" not in t.rate
+
+
+def test_keybalance_pick_equalises_burn_rate():
+    import keybalance as KB
+    now = 1000.0
+    # same burn rate, but k2 has much more left: the new session goes to k2 even though k2 used more in absolute terms
+    u = {"k1": _wk(100, 80, 3, now), "k2": _wk(1000, 300, 3, now)}
+    rates = {"k1": 0.001, "k2": 0.001}
+    assert KB.pick_key(["k1", "k2"], u, in_use={"k1": 1, "k2": 1}, rates=rates, now=now) == "k2"
+    # a key spent on the 7-day window or flagged invalid is never picked; the 5 h window does not matter here
+    u["k3"] = _wk(100, 100, 3, now)
+    u["k4"] = {"ts": 1, "error": "Key 无效或已停用"}
+    u["k5"] = _wk(500, 10, 3, now)
+    u["k5"]["windows"][0]["percent"] = 100                # 5 h full: left to on_exhausted
+    assert KB.pick_key(["k3", "k4", "k5"], u, now=now) == "k5"
+    assert KB.pick_key(["k3", "k4"], u, now=now) is None
+    # no usage data at all: fewest sessions, then order
+    assert KB.pick_key(["a", "b"], {}, in_use={"a": 2}) == "b"
+
+
+def test_keybalance_rebalance_only_when_it_helps():
+    import keybalance as KB
+    now = 1000.0
+    u = {"k1": _wk(100, 90, 3, now), "k2": _wk(100, 10, 3, now)}
+    # k1: 10 left, 3 sessions burning; k2: 90 left, 1 session -> moving one session lowers the max load a lot
+    rates = {"k1": 3e-4, "k2": 1e-4}
+    assert KB.should_rebalance("k1", ["k1", "k2"], u, in_use={"k1": 3, "k2": 1}, rates=rates, now=now) == "k2"
+    # balanced already: stay
+    u2 = {"k1": _wk(100, 50, 3, now), "k2": _wk(100, 50, 3, now)}
+    assert KB.should_rebalance("k1", ["k1", "k2"], u2, in_use={"k1": 1, "k2": 1}, rates={"k1": 1e-4, "k2": 1e-4}, now=now) is None
+    # no measured rates yet: no move
+    assert KB.should_rebalance("k1", ["k1", "k2"], u, in_use={"k1": 3, "k2": 1}, now=now) is None
+
+
+def test_keybalance_fatal_and_exhausted():
+    import keybalance as KB
     for t in ("API Error: 500 Key余额不足，无法完成当前操作", 'unexpected status 666: {"code":40111,"code_msg":"API KEY 权限验证失败"}',
               "Invalid API key · Please run /login", "insufficient_quota"):
         assert KB.is_key_fatal(t), t
     for t in ("stream disconnected before completion", "prompt is too long: 210000 tokens", "exit code 1", "429 rate limit"):
         assert not KB.is_key_fatal(t), t
-    assert KB.should_rebalance("k2", names, u) is None                  # 70 % is still fine
-    u["k2"]["windows"][1]["percent"] = 95
-    assert KB.should_rebalance("k2", names, u) == "k3"
-    # an exhausted mark goes away when the usage shows room again, or after the TTL
     assert KB.live_exhausted({"k3": 5}, {"k3": {"ts": 9, "windows": [{"percent": 10}]}}, now=10) == {}
     assert KB.live_exhausted({"k2": 5}, {}, now=10) == {"k2": 5}
     assert KB.live_exhausted({"k2": 5}, {}, now=5 + KB.EXHAUSTED_TTL + 1) == {}
@@ -599,6 +638,8 @@ def test_least_used_picks_key_for_new_sessions(hub_mod):
     cfg["keys"]["profiles"] = [{"name": "k1", "value": "v1"}, {"name": "k2", "value": "v2"}]
     cfg["keys"]["balance"] = {"mode": "least_used", "exclude": []}
     h = server.Hub(cfg)
-    h.key_usage = {"k1": {"ts": 1, "windows": [{"percent": 80}]}, "k2": {"ts": 1, "windows": [{"percent": 10}]}}
+    import time as _t
+    now = _t.time()
+    h.key_usage = {"k1": _wk(100, 80, 3, now), "k2": _wk(100, 10, 3, now)}
     assert h.best_key() == "k2"
     assert h.balance_view() == {"mode": "least_used", "exclude": [], "usage": False}

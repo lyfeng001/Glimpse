@@ -238,6 +238,8 @@ class Hub:
         self.key_usage_wake = asyncio.Event()
         self.key_exhausted = {}    # key name -> time it ran out / was rejected (balancing skips it a while)
         self.key_swaps = {}        # (machine, sid) -> times of automatic swaps (loop guard)
+        self.key_rates = KB.RateTracker()   # measured 7-day spend rate per key (from successive usage polls)
+        self.key_moved = {}        # (machine, sid) -> last balancing move
         self.bg = []
         for mc in cfg.get("machines", []):
             if mc.get("enabled", True) is False:
@@ -324,7 +326,8 @@ class Hub:
 
     def best_key(self, avoid=()):
         self.key_exhausted = KB.live_exhausted(self.key_exhausted, self.key_usage)
-        return KB.pick_key(KB.pool(self.cfg), self.key_usage, self.key_exhausted, self.keys_in_use(), avoid)
+        return KB.pick_key(KB.pool(self.cfg), self.key_usage, self.key_exhausted, self.keys_in_use(), avoid,
+                           rates=self.key_rates.rate)
 
     async def balance_on_event(self, m, sid, ev):
         """An error event: when the session's key ran out / was rejected, switch it to another key (live when
@@ -379,9 +382,13 @@ class Hub:
         cur = s.get("key")
         if KB.mode_of(self.cfg) != "least_used" or not s.get("hot_key") or not cur or cur not in KB.pool(self.cfg):
             return
+        if time.time() - self.key_moved.get((m.id, sid), 0) < KB.REBALANCE_GAP:
+            return
         self.key_exhausted = KB.live_exhausted(self.key_exhausted, self.key_usage)
-        new = KB.should_rebalance(cur, KB.pool(self.cfg), self.key_usage, self.key_exhausted, self.keys_in_use())
+        new = KB.should_rebalance(cur, KB.pool(self.cfg), self.key_usage, self.key_exhausted, self.keys_in_use(),
+                                  rates=self.key_rates.rate)
         if new and await self.switch_key(m, sid, s.get("kind"), new):
+            self.key_moved[(m.id, sid)] = time.time()
             log.info("%s/%s: key %s -> %s (balancing)", m.id, sid, cur, new)
 
     async def fetch_key_usage(self, value):
@@ -463,6 +470,7 @@ class Hub:
             for p in list(self.cfg["keys"].get("profiles") or []):
                 if p.get("name") and p.get("value"):
                     self.key_usage[p["name"]] = await self.fetch_key_usage(p["value"])
+                    self.key_rates.observe(p["name"], self.key_usage[p["name"]])
                     self.state_dirty.set()
             self.key_usage_wake.clear()
             try:

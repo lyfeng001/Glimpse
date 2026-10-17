@@ -19,7 +19,11 @@ DEFAULTS = {
             "push_subject": "mailto:glimpse@users.noreply.github.com", "approval_wait_seconds": 600},
     # usage_url: optional key-usage API (POST <url>/limit and /summary with the key as Bearer),
     # e.g. "https://api.funcloud.ai/v1/model/key-usage"; empty = no usage shown
-    "keys": {"env": {"claude": "ANTHROPIC_AUTH_TOKEN", "codex": "OPENAI_API_KEY"}, "profiles": [], "usage_url": ""},
+    # balance (optional, off by default): "off" | "on_exhausted" (a session whose key runs out of balance / is
+    # rejected switches to another key and continues) | "least_used" (also: new sessions without a chosen key
+    # get the least used one, busy keys are moved off between turns). exclude: key names never picked.
+    "keys": {"env": {"claude": "ANTHROPIC_AUTH_TOKEN", "codex": "OPENAI_API_KEY"}, "profiles": [], "usage_url": "",
+             "balance": {"mode": "off", "exclude": []}},
     "machines": [{"id": "M1", "name": "this-mac", "type": "local", "default_cwd": "~"}],
     # optional persistent memory through AMem (https://github.com/lyfeng001/AMem), off by default.
     # python: an interpreter with agent-memory-local[mcp] installed (per machine: machines[].memory.python);

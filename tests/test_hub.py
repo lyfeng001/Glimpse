@@ -507,3 +507,98 @@ def test_cli_token_only_from_localhost(hub_mod):
             self.headers = {"Authorization": "Bearer " + hub.token}
     assert hub.authed(Req("127.0.0.1")) is True
     assert hub.authed(Req("100.64.1.2")) is False                 # over Tailscale the file token is useless
+
+
+def test_keybalance_pick_and_fatal():
+    import keybalance as KB
+    u = {"k1": {"ts": 1, "windows": [{"percent": 100}]},           # spent
+         "k2": {"ts": 1, "windows": [{"percent": 40}, {"percent": 70}]},
+         "k3": {"ts": 1, "windows": [{"percent": 20}]},
+         "k4": {"ts": 1, "error": "Key 无效或已停用"}}
+    names = ["k1", "k2", "k3", "k4", "k5"]
+    assert KB.pick_key(names, u) == "k3"
+    assert KB.pick_key(names, u, exhausted={"k3": 1}) == "k5"          # unknown usage counts as 50 %
+    assert KB.pick_key(names, u, avoid=("k3", "k5")) == "k2"
+    assert KB.pick_key(["k1", "k4"], u) is None
+    assert KB.pick_key(["a", "b"], {}, in_use={"a": 2}) == "b"          # no usage data: fewest sessions
+    for t in ("API Error: 500 Key余额不足，无法完成当前操作", 'unexpected status 666: {"code":40111,"code_msg":"API KEY 权限验证失败"}',
+              "Invalid API key · Please run /login", "insufficient_quota"):
+        assert KB.is_key_fatal(t), t
+    for t in ("stream disconnected before completion", "prompt is too long: 210000 tokens", "exit code 1", "429 rate limit"):
+        assert not KB.is_key_fatal(t), t
+    assert KB.should_rebalance("k2", names, u) is None                  # 70 % is still fine
+    u["k2"]["windows"][1]["percent"] = 95
+    assert KB.should_rebalance("k2", names, u) == "k3"
+    # an exhausted mark goes away when the usage shows room again, or after the TTL
+    assert KB.live_exhausted({"k3": 5}, {"k3": {"ts": 9, "windows": [{"percent": 10}]}}, now=10) == {}
+    assert KB.live_exhausted({"k2": 5}, {}, now=10) == {"k2": 5}
+    assert KB.live_exhausted({"k2": 5}, {}, now=5 + KB.EXHAUSTED_TTL + 1) == {}
+
+
+class _M:
+    """Machine stub: records calls, answers restart like an agent that can swap live."""
+    id, name = "M1", "mac"
+
+    def __init__(self, hot=True):
+        self.sessions = {"s1": {"sid": "s1", "kind": "codex", "key": "k1", "status": "error", "hot_key": hot}}
+        self.calls, self.writes, self.hot = [], [], hot
+
+    async def call(self, obj, timeout=20):
+        self.calls.append(obj)
+        return {"t": "restarted", "hot": self.hot}
+
+    def write(self, obj):
+        self.writes.append(obj)
+
+
+def test_balance_swaps_key_on_no_balance(hub_mod, monkeypatch):
+    import asyncio
+    C, server = hub_mod
+    cfg = C.load()
+    cfg["keys"]["profiles"] = [{"name": "k1", "value": "v1"}, {"name": "k2", "value": "v2"}, {"name": "k3", "value": "v3"}]
+    cfg["keys"]["env"]["codex"] = "V_API_KEY"
+    h = server.Hub(cfg)
+    m = _M()
+    ev = {"kind": "error", "title": "出错停止", "body": "unexpected status 666: Key余额不足，无法完成当前操作"}
+
+    async def run(e):
+        return await h.balance_on_event(m, "s1", e)
+    assert asyncio.run(run(ev)) is None                                 # mode off: nothing happens
+    cfg["keys"]["balance"] = {"mode": "on_exhausted", "exclude": ["k2"]}
+    sleeps = []
+
+    async def no_sleep(t):
+        sleeps.append(t)
+    monkeypatch.setattr(server.asyncio, "sleep", no_sleep)
+
+    async def run2():
+        out = await h.balance_on_event(m, "s1", ev)
+        await asyncio.gather(*[t for t in asyncio.all_tasks() if t is not asyncio.current_task()])
+        return out
+    out = asyncio.run(run2())
+    assert out["kind"] == "keyswap" and "k1" in out["title"] and "k3" in out["title"]      # k2 excluded
+    assert m.calls[-1]["op"] == "restart" and m.calls[-1]["key"] == "k3" and m.calls[-1]["env"] == {"V_API_KEY": "v3"}
+    assert m.writes[-1] == {"op": "text", "sid": "s1", "text": "继续"} and sleeps[0] == 5      # hot swap: wait for claude
+    assert "k1" in h.key_exhausted and any(k.get("exhausted") for k in h.keys_view() if k["name"] == "k1")
+    # a transient error is not the key's fault
+    n = len(m.calls)
+    assert asyncio.run(run({"kind": "error", "title": "出错停止", "body": "stream disconnected"})) is None and len(m.calls) == n
+    # the loop guard stops after SWAP_LIMIT swaps
+    h.key_exhausted.clear()
+    m.sessions["s1"]["key"] = "k3"
+    for _ in range(5):
+        out = asyncio.run(run2())
+        m.sessions["s1"]["key"] = m.calls[-1]["key"]
+        h.key_exhausted.clear()
+    assert "请手动处理" in out["title"]
+
+
+def test_least_used_picks_key_for_new_sessions(hub_mod):
+    C, server = hub_mod
+    cfg = C.load()
+    cfg["keys"]["profiles"] = [{"name": "k1", "value": "v1"}, {"name": "k2", "value": "v2"}]
+    cfg["keys"]["balance"] = {"mode": "least_used", "exclude": []}
+    h = server.Hub(cfg)
+    h.key_usage = {"k1": {"ts": 1, "windows": [{"percent": 80}]}, "k2": {"ts": 1, "windows": [{"percent": 10}]}}
+    assert h.best_key() == "k2"
+    assert h.balance_view() == {"mode": "least_used", "exclude": [], "usage": False}

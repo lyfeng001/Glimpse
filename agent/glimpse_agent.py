@@ -628,7 +628,7 @@ def private_dir():
     return _PRIV
 
 
-def prepare_claude_argv(argv, sid, sdir, env_extra=None, approval_wait=600, allow=None):
+def prepare_claude_argv(argv, sid, sdir, env_extra=None, approval_wait=600, allow=None, key_file=None):
     """Merge our hooks into the --settings file the user launches claude with.
 
     claude only honours the last --settings flag, so the user's file (which carries
@@ -665,6 +665,13 @@ def prepare_claude_argv(argv, sid, sdir, env_extra=None, approval_wait=600, allo
     if env_extra:
         # settings env wins over the process env in claude, so a key swap must go here too
         merged["env"] = dict(merged.get("env") or {}, **env_extra)
+    if key_file:
+        # hot key: claude asks apiKeyHelper (every CLAUDE_HELPER_TTL_MS) instead of using a fixed token, so the
+        # key can be swapped by rewriting key_file. A token in env would take precedence: drop it.
+        e = {k: v for k, v in (merged.get("env") or {}).items() if k not in CLAUDE_KEY_VARS}
+        e["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"] = CLAUDE_HELPER_TTL_MS
+        merged["env"] = e
+        merged["apiKeyHelper"] = "cat " + shlex.quote(key_file)
     # always a 0600 file: the settings may carry API tokens and argv is world-readable via ps
     path = os.path.join(sdir or private_dir(), "claude-%s.json" % sid)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -1208,6 +1215,7 @@ class Session:
         self.last_key = None
         self.killed = False
         self.env = {}                  # extra env (API key swaps); never sent to clients
+        self.key_file = None           # hot key: 0600 file the process reads the key from (None = env / settings)
         self.key = None                # key profile name shown in the UI
         self.agent_session_id = None   # claude session id / codex thread id, for resume
         self.restarts = 0
@@ -1276,7 +1284,8 @@ class Session:
                 "question": self.question, "agent_session_id": self.agent_session_id,
                 "can_resume": bool(self.agent_session_id) and self.kind in ("claude", "codex"),
                 "key": self.key, "restarts": self.restarts, "auto_continue": self.auto_continue, "ac_count": self.ac_count, "mode": self.mode(), "overrides": dict(self.overrides),
-                "memory": self.memory_project, "menu": self.menu}
+                "memory": self.memory_project, "hot_key": bool(self.key_file) and self.fd is not None,
+                "menu": self.menu}
 
     def touch(self):
         self.dirty = True
@@ -1306,6 +1315,46 @@ class Session:
             argv = argv[:1] + CODEX_FLAGS + argv[1:]
         return argv
 
+    def hot_key_setup(self, argv):
+        """Before spawn: can this session's key be swapped live? Then write the key file and return
+        (env vars to remove, extra codex argv). None: classic env / settings key (a swap restarts)."""
+        self.key_file = None
+        if len(self.env) != 1 or self.kind not in ("claude", "codex"):
+            return None
+        var, value = next(iter(self.env.items()))
+        tmpl = []
+        if self.kind == "claude":
+            if var not in CLAUDE_KEY_VARS:
+                return None
+            drop = CLAUDE_KEY_VARS
+        else:
+            tmpl = codex_hot_provider(argv, var)
+            if tmpl is None:
+                return None
+            drop = (var,)
+        path = os.path.join(self.d.sdir or private_dir(), "key-%s" % self.sid)
+        try:
+            write_private(path, value)
+        except OSError:
+            return None
+        self.key_file = path
+        return drop, [a.replace("{KEYFILE}", path) for a in tmpl]
+
+    def swap_key(self, env, key):
+        """Change the API key of the running process without a restart. False: not possible (restart instead)."""
+        if self.fd is None or not self.key_file or not env or len(env) != 1 or set(env) != set(self.env):
+            return False
+        try:
+            write_private(self.key_file, next(iter(env.values())))
+        except OSError:
+            return False
+        self.env, self.key = dict(env), key
+        it = self.add_chat("system", "—— 已切换到 %s（无需重启）——" % (key or "新 key"))
+        if it:
+            self.d.send_subs(self, {"t": "chat", "sid": self.sid, "items": [it]})
+        self.touch()
+        return True
+
     def spawn(self, resume=False):
         env = {k: v for k, v in os.environ.items() if not k.startswith(STRIP_ENV)}
         env.update({"TERM": "xterm-256color", "COLORTERM": "truecolor", "GLIMPSE_SID": self.sid,
@@ -1313,16 +1362,23 @@ class Session:
                     "GLIMPSE_APPROVAL_WAIT": str(int(self.d.approval_wait))})
         if "LANG" not in env:
             env["LANG"] = "en_US.UTF-8" if sys.platform == "darwin" else "C.UTF-8"
-        if self.kind != "claude":
-            env.update(self.env)     # codex: export OPENAI_API_KEY=... ; claude: key goes into the settings file only
         argv = self.launch_argv(resume)
+        hot = self.hot_key_setup(argv)   # -> (env var the key replaces, extra argv) or None
+        if self.kind != "claude" and not hot:
+            env.update(self.env)     # codex: export OPENAI_API_KEY=... ; claude: key goes into the settings file only
+        if hot:
+            for v in hot[0]:
+                env.pop(v, None)
+            if self.kind == "codex":
+                argv = argv[:1] + hot[1] + argv[1:]
         self.d.memory.attach(self)
         if self.kind == "codex" and argv:
             argv = argv[:1] + self.d.memory.codex_args(self) + argv[1:]
         if self.kind == "claude":
             argv = argv[:1] + self.d.memory.claude_args(self) + argv[1:] if argv else argv
-            argv, self.settings_file = prepare_claude_argv(argv, self.sid, self.d.sdir, self.env,
-                                                           self.d.approval_wait, self.d.memory.claude_allow(self))
+            argv, self.settings_file = prepare_claude_argv(argv, self.sid, self.d.sdir, None if hot else self.env,
+                                                           self.d.approval_wait, self.d.memory.claude_allow(self),
+                                                           key_file=self.key_file if hot else None)
         shell = env.get("SHELL")
         if not shell:
             try:
@@ -1335,7 +1391,12 @@ class Session:
             # login+interactive shell so PATH/aliases match the user's terminal; key env is exported again
             # after the rc files ran (a `export OPENAI_API_KEY=...` in ~/.bashrc must not override the chosen key)
             pre = ""
-            if self.kind != "claude":
+            if hot:
+                # an `export ANTHROPIC_AUTH_TOKEN=...` / `export V_API_KEY=...` in the rc files would win over the key file
+                pre += "".join("unset %s; " % v for v in hot[0])
+            if self.kind == "codex" and hot:
+                pass
+            elif self.kind != "claude":
                 for k in self.env:
                     if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", k):
                         env["GLIMPSE_KEY_" + k] = self.env[k]
@@ -1492,7 +1553,11 @@ class Session:
         return False
 
     def restart(self, env, key, resume, done):
-        """Kill the process, swap env (API key), start again (optionally resuming the conversation)."""
+        """Kill the process, swap env (API key), start again (optionally resuming the conversation).
+        A key change on a session that reads its key from a file is applied live instead (no restart)."""
+        if env is not None and resume and self.swap_key(env, key):
+            done(None)
+            return
         if env is not None:
             self.env = dict(env)
             self.key = key
@@ -1624,6 +1689,12 @@ class Session:
             except OSError:
                 pass
             self.settings_file = None
+        if self.key_file:
+            try:
+                os.unlink(self.key_file)
+            except OSError:
+                pass
+            self.key_file = None
         if self.restart_req:
             self.poll_tail()
             resume, done = self.restart_req
@@ -1931,6 +2002,81 @@ class Session:
                 self.event("error", "出错停止: %s" % err, det or ev.get("last_assistant_message") or "")
         self.poll_tail()
         return wait
+
+
+# --------------------------------------------------------------------------- hot key swap
+# The API key of a claude / codex session can change without restarting it: the process reads the key from a
+# per-session 0600 file on each refresh (claude: settings apiKeyHelper; codex: provider auth.command), and a
+# swap only rewrites that file. Sessions where this is impossible keep the env / settings key and restart.
+
+CLAUDE_KEY_VARS = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+CLAUDE_HELPER_TTL_MS = "3000"     # claude re-runs the helper this often (it serves the old key once more)
+CODEX_AUTH_REFRESH_MS = 2000
+TOML_KEY_RE = re.compile(r'^\s*("[^"]+"|[A-Za-z0-9_.-]+)\s*=\s*(.+?)\s*$')
+
+
+def toml_tables(text):
+    """Tiny TOML reader for codex's config.toml: {table path: {key: raw value text}} ("" = top level).
+    Only single-line values (all codex provider settings are); anything else is skipped."""
+    out, cur = {"": {}}, ""
+    for ln in text.splitlines():
+        s = ln.strip()
+        # drop a trailing comment outside quotes: `wire_api = "responses"  # note`
+        m = re.match(r'^((?:[^"#]|"(?:[^"\\]|\\.)*")*)#', s)
+        if m:
+            s = m.group(1).strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("[") and s.endswith("]") and not s.startswith("[["):
+            cur = s[1:-1].strip()
+            out.setdefault(cur, {})
+            continue
+        m = TOML_KEY_RE.match(s)
+        if m:
+            out.setdefault(cur, {})[m.group(1).strip('"')] = m.group(2)
+    return out
+
+
+def codex_hot_provider(argv, key_var):
+    """-c args that clone the active codex provider without env_key, reading the token from the key file
+    (placeholder "{KEYFILE}"); None when the active provider is not the one whose env_key we inject."""
+    if any(a in ("-p", "--profile") or a.startswith("--profile=") for a in argv) or \
+            any(a.replace(" ", "").startswith(("model_provider=", "model_providers.")) for a in argv):
+        return None                    # the user steers providers on the command line: leave it alone
+    home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    try:
+        with open(os.path.join(home, "config.toml"), errors="replace") as f:
+            t = toml_tables(f.read())
+    except OSError:
+        return None
+    pid = (t[""].get("model_provider") or "").strip().strip('"')
+    sect = t.get("model_providers." + pid) or t.get('model_providers."%s"' % pid)
+    if not pid or not sect or "base_url" not in sect or sect.get("env_key", "").strip('"') != key_var \
+            or not re.match(r"^[A-Za-z0-9_-]+$", pid):
+        return None
+    new = pid + "-glimpse"
+    args = ["-c", 'model_provider="%s"' % new]
+    for k, v in sect.items():
+        if k not in ("env_key", "env_key_instructions", "experimental_bearer_token", "requires_openai_auth") \
+                and re.match(r"^[A-Za-z0-9_]+$", k):
+            args += ["-c", "model_providers.%s.%s=%s" % (new, k, v)]
+    for sub, vals in t.items():           # e.g. [model_providers.x.http_headers]
+        pre = "model_providers.%s." % pid
+        if sub.startswith(pre) and sub[len(pre):] not in ("auth",) and re.match(r"^[A-Za-z0-9_]+$", sub[len(pre):]):
+            for k, v in vals.items():
+                if re.match(r"^[A-Za-z0-9_-]+$", k):
+                    args += ["-c", "model_providers.%s.%s.%s=%s" % (new, sub[len(pre):], k, v)]
+    args += ["-c", 'model_providers.%s.auth.command="/bin/cat"' % new,
+             "-c", "model_providers.%s.auth.args=[\"{KEYFILE}\"]" % new,
+             "-c", "model_providers.%s.auth.refresh_interval_ms=%d" % (new, CODEX_AUTH_REFRESH_MS)]
+    return args
+
+
+def write_private(path, data):
+    fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(data)
+    os.replace(path + ".tmp", path)
 
 
 # --------------------------------------------------------------------------- auto-continue
@@ -3202,9 +3348,12 @@ class Daemon:
                 if env is not None and not isinstance(env, dict):
                     raise RuntimeError("bad env")
 
-                def done(err, c=c, req=req, sid=sid):
+                n0 = s.restarts
+
+                def done(err, c=c, req=req, sid=sid, n0=n0):
+                    # hot: the key was swapped in the running process (no restart happened)
                     self.send(c, {"t": "error", "req": req, "sid": sid, "msg": err} if err else
-                              {"t": "restarted", "req": req, "sid": sid})
+                              {"t": "restarted", "req": req, "sid": sid, "hot": s.restarts == n0})
                 s.restart(env, m.get("key"), bool(m.get("resume", True)), done)
             else:
                 self.send(c, {"t": "error", "req": req, "msg": "unknown op %r" % op})

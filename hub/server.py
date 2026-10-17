@@ -20,6 +20,7 @@ from aiohttp import web
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config as C  # noqa: E402
 from auth import PAIR_TTL, Auth  # noqa: E402
+import keybalance as KB  # noqa: E402
 import webpush  # noqa: E402
 from machines import Machine  # noqa: E402
 
@@ -235,6 +236,8 @@ class Hub:
         self.http = None
         self.key_usage = {}        # key name -> {limits, today_tokens, ...} from keys.usage_url
         self.key_usage_wake = asyncio.Event()
+        self.key_exhausted = {}    # key name -> time it ran out / was rejected (balancing skips it a while)
+        self.key_swaps = {}        # (machine, sid) -> times of automatic swaps (loop guard)
         self.bg = []
         for mc in cfg.get("machines", []):
             if mc.get("enabled", True) is False:
@@ -300,8 +303,86 @@ class Hub:
                 u = self.key_usage.get(p["name"])
                 if u:
                     k["usage"] = u
+                if p["name"] in self.key_exhausted:
+                    k["exhausted"] = self.key_exhausted[p["name"]]
                 out.append(k)
         return out
+
+    # --- key balancing (keys.balance, optional)
+    def balance_view(self):
+        b = self.cfg["keys"].get("balance") or {}
+        return {"mode": KB.mode_of(self.cfg), "exclude": list(b.get("exclude") or []),
+                "usage": bool(self.cfg["keys"].get("usage_url"))}
+
+    def keys_in_use(self):
+        n = {}
+        for m in self.machines.values():
+            for s in m.sessions.values():
+                if s.get("key") and s.get("status") not in ("exited",):
+                    n[s["key"]] = n.get(s["key"], 0) + 1
+        return n
+
+    def best_key(self, avoid=()):
+        self.key_exhausted = KB.live_exhausted(self.key_exhausted, self.key_usage)
+        return KB.pick_key(KB.pool(self.cfg), self.key_usage, self.key_exhausted, self.keys_in_use(), avoid)
+
+    async def balance_on_event(self, m, sid, ev):
+        """An error event: when the session's key ran out / was rejected, switch it to another key (live when
+        the agent can, else restart + resume) and type 继续. Returns the event to show instead, or None."""
+        s = m.sessions.get(sid) or {}
+        cur = s.get("key")
+        if KB.mode_of(self.cfg) == "off" or ev.get("kind") != "error" or s.get("kind") not in ("claude", "codex") \
+                or not cur or cur not in KB.pool(self.cfg) or not KB.is_key_fatal("%s %s" % (ev.get("title"), ev.get("body"))):
+            return None
+        self.key_exhausted[cur] = time.time()
+        self.state_dirty.set()
+        t = time.time()
+        recent = [x for x in self.key_swaps.get((m.id, sid), []) if t - x < KB.SWAP_WINDOW]
+        if len(recent) >= KB.SWAP_LIMIT:
+            return dict(ev, title="%s 不可用，已自动换过 %d 次，请手动处理" % (cur, len(recent)))
+        new = self.best_key(avoid=(cur,))
+        if not new:
+            return dict(ev, title="%s 不可用，没有其他可用的 Key" % cur)
+        self.key_swaps[(m.id, sid)] = recent + [t]
+        hot = await self.switch_key(m, sid, s.get("kind"), new)
+        if hot is None:
+            return dict(ev, title="%s 不可用，切换到 %s 失败" % (cur, new))
+        asyncio.ensure_future(self.continue_after_swap(m, sid, hot))
+        return {"kind": "keyswap", "title": "%s 不可用，已切换到 %s 并继续" % (cur, new), "body": ev.get("body") or "",
+                "ts": ev.get("ts")}
+
+    async def switch_key(self, m, sid, kind, name):
+        """Give the session another key. True = swapped live, False = restarted + resumed, None = failed."""
+        try:
+            r = await m.call({"op": "restart", "sid": sid, "env": self.env_for(kind, name), "key": name, "resume": True},
+                             timeout=30)
+        except (ConnectionError, asyncio.TimeoutError, ValueError):
+            return None
+        return bool(r.get("hot")) if r.get("t") == "restarted" else None
+
+    async def continue_after_swap(self, m, sid, hot):
+        # claude serves its old key once more after the helper file changed; a restart needs the TUI ready
+        await asyncio.sleep(5 if hot else 3)
+        for _ in range(40):
+            s = m.sessions.get(sid) or {}
+            if s.get("status") in ("idle", "error") and not s.get("menu"):
+                break
+            await asyncio.sleep(1)
+        try:
+            m.write({"op": "text", "sid": sid, "text": "继续"})
+        except ConnectionError:
+            pass
+
+    async def balance_on_done(self, m, sid):
+        """least_used, between turns: move a session off a nearly spent key (only when it can be done live)."""
+        s = m.sessions.get(sid) or {}
+        cur = s.get("key")
+        if KB.mode_of(self.cfg) != "least_used" or not s.get("hot_key") or not cur or cur not in KB.pool(self.cfg):
+            return
+        self.key_exhausted = KB.live_exhausted(self.key_exhausted, self.key_usage)
+        new = KB.should_rebalance(cur, KB.pool(self.cfg), self.key_usage, self.key_exhausted, self.keys_in_use())
+        if new and await self.switch_key(m, sid, s.get("kind"), new):
+            log.info("%s/%s: key %s -> %s (balancing)", m.id, sid, cur, new)
 
     async def fetch_key_usage(self, value):
         """One key's quota + today's usage from keys.usage_url (a key-usage API like funcloud's:
@@ -409,7 +490,8 @@ class Hub:
         return out
 
     def state(self):
-        return {"t": "state", "hub": {"version": VERSION}, "keys": self.keys_view(), "options": self.options(),
+        return {"t": "state", "hub": {"version": VERSION}, "keys": self.keys_view(), "balance": self.balance_view(),
+                "options": self.options(),
                 "machines": [self.machines[k].info(self.presets_view(self.machines[k])) for k in self.order]}
 
     def on_machine_state(self, m):
@@ -465,6 +547,10 @@ class Hub:
             p.send(out)
 
     async def on_event(self, m, sid, ev):
+        if ev.get("kind") == "error":
+            ev = await self.balance_on_event(m, sid, ev) or ev
+        elif ev.get("kind") == "done":
+            asyncio.ensure_future(self.balance_on_done(m, sid))
         s = m.sessions.get(sid) or {}
         name = s.get("name") or sid
         title = "%s · %s" % (name, ev.get("title", ""))
@@ -519,6 +605,17 @@ class Hub:
             return
         if op == "key_usage":
             self.key_usage_wake.set()         # refresh now; the result arrives with the next state
+            return
+        if op == "key_balance":
+            mode, ex = msg.get("mode"), msg.get("exclude")
+            names = {x.get("name") for x in self.cfg["keys"].get("profiles") or []}
+            if mode not in KB.MODES or not isinstance(ex, list) or any(not isinstance(x, str) or x not in names for x in ex):
+                p.send({"t": "error", "op": op, "msg": "无效的均衡设置"})
+                return
+            self.cfg["keys"]["balance"] = {"mode": mode, "exclude": sorted(set(ex))}
+            C.save(self.cfg)
+            self.state_dirty.set()
+            p.send({"t": "key_balance_ok"})
             return
         if op == "visible":
             p.visible = bool(msg.get("v"))
@@ -639,6 +736,8 @@ class Hub:
         if resume_id is not None and (kind == "shell" or not isinstance(resume_id, str) or not RESUME_RE.match(resume_id)):
             raise ValueError("无效的会话 id")
         key = msg.get("key") or preset.get("key")
+        if kind != "shell" and not msg.get("key") and KB.mode_of(self.cfg) == "least_used":
+            key = self.best_key() or key       # "默认" = let the balancer choose
         env = self.env_for(kind, key) if key else None
         r = await m.call({"op": "create", "kind": kind, "cwd": msg.get("cwd") or m.cfg.get("default_cwd"),
                           "name": msg.get("name") or None, "args": argv or None, "env": env,
@@ -704,7 +803,7 @@ class Hub:
         r = await m.call({"op": "restart", "sid": sid, "env": env, "key": key,
                           "resume": bool(msg.get("resume", True))}, timeout=30)
         if r.get("t") == "restarted":
-            p.send({"t": "restarted", "m": m.id, "sid": sid})
+            p.send({"t": "restarted", "m": m.id, "sid": sid, "hot": bool(r.get("hot")), "key": key})
         else:
             p.send({"t": "error", "m": m.id, "sid": sid, "msg": r.get("msg") or "重启失败"})
 

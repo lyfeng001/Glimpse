@@ -445,6 +445,7 @@
         <p class="g-f">同一个 Key 同时用于 Claude 和 Codex（hub 会映射成对应的环境变量）。填写“保存为”后会出现在 Key 列表里。</p>
       </div>
       <div class="g-h"></div>
+      <div class="note-box" id="rs-hot-note" hidden><svg class="ic sm" aria-hidden="true"><use href="#i-check-c"/></svg><div>这个会话支持<b>直接切换 Key</b>：不会重启，当前对话和进行中的任务都不受影响。</div></div>
       <div class="group">
         <label class="cell" for="rs-resume"><span class="grow">恢复原对话<div class="sub" id="rs-resume-sub">重启后接着之前的上下文继续</div></span>
           <span class="switch"><input type="checkbox" id="rs-resume" role="switch" checked><i></i></span></label>
@@ -477,7 +478,8 @@
       <button type="button" class="cell" data-spage="mem" id="nav-mem" hidden><span class="cell-ic" style="background:#8E5CF7" aria-hidden="true"><svg class="ic"><use href="#i-sparkle"/></svg></span><span class="grow">记忆<div class="sub" id="nav-mem-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
     </div>
     <div class="group" style="margin-top:var(--s4)">
-      <button type="button" class="cell" data-spage="acct"><span class="cell-ic" style="background:#30B0C7" aria-hidden="true"><svg class="ic"><use href="#i-key"/></svg></span><span class="grow">账号与设备<div class="sub" id="nav-acct-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
+      <button type="button" class="cell" data-spage="keys2"><span class="cell-ic" style="background:#E5A50A" aria-hidden="true"><svg class="ic"><use href="#i-key"/></svg></span><span class="grow">Key<div class="sub" id="nav-keys2-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
+      <button type="button" class="cell" data-spage="acct"><span class="cell-ic" style="background:#30B0C7" aria-hidden="true"><svg class="ic"><use href="#i-shield"/></svg></span><span class="grow">账号与设备<div class="sub" id="nav-acct-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
       <button type="button" class="cell" id="btn-install"><span class="cell-ic" style="background:#0A84FF" aria-hidden="true"><svg class="ic"><use href="#i-phone"/></svg></span><span class="grow">添加到主屏幕<div class="sub" id="btn-install-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
     </div>
     <div class="g-h">关于</div>
@@ -539,6 +541,18 @@
   <div class="spage" data-page="mem" data-title="记忆" hidden>
     <div class="group" id="set-mem"></div>
     <p class="g-f" id="set-mem-f">同一个项目的所有 Claude Code / Codex 会话共享一份长期记忆（AMem）：助手会读取之前的结论，并把确认过的结论存下来。超过存储上限时，会先清理最旧的工具输出。</p>
+  </div>
+  <div class="spage" data-page="keys2" data-title="Key" hidden>
+    <div class="g-h">自动均衡</div>
+    <div class="group" id="kb-modes" role="radiogroup" aria-label="Key 均衡策略">
+      <button type="button" class="cell radio" role="radio" data-kb="off"><span class="grow">关闭<div class="sub">由你手动选择每个会话用哪个 Key</div></span></button>
+      <button type="button" class="cell radio" role="radio" data-kb="on_exhausted"><span class="grow">没余额时自动换<div class="sub">会话报余额不足或 Key 被拒绝时，换成另一个可用的 Key 并发送“继续”</div></span></button>
+      <button type="button" class="cell radio" role="radio" data-kb="least_used"><span class="grow">按用量分配<div class="sub">另外：新会话选“默认”时用用量最低的 Key；某个 Key 快用完时，在一轮结束后把会话换走</div></span></button>
+    </div>
+    <p class="g-f" id="kb-note"></p>
+    <div class="g-h">参与均衡的 Key</div>
+    <div class="group" id="kb-keys"></div>
+    <p class="g-f">关掉的 Key 不会被自动选中，但你仍然可以手动给会话指定它。支持直接切换的会话（Claude Code 和用自定义中转的 Codex）换 Key 时不重启，其他会话会重启并恢复对话。</p>
   </div>
   <div class="spage" data-page="acct" data-title="账号与设备" hidden>
     <div class="group">

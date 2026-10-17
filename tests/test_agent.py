@@ -1253,3 +1253,74 @@ def test_codex_menu_walk_refuses_while_busy():
     d.walk_menus = A.Daemon.walk_menus.__get__(d)
     A.Daemon.codex_set_model(d, s, "x", "low", out.append)
     assert out and out[0].startswith("会话") and d.typed == []
+
+
+def test_toml_tables_and_codex_hot_provider(tmp_path, monkeypatch):
+    home = tmp_path / "codex"
+    home.mkdir()
+    (home / "config.toml").write_text('''model = "gpt-x"
+model_provider = "relay"   # comment
+[model_providers.relay]
+name = "Relay"
+base_url = "https://relay.example/v1"
+env_key = "V_API_KEY"
+wire_api = "responses"
+request_max_retries = 0
+[model_providers.relay.http_headers]
+X-Team = "a#b"
+[projects."/x"]
+trust_level = "trusted"
+''')
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    t = A.toml_tables((home / "config.toml").read_text())
+    assert t[""]["model_provider"] == '"relay"' and t["model_providers.relay.http_headers"]["X-Team"] == '"a#b"'
+    args = A.codex_hot_provider(["codex", "--no-daemon"], "V_API_KEY")
+    pairs = [args[i + 1] for i in range(0, len(args), 2)]
+    assert pairs[0] == 'model_provider="relay-glimpse"'
+    assert 'model_providers.relay-glimpse.base_url="https://relay.example/v1"' in pairs
+    assert 'model_providers.relay-glimpse.http_headers.X-Team="a#b"' in pairs
+    assert not any("env_key" in p for p in pairs)
+    assert 'model_providers.relay-glimpse.auth.command="/bin/cat"' in pairs and any("{KEYFILE}" in p for p in pairs)
+    # a different key variable, an explicit provider / profile on the command line: not ours to rewrite
+    assert A.codex_hot_provider(["codex"], "OPENAI_API_KEY") is None
+    assert A.codex_hot_provider(["codex", "-p", "work"], "V_API_KEY") is None
+    assert A.codex_hot_provider(["codex", "-c", 'model_provider="x"'], "V_API_KEY") is None
+
+
+def test_hot_key_claude_settings_and_swap(tmp_path):
+    src = tmp_path / "s.json"
+    src.write_text(json.dumps({"env": {"ANTHROPIC_AUTH_TOKEN": "placeholder-old", "ANTHROPIC_BASE_URL": "https://relay"}}))
+    d, s = _session("claude")
+    d.sdir = str(tmp_path)
+    s.env = {"ANTHROPIC_AUTH_TOKEN": "placeholder-one"}
+    s.key = "key1"
+    hot = s.hot_key_setup(["claude", "--settings", str(src)])
+    assert hot and "ANTHROPIC_AUTH_TOKEN" in hot[0] and hot[1] == []
+    kf = s.key_file
+    assert open(kf).read() == "placeholder-one" and oct(os.stat(kf).st_mode & 0o777) == "0o600"
+    argv, path = A.prepare_claude_argv(["claude", "--settings", str(src)], "x1", str(tmp_path), None, key_file=kf)
+    merged = json.load(open(path))
+    raw = open(path).read()
+    assert "placeholder-one" not in raw and "placeholder-old" not in raw     # no token in the settings file
+    assert merged["apiKeyHelper"].endswith(kf) and merged["env"]["ANTHROPIC_BASE_URL"] == "https://relay"
+    assert merged["env"]["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"] == A.CLAUDE_HELPER_TTL_MS
+    # live swap rewrites the file; the process keeps running
+    s.fd = 7
+    assert s.swap_key({"ANTHROPIC_AUTH_TOKEN": "placeholder-two"}, "key2") is True
+    assert open(kf).read() == "placeholder-two" and s.key == "key2" and s.info()["hot_key"] is True
+    assert "已切换到 key2" in s.chat[-1]["text"]
+    assert s.swap_key({"OTHER": "x"}, "k") is False                  # a different variable: restart needed
+    # restart(env, key, resume=True) on a hot session swaps instead of restarting
+    out = []
+    s.restart({"ANTHROPIC_AUTH_TOKEN": "placeholder-three"}, "key3", True, out.append)
+    assert out == [None] and s.restarts == 0 and open(kf).read() == "placeholder-three"
+    # exit removes the key file
+    s.on_exit(0)
+    assert not os.path.exists(kf) and s.key_file is None
+
+
+def test_no_hot_key_without_a_glimpse_key():
+    d, s = _session("claude")
+    assert s.hot_key_setup(["claude"]) is None and s.key_file is None
+    s.env = {"SOMETHING_ELSE": "x"}
+    assert s.hot_key_setup(["claude"]) is None

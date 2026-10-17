@@ -532,7 +532,7 @@ function onMsg(m) {
           if (mc.stats.ts !== h.ts) { h.ts = mc.stats.ts; pushHist(h.rtt, mc.stats.rtt_ms || 0); pushHist(h.rx, mc.stats.rx_bps || 0); }
         }
       }
-      S.keys = m.keys || []; S.hub = m.hub || null; S.options = m.options || null; S.haveState = true;
+      S.keys = m.keys || []; S.balance = m.balance || null; S.hub = m.hub || null; S.options = m.options || null; S.haveState = true;
       renderHome();
       if (S.view) renderView();
       refreshOpenSheets();
@@ -557,7 +557,8 @@ function onMsg(m) {
       if (m.s) openSession(m.m, m.s.sid);
       break;
     }
-    case 'restarted': if (RS.active && RS.m === m.m && RS.sid === m.sid) rsDone(); break;
+    case 'restarted': if (RS.active && RS.m === m.m && RS.sid === m.sid) rsDone(m); break;
+    case 'key_balance_ok': toast('已保存', '', null, 'done'); break;
     case 'approved': if (isView(m)) { S.view.approving = null; S.view.cardSig = null; renderCard(); } break;
     case 'history': onHistory(m); break;
     case 'models': onModels(m, false); break;
@@ -569,7 +570,7 @@ function onMsg(m) {
     case 'machines_ok': mcSaved(); break;
     case 'event': {
       const here = isView(m) && document.visibilityState === 'visible';
-      if (!here) toast(m.title || (m.ev && m.ev.title) || 'Glimpse', m.ev && m.ev.body, () => openSession(m.m, m.sid), m.ev && m.ev.kind);
+      if (!here) toast(m.title || (m.ev && m.ev.title) || 'Glimpse', m.ev && m.ev.body, () => openSession(m.m, m.sid), m.ev && m.ev.kind === 'keyswap' ? 'done' : m.ev && m.ev.kind);
       break;
     }
     case 'error':
@@ -1509,7 +1510,7 @@ function fillNewDeps() {
   const ai = kind !== 'shell';
   $('#new-key-row').hidden = !ai || !S.keys.length;
   const def = mc && mc.presets && mc.presets[kind] && mc.presets[kind].key;
-  $('#new-key').innerHTML = '<option value="">默认' + (def ? '（' + esc(def) + '）' : '') + '</option>' +
+  $('#new-key').innerHTML = '<option value="">' + (kbState().mode === 'least_used' ? '自动（用量最低的 Key）' : '默认' + (def ? '（' + esc(def) + '）' : '')) + '</option>' +
     S.keys.map((k) => '<option value="' + esc(k.name) + '">' + esc(k.name) + (keyUsageText(k) ? '  ·  ' + esc(keyUsageText(k)) : '') + '</option>').join('');
   const rec = mc ? recentDirs(mc.id) : [];
   const cwd = $('#new-cwd');
@@ -1696,6 +1697,11 @@ function openRestart() {
   $('#rs-new').hidden = true; $('#rs-value').value = ''; $('#rs-save').value = '';
   const rz = $('#rs-resume'); rz.checked = !!s.can_resume; rz.disabled = !s.can_resume;
   $('#rs-resume-sub').textContent = s.can_resume ? '重启后接着之前的上下文继续' : '还没有可恢复的对话（会开始新对话）';
+  // a session that reads its key from a file switches keys live: no restart, the conversation goes on
+  RS.hot = !!s.hot_key;
+  $('#dlg-rs-title').textContent = RS.hot ? '切换 Key' : '更换 Key 并重启';
+  $('#rs-ok').textContent = RS.hot ? '切换' : '重启';
+  $('#rs-hot-note').hidden = !RS.hot;
   $('#rs-progress').hidden = true; $('#rs-err').textContent = ''; $('#rs-ok').disabled = false;
   setTimeout(() => openSheet($('#dlg-restart')), $('#dlg-more').open ? 230 : 0);
 }
@@ -1721,10 +1727,14 @@ $('#rs-form').addEventListener('submit', (e) => {
   setTimeout(() => { if (RS.active) rsSteps(1); }, 600);
   clearTimeout(RS.timer); RS.timer = setTimeout(() => { if (RS.active) rsFail('重启超时'); }, 40000);
 });
-function rsDone() {
+function rsDone(m) {
   clearTimeout(RS.timer); rsSteps(3); RS.active = false;
   $('#rs-value').value = '';
-  setTimeout(() => { closeSheet($('#dlg-restart')); toast('已重启', '进程已用新的配置重新启动', null, 'done'); }, 600);
+  const hot = m && m.hot;
+  setTimeout(() => {
+    closeSheet($('#dlg-restart'));
+    toast(hot ? '已切换到 ' + (m.key || '新 Key') : '已重启', hot ? '无需重启，下一次请求开始使用新 Key' : '进程已用新的配置重新启动', null, 'done');
+  }, hot ? 200 : 600);
 }
 function rsFail(msg) { clearTimeout(RS.timer); RS.active = false; $('#rs-ok').disabled = false; $('#rs-progress').hidden = true; $('#rs-err').textContent = msg || '重启失败'; }
 
@@ -2131,7 +2141,7 @@ async function renderSettings() {
   $('#opt-font').textContent = String(S.fontSize);
   $('#set-ver').textContent = APP_VERSION;
   $('#set-hubver').textContent = S.hub && S.hub.version ? S.hub.version : '—';
-  renderSettingsWidgets(); renderSettingsKeys(); renderSettingsMachines(); renderSettingsMemory(); renderAccount();
+  renderSettingsWidgets(); renderSettingsKeys(); renderSettingsMachines(); renderSettingsMemory(); renderKeyPage(); renderAccount();
   $('#btn-install-sub').textContent = standalone() ? '已作为 App 运行 ✓' : isIOS() ? 'Safari：分享 → 添加到主屏幕' : INST.prompt ? '可以直接安装' : '查看安装方法';
   renderSettingsNav();
   $('#set-push').textContent = await pushState();
@@ -2147,7 +2157,35 @@ function renderSettingsNav() {
   $('#nav-keys-sub').textContent = '按键栏 ' + keybar().length + ' 个键';
   $('#nav-machines-sub').textContent = S.machines.map((mc) => mc.id + (mc.online ? '' : ' 离线')).join(' · ');
   $('#nav-acct-sub').textContent = $('#acct-pw-sub').textContent === '已设置' ? '已设置密码' : '登录设备与密码';
+  $('#nav-keys2-sub').textContent = (S.keys || []).length + ' 个 · 均衡：' + KB_NAMES[kbState().mode];
 }
+// ---- Key page: optional balancing (keys.balance) + which keys take part
+const KB_NAMES = { off: '关闭', on_exhausted: '没余额时自动换', least_used: '按用量分配' };
+function kbState() { return S.balance || { mode: 'off', exclude: [], usage: false }; }
+function renderKeyPage() {
+  const b = kbState();
+  for (const el of $$('#kb-modes [data-kb]')) {
+    const on = el.dataset.kb === b.mode;
+    el.setAttribute('aria-checked', String(on));
+    const c = $('.chk', el); if (c) c.remove();
+    if (on) el.insertAdjacentHTML('beforeend', ic('check', 'chk on'));
+  }
+  $('#kb-note').textContent = b.mode === 'least_used' && !b.usage
+    ? '没有配置 keys.usage_url，看不到各 Key 的用量：会按每个 Key 上的会话数平均分配。' : '';
+  const keys = S.keys || [];
+  setHTML($('#kb-keys'), keys.length ? keys.map((k) => {
+    const inPool = !b.exclude.includes(k.name);
+    const ex = k.exhausted ? '<span class="tag" style="color:var(--c-err)">' + esc(ago(k.exhausted)) + '不可用</span> ' : '';
+    return '<label class="cell"><span class="grow">' + esc(k.name) + ' ' + ex + '<div class="sub">' + esc(keyUsageText(k) || '暂无用量数据') + '</div>' + keyUsageBars(k.usage) + '</span>' +
+      '<span class="switch"><input type="checkbox" role="switch" data-kbk="' + esc(k.name) + '"' + (inPool ? ' checked' : '') + ' aria-label="' + esc(k.name) + ' 参与均衡"><i></i></span></label>';
+  }).join('') : '<div class="cell"><span class="grow sub">config.json 里还没有 Key</span></div>');
+  for (const el of $$('#kb-keys [data-kbk]')) el.onchange = () => {
+    const cur = kbState(); const ex = new Set(cur.exclude);
+    if (el.checked) ex.delete(el.dataset.kbk); else ex.add(el.dataset.kbk);
+    send({ op: 'key_balance', mode: cur.mode, exclude: [...ex] });
+  };
+}
+for (const el of $$('#kb-modes [data-kb]')) el.onclick = () => send({ op: 'key_balance', mode: el.dataset.kb, exclude: kbState().exclude });
 function settingsPage(name, back) {
   const d = $('#dlg-settings'); const cur = $('.spage:not([hidden])', d); const next = $('.spage[data-page="' + name + '"]', d);
   if (!next || cur === next) return;
@@ -2316,7 +2354,10 @@ $('#acct-revoke-others').onclick = async () => {
 };
 
 function refreshOpenSheets() {
-  if ($('#dlg-settings').open) { renderSettingsMachines(); $('#set-hubver').textContent = S.hub && S.hub.version ? S.hub.version : '—'; }
+  if ($('#dlg-settings').open) {
+    renderSettingsMachines(); renderKeyPage(); renderSettingsNav();
+    $('#set-hubver').textContent = S.hub && S.hub.version ? S.hub.version : '—';
+  }
   if ($('#dlg-new').open) {
     const sel = $('#new-machine'); const cur = sel.value;
     for (const o of sel.options) { const m = S.byId[o.value]; if (m) o.disabled = !m.online; }

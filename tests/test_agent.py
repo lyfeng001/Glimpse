@@ -1158,3 +1158,98 @@ def test_memory_probe_reports_bound_projects(tmp_path, monkeypatch):
     mem.capture = lambda ss: None
     mem.attach(s)
     assert s.memory_project == "echo-sim"
+
+
+class MenuDaemon(FakeDaemon):
+    """Runs later() callbacks immediately in order; type_text records the command."""
+    def __init__(self):
+        FakeDaemon.__init__(self)
+        self.q, self.typed = [], []
+
+    def later(self, delay, fn):
+        self.q.append(fn)
+
+    def type_text(self, s, text):
+        self.typed.append(text)
+
+    def run(self, n=400):
+        while self.q and n:
+            self.q.pop(0)()
+            n -= 1
+
+
+def _codex_with_menus(menus):
+    """A codex session whose screen shows menus[k] after the k-th selection key."""
+    d = MenuDaemon()
+    s = A.Session(d, "s1", "codex", "n", "/", ["codex"], 80, 24)
+    s.fd, s.status = 99, "idle"
+    keys = []
+    state = {"k": 0}
+
+    def write(b):
+        keys.append(b)
+        if b in (b"\r", b"s"):
+            state["k"] += 1
+    s.write = write
+    s.check_menu = lambda t=None: setattr(s, "menu", menus[state["k"]] if state["k"] < len(menus) else None)
+    return d, s, keys
+
+
+def _menu(title, labels, cur=0, current=None):
+    return {"kind": "list", "title": title, "cursor": cur,
+            "options": [{"i": i, "label": l, "current": l == current} for i, l in enumerate(labels)]}
+
+
+def test_codex_model_and_effort_switch_in_session():
+    models = _menu("Select Model and Effort", ["GPT-6.1-Sol", "GPT-6-Astra (current)", "GPT-6-Luna"], 1, "GPT-6-Astra (current)")
+    levels = _menu("Select Reasoning Level for GPT-6-Luna", ["Low (default)", "Medium", "High", "Extra high", "More reasoning…"], 0)
+    d, s, keys = _codex_with_menus([models, levels])
+    out = []
+    d.walk_menus = A.Daemon.walk_menus.__get__(d)
+    A.Daemon.codex_set_model(d, s, "gpt-6-luna", "xhigh", out.append)
+    d.run()
+    assert d.typed == ["/model"] and out == [None]
+    # model: one down from the cursor (Astra -> Luna) + Enter; effort: three down + "s" (this session only)
+    assert keys == [b"\x1b[B", b"\r", b"\x1b[B", b"\x1b[B", b"\x1b[B", b"s"]
+
+
+def test_codex_max_effort_goes_through_advanced_menu():
+    models = _menu("Select Model and Effort", ["GPT-6-Astra (current)"], 0, "GPT-6-Astra (current)")
+    levels = _menu("Select Reasoning Level for GPT-6-Astra", ["Low", "Medium", "High", "Extra high", "More reasoning…"], 0)
+    adv = _menu("Advanced Reasoning", ["Max", "Ultra"], 0)
+    d, s, keys = _codex_with_menus([models, levels, adv])
+    out = []
+    d.walk_menus = A.Daemon.walk_menus.__get__(d)
+    A.Daemon.codex_set_model(d, s, None, "ultra", out.append)    # keep the current model
+    d.run()
+    assert out == [None]
+    # current model: Enter; "More reasoning…" is four down + Enter; Ultra one down + "s"
+    assert keys == [b"\r"] + [b"\x1b[B"] * 4 + [b"\r"] + [b"\x1b[B", b"s"]
+
+
+def test_codex_permissions_presets_and_missing_combination():
+    perms = _menu("Update Model Permissions", ["Ask for approval (current)", "Approve for me", "Full Access", "Read Only"],
+                  0, "Ask for approval (current)")
+    d, s, keys = _codex_with_menus([perms])
+    out = []
+    d.walk_menus = A.Daemon.walk_menus.__get__(d)
+    A.Daemon.codex_set_permissions(d, s, "sandbox", "read-only", out.append)
+    d.run()
+    assert out == [None] and keys == [b"\x1b[B"] * 3 + [b"\r"]
+    assert s.cx_mode["sandbox"] == "read-only" and s.cx_mode["approval"] == "on-request"
+    # never + workspace-write: no such preset -> error, so the caller restarts with -a never
+    d, s, keys = _codex_with_menus([perms])
+    d.walk_menus = A.Daemon.walk_menus.__get__(d)
+    out = []
+    A.Daemon.codex_set_permissions(d, s, "approval", "never", out.append)
+    d.run()
+    assert out and out[0] and "没有这个选项" in out[0] and keys[0] == b"\x1b"
+
+
+def test_codex_menu_walk_refuses_while_busy():
+    d, s, keys = _codex_with_menus([])
+    s.status = "running"
+    out = []
+    d.walk_menus = A.Daemon.walk_menus.__get__(d)
+    A.Daemon.codex_set_model(d, s, "x", "low", out.append)
+    assert out and out[0].startswith("会话") and d.typed == []

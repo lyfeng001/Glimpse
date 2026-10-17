@@ -1836,7 +1836,7 @@ function renderCtl() {
         (busy ? '<span class="spinner" aria-hidden="true"></span>' : v === cur ? ic('check', 'chk on') : '') + '</button>';
     }).join('') + '</div><p class="g-f">通过 Shift+Tab 在终端里切换，当前模式从 Claude Code 底部状态栏识别。部分模式需要在 Claude 设置里先启用才会出现在循环中。</p>';
   } else {
-    h += '<div class="note-box">' + ic('refresh', 'sm') + '<div>Codex 的这些设置会<b>重启并恢复对话</b>后生效，正在进行的回复会被中断。</div></div>';
+    h += '<div class="note-box">' + ic('refresh', 'sm') + '<div>模型、推理强度和权限直接在当前会话里切换（Codex 的 /model、/permissions，只对这个会话生效），不会重启。只有 Codex 菜单里没有的组合才会重启并恢复对话。请在这一轮结束后再改。</div></div>';
   }
   const curModel = md.model || ''; const curM = findModel(cat, curModel);
   h += '<div class="g-h">Model' + (curModel ? '<span class="g-cur mono">' + esc(shortModel(curModel)) + '</span>' : '') + '</div>';

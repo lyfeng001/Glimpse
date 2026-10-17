@@ -98,7 +98,9 @@ def test_default_codex_key_env_and_options(hub_mod, tmp_path):
     assert opts["claude"]["efforts"] == ["low", "medium", "high", "xhigh", "max", "ultracode"]
     assert opts["claude"]["modes"] == ["manual", "acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions"]
     assert opts["codex"]["efforts"] == ["low", "medium", "high", "xhigh", "max", "ultra"]
-    assert opts["codex"]["approvals"] == ["untrusted", "on-request", "never"]
+    assert opts["codex"]["approvals"] == ["on-request", "never"]          # codex 0.16x has no "untrusted"
+    cfg["options"] = {"codex": {"approvals": ["untrusted", "on-request", "never"]}}   # the list older versions saved
+    assert server.Hub(cfg).options()["codex"]["approvals"] == ["on-request", "never"]
     assert "minimal" not in json.dumps(opts)
     # old defaults that an earlier save() wrote into config.json give way to the new ones
     cfg["options"] = {"claude": {"modes": ["default", "acceptEdits", "auto", "plan", "bypassPermissions"],

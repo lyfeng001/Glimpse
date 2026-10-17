@@ -46,7 +46,7 @@ Glimpse 让手机变成这些会话的遥控器。手机上看到的就是它们
 - **模型与模式**：
   - 选择列表来自各机器的真实数据：Codex 的模型和推理强度取自 `codex debug models`；Claude 的模型是 default / opus / sonnet / haiku / fable / opusplan，并显示 `--settings` 文件里配置的自定义模型名。列表缓存 10 分钟。
   - Claude Code：权限模式（manual / acceptEdits / auto / plan / dontAsk / bypassPermissions）、`/model`、推理强度（low / medium / high / xhigh / max / ultracode）和 `/goal`。`ultracode` 会先用 `--effort xhigh` 启动，再执行 `/effort ultracode`。
-  - Codex：模型、推理强度（low / medium / high / xhigh / max / ultra，以模型支持为准）、审批策略和沙箱，改完会重启并恢复对话。
+  - Codex：模型、推理强度（low / medium / high / xhigh / max / ultra，以模型支持为准）、审批策略和沙箱。通过 Codex 自带的 `/model`、`/permissions` 在当前会话里直接切换（只对这个会话生效，不改 `config.toml`）；只有这两个菜单里没有的组合，才会重启并恢复对话。
   - 这些在新建会话时也能直接选。
 - **接管电脑上的会话**：列出这台机器上最近的 Claude / Codex 对话，选中后 Glimpse 用 `--resume` / `codex resume` 接着这段对话继续。
 - **删除会话**：会话卡片左滑，或在“会话操作”里删除。正在运行的会先结束进程。另有一键清理已结束的会话。

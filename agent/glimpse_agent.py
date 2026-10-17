@@ -54,6 +54,10 @@ CLAUDE_MODES = ("default", "acceptEdits", "auto", "plan", "bypass", "manual", "d
 CLAUDE_MODE_ALIAS = {"bypassPermissions": "bypass"}
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultracode")
 CODEX_OVERRIDES = ("model", "effort", "approval", "sandbox")
+CODEX_EFFORT_LABELS = {"xhigh": "extra high"}           # phone value -> label in codex's /model picker
+# presets of codex's /permissions picker -> (approval, sandbox); other combinations need a restart with -a / -s
+CODEX_PERMISSION_PRESETS = {"read only": ("on-request", "read-only"), "ask for approval": ("on-request", "workspace-write"),
+                            "approve for me": (None, "workspace-write"), "full access": ("never", "danger-full-access")}
 SHIFT_TAB = b"\x1b[Z"
 # op "models": what the pickers on the phone offer
 CLAUDE_MODEL_LIST = (("default", "Default"), ("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku"),
@@ -2794,14 +2798,160 @@ class Daemon:
                 raise RuntimeError("未知操作 %s" % action)
             if value and not VALUE_RE.match(value):
                 raise RuntimeError("无效的值")
-            if value:
-                s.overrides[action] = value
+            def keep(err=None):
+                # remember the choice: a later restart (key swap, daemon restart) launches with it
+                if err is None:
+                    s.overrides[action] = value
+                    if action in ("model", "effort"):
+                        s.cx_mode = dict(s.cx_mode, **{action: value})
+                    s.touch()
+                done(err)
+
+            def restart():
+                if value:
+                    s.overrides[action] = value
+                else:
+                    s.overrides.pop(action, None)   # back to the preset / config.toml default
+                s.cx_mode = dict(s.cx_mode, **{action: value}) if value else s.cx_mode
+                s.touch()
+                s.restart(None, None, True, done)   # not settable in the running session: restart and resume
+
+            def walked(err):
+                if err is None or err.startswith("会话"):
+                    keep(err)                  # done, or busy / exited: report it, no restart behind the user's back
+                else:
+                    sys.stderr.write("glimpse: codex %s=%s needs a restart: %s\n" % (action, value, err))
+                    restart()
+            if s.fd is None or not value:
+                restart()
+            elif action in ("model", "effort"):
+                cur = dict(s.cx_mode, **s.overrides)
+                self.codex_set_model(s, value if action == "model" else cur.get("model"),
+                                     value if action == "effort" else cur.get("effort"), walked)
             else:
-                s.overrides.pop(action, None)   # back to the preset / config.toml default
-            s.touch()
-            s.restart(None, None, True, done)   # codex reads these at start: restart and resume
+                self.codex_set_permissions(s, action, value, walked)
         else:
             raise RuntimeError("只有 Claude / Codex 会话支持")
+
+    # --- codex: change model / effort / permissions inside the running session (its own pickers)
+    def walk_menus(self, s, cmd, steps, done, timeout=6.0):
+        """Type `cmd`, then drive the pickers it opens. steps: [(title_re, pick)] where pick(menu) returns
+        (index, key) — key "\\r" (Enter) or "s" (session only) — or None to fail. done(err)."""
+        def label(o):
+            return re.sub(r"\s*\((current|default)\)\s*", " ", o.get("label") or "").strip()
+
+        def step(i, deadline):
+            if s.fd is None:
+                done("会话已退出")
+                return
+            s.check_menu(now() + MENU_SETTLE)
+            mn = s.menu
+            if i >= len(steps):
+                if mn is None:
+                    done(None)
+                elif now() > deadline:
+                    s.write(b"\x1b")
+                    done("Codex 还停在菜单“%s”，已取消" % mn.get("title"))
+                else:
+                    self.later(0.2, lambda: step(i, deadline))
+                return
+            title_re, pick = steps[i]
+            if not mn or not re.search(title_re, mn.get("title") or "", re.I):
+                if now() > deadline:
+                    if mn:
+                        s.write(b"\x1b")
+                    done("Codex 没有弹出预期的菜单（%s）" % (mn.get("title") if mn else "无菜单"))
+                else:
+                    self.later(0.2, lambda: step(i, deadline))
+                return
+            choice = pick(mn, label)
+            if choice is None:
+                s.write(b"\x1b")
+                self.later(0.2, lambda: s.write(b"\x1b"))
+                done("菜单里没有这个选项（%s）" % ", ".join(label(o) for o in mn["options"]))
+                return
+            idx, key = choice
+            n = idx - mn["cursor"]
+            keys = [b"\x1b[B" if n > 0 else b"\x1b[A"] * abs(n) + [key.encode()]
+            s.menu, s.menu_dirty = None, True
+            for k, data in enumerate(keys):
+                self.later(0.04 * k, lambda data=data: s.fd is not None and s.write(data))
+            self.later(0.04 * len(keys) + 0.3, lambda: step(i + 1, now() + timeout))
+
+        if s.status not in ("idle", "starting") or s.menu:
+            done("会话正忙，等这一轮结束再改")
+            return
+        self.type_text(s, cmd)
+        self.later(0.4, lambda: step(0, now() + timeout))
+
+    def codex_set_model(self, s, model, effort, done):
+        """/model -> pick the model (or keep the current one) -> pick the effort, "s" = this session only."""
+        want_m = (model or "").lower()
+        want_e = CODEX_EFFORT_LABELS.get((effort or "").lower(), (effort or "").lower())
+
+        def pick_model(mn, label):
+            for o in mn["options"]:
+                if (want_m and label(o).lower() == want_m) or (not want_m and o.get("current")):
+                    return o["i"], "\r"
+            return None
+
+        def effort_index(mn, label):
+            for o in mn["options"]:
+                if (want_e and label(o).lower() == want_e) or (not want_e and o.get("current")):
+                    return o["i"]
+            return None
+
+        def pick_level(mn, label):
+            i = effort_index(mn, label)
+            if i is not None:
+                return i, "s"
+            more = next((o["i"] for o in mn["options"] if label(o).lower().startswith("more reasoning")), None)
+            return (more, "\r") if more is not None and want_e in ("max", "ultra") else None
+
+        def pick_advanced(mn, label):
+            i = effort_index(mn, label)
+            return (i, "s") if i is not None else None
+        steps = [(r"^Select Model", pick_model), (r"^Select Reasoning Level", pick_level)]
+        if want_e in ("max", "ultra"):
+            steps.append((r"^Advanced Reasoning", pick_advanced))
+        self.walk_menus(s, "/model", steps, done)
+
+    def codex_set_permissions(self, s, action, value, done):
+        """/permissions: the picker's current preset says what is set now; pick the preset with the new
+        approval / sandbox and the other half unchanged. No such preset -> error (the caller restarts)."""
+        chosen = []
+
+        def pick(mn, label):
+            cur = next((CODEX_PERMISSION_PRESETS.get(label(o).lower()) for o in mn["options"] if o.get("current")), None)
+            ap, sb = cur or (None, None)
+            want = (value, sb) if action == "approval" else (ap, value)
+            for o in mn["options"]:
+                p = CODEX_PERMISSION_PRESETS.get(label(o).lower())
+                if p and p[1] == want[1] and (p[0] == want[0] or (p[0] is None and o.get("current") and action == "sandbox")):
+                    chosen.append(label(o))
+                    return o["i"], "\r"
+            # same sandbox, approval unknown (e.g. "Approve for me" -> workspace): the plain preset for that sandbox
+            if action == "sandbox":
+                for o in mn["options"]:
+                    p = CODEX_PERMISSION_PRESETS.get(label(o).lower())
+                    if p and p[1] == value and p[0] is not None:
+                        chosen.append(label(o))
+                        return o["i"], "\r"
+            return None
+
+        def confirm(mn, label):
+            return next(((o["i"], "\r") for o in mn["options"] if label(o).lower().startswith("yes")), None)
+
+        def finished(err):
+            if err is None and chosen:
+                ap, sb = CODEX_PERMISSION_PRESETS[chosen[0].lower()]
+                s.cx_mode = dict(s.cx_mode, **({"approval": ap} if ap else {}), sandbox=sb)
+            done(err)
+        steps = [(r"Permissions", pick)]
+        if (action, value) in (("sandbox", "danger-full-access"), ("approval", "never")):
+            # the phone user chose it explicitly; codex asks once more ("Apply full access for this session")
+            steps.append((r"full access", confirm))
+        self.walk_menus(s, "/permissions", steps, finished)
 
     def menu_op(self, s, index=None, key=None, gap=0.04):
         """Operate the picker on screen: move the cursor to index with arrow keys, then Enter; or Esc / "s"."""

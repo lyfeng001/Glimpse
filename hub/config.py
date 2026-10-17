@@ -32,7 +32,7 @@ DEFAULTS = {
                    "efforts": ["low", "medium", "high", "xhigh", "max", "ultracode"],
                    "modes": ["manual", "acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions"]},
         "codex": {"models": [], "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
-                  "approvals": ["untrusted", "on-request", "never"],
+                  "approvals": ["on-request", "never"],     # codex 0.16x: "untrusted" was removed
                   "sandboxes": ["read-only", "workspace-write", "danger-full-access"]},
     },
 }
@@ -40,7 +40,8 @@ DEFAULTS = {
 LEGACY_OPTIONS = {
     "claude": {"models": [["opus", "sonnet", "haiku"]], "efforts": [["low", "medium", "high", "xhigh", "max"]],
                "modes": [["default", "acceptEdits", "auto", "plan", "bypassPermissions"]]},
-    "codex": {"efforts": [["minimal", "low", "medium", "high", "max"]]},
+    "codex": {"efforts": [["minimal", "low", "medium", "high", "max"]],
+              "approvals": [["untrusted", "on-request", "never"]]},
 }
 
 

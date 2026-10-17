@@ -738,6 +738,10 @@ dialog.sheet.tall { min-height: min(560px, calc(var(--app-h) - var(--safe-t) - 1
   #groups .cards > .empty-m { grid-column: 1 / -1; }
   .fab { right: max(24px, calc((100vw - 1480px) / 2)); }
   #view .chat > * { max-width: 980px; margin-left: auto; margin-right: auto; width: 100%; }
+  /* the terminal grid has the session's size (e.g. 110 columns): centre it in a wider pane; when it is wider than
+     the pane it starts at the left edge and scrolls (margin auto never pushes it off-screen) */
+  #view .term-wrap { display: flex; }
+  #view #term { min-width: 0; margin: 0 auto; }
   /* the dock (approval card, quick keys, composer) follows the same column as the chat */
   #view .dock > * { max-width: 1012px; margin-left: auto; margin-right: auto; }
   #view .wstrip, #view .vbar, #view .banner { max-width: 1012px; margin-left: auto; margin-right: auto; width: 100%; }

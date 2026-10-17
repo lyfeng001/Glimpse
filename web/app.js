@@ -665,6 +665,9 @@ function renderHome() {
   document.title = waiting ? '(' + waiting + ') Glimpse' : 'Glimpse';
   if (navigator.setAppBadge) { try { (waiting ? navigator.setAppBadge(waiting) : navigator.clearAppBadge()).catch(() => {}); } catch (_) {} }
 }
+// home lists are ordered by session name (natural order: "任务2" before "任务10"), stable across restarts
+const NAME_COLL = new Intl.Collator('zh-Hans-CN', { numeric: true, sensitivity: 'base' });
+function bySessionName(a, b) { return NAME_COLL.compare(a.name || '', b.name || '') || (a.sid < b.sid ? -1 : a.sid > b.sid ? 1 : 0); }
 function renderGroupsByMachine(groups) {
   if (groups._st) { groups._st = false; groups._h = null; groups.innerHTML = ''; }
   if (groups._h) { groups._h = null; groups.innerHTML = ''; }
@@ -685,7 +688,7 @@ function renderGroupsByMachine(groups) {
       rc.setAttribute('aria-label', '重连 ' + mc.id); rc.onclick = () => send({ op: 'reconnect', m: mc.id }); $('.mhead', g).appendChild(rc);
     } else if (mc.online && rc) rc.remove();
     const cards = $('.cards', g);
-    const ss = visibleSessions(mc).slice().reverse();
+    const ss = visibleSessions(mc).slice().sort(bySessionName);
     if (!ss.length) {
       setHTML(cards, mc.online ? '<div class="empty-m"><span>这台机器上还没有会话</span><button type="button" class="btn sm primary" data-new="' + esc(mc.id) + '">' + ic('plus', 'xs') + '新建</button></div>'
         : '<div class="empty-m"><span>机器离线，重连后可查看会话</span></div>');
@@ -737,7 +740,7 @@ function renderGroupsByStatus(groups) {
   for (const mc of S.machines) {
     for (const s of visibleSessions(mc)) buckets.find((b) => b.g.test(s)).items.push([mc, s]);
   }
-  for (const b of buckets) b.items.sort((x, y) => (y[1].activity || 0) - (x[1].activity || 0));
+  for (const b of buckets) b.items.sort((x, y) => bySessionName(x[1], y[1]) || x[0].id.localeCompare(y[0].id));
   const shown = buckets.filter((b) => b.items.length);
   if (!shown.length) {
     setHTML(groups, '<div class="empty"><div class="art">' + ic('inbox', 'lg') + '</div><h3>还没有会话</h3><p>点右下角 ＋ 新建一个会话。</p></div>');

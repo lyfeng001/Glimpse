@@ -840,16 +840,67 @@ function ensureTerm() {
   if (term) return term;
   term = new window.Terminal({
     fontSize: S.fontSize, fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace', scrollback: 5000, convertEol: false,
-    theme: { background: '#0B0D10', foreground: '#DCE1E8', cursor: '#5AA9FF', selectionBackground: 'rgba(90,169,255,.35)',
+    theme: { background: '#0B0D10', foreground: '#DCE1E8', cursor: '#5AA9FF', cursorAccent: '#0B0D10', selectionBackground: 'rgba(90,169,255,.35)',
       black: '#1C1F25', red: '#FF6B63', green: '#3DDC6A', yellow: '#FFB547', blue: '#5AA9FF', magenta: '#C792EA', cyan: '#56D4DD', white: '#DCE1E8',
       brightBlack: '#5C636E', brightRed: '#FF8E86', brightGreen: '#6EE7A0', brightYellow: '#FFD07A', brightBlue: '#8CC4FF', brightMagenta: '#DDB3F5', brightCyan: '#8BE8EE', brightWhite: '#FFFFFF' },
-    allowProposedApi: true, cursorBlink: false, screenReaderMode: false,
+    // a thin blinking accent bar (Warp-like); TUIs that set their own cursor shape still win
+    cursorStyle: 'bar', cursorWidth: 2, cursorBlink: true, cursorInactiveStyle: 'outline',
+    allowProposedApi: true, screenReaderMode: false,
   });
   if (window.FitAddon) { try { term.loadAddon(new window.FitAddon.FitAddon()); } catch (_) {} }
   // opened lazily (openTerm) the first time the terminal tab is visible: xterm measures the font on open
   term.onData((d) => { if (S.view) sendBytes(enc.encode(d)); });
   term.onBinary((d) => { if (S.view) { const b = new Uint8Array(d.length); for (let i = 0; i < d.length; i++) b[i] = d.charCodeAt(i) & 255; sendBytes(b); } });
+  termLineEditing();
   return term;
+}
+// ---- line editing on the input line (where the cursor is): a click moves the cursor there, a selection on
+// that line is deleted with Backspace / Delete. The program only understands keys, so both become arrow keys
+// and backspaces sent to it; text outside the cursor's line (already sent output) is never touched.
+const ARROW_R = '\x1b[C', ARROW_L = '\x1b[D', BKSP = '\x7f';
+function cellAt(e) {
+  // xterm's screen element is the grid the rows are drawn into
+  const scr = $('#term .xterm-screen'); if (!scr) return null;
+  const r = scr.getBoundingClientRect();
+  if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) return null;
+  return { col: Math.floor((e.clientX - r.left) / (r.width / term.cols)), row: Math.floor((e.clientY - r.top) / (r.height / term.rows)) };
+}
+function onCursorLine(row) {
+  const b = term.buffer.active;
+  return b.viewportY === b.baseY && row === b.cursorY;     // only while scrolled to the bottom
+}
+function lineEnd(row) {
+  // last column with text on the cursor's line (so a click past the text lands at its end, not in empty space)
+  const line = term.buffer.active.getLine(term.buffer.active.baseY + row); if (!line) return 0;
+  return line.translateToString(true).length;
+}
+function termLineEditing() {
+  let down = null;
+  $('#term').addEventListener('mousedown', (e) => { down = e.button === 0 ? { x: e.clientX, y: e.clientY } : null; });
+  $('#term').addEventListener('mouseup', (e) => {
+    const d = down; down = null;
+    if (!d || !S.view || Math.abs(e.clientX - d.x) > 3 || Math.abs(e.clientY - d.y) > 3) return;   // a drag selects
+    if (term.hasSelection()) return;
+    const c = cellAt(e); if (!c || !onCursorLine(c.row)) return;
+    const cur = term.buffer.active.cursorX;
+    const tgt = Math.max(0, Math.min(c.col, lineEnd(c.row)));
+    if (tgt !== cur) sendBytes(enc.encode((tgt > cur ? ARROW_R : ARROW_L).repeat(Math.abs(tgt - cur))));
+  });
+  term.attachCustomKeyEventHandler((e) => {
+    if (e.type !== 'keydown' || (e.key !== 'Backspace' && e.key !== 'Delete') || !term.hasSelection() || !S.view) return true;
+    const p = term.getSelectionPosition(); const b = term.buffer.active;
+    if (!p) return true;
+    const row = b.cursorY + b.baseY;                    // absolute line of the cursor
+    if (p.start.y !== row || p.end.y !== row) return true;   // spans other lines: leave it to the program
+    const s = Math.min(p.start.x, p.end.x), en = Math.min(Math.max(p.start.x, p.end.x), lineEnd(b.cursorY));
+    if (en <= s) return true;
+    // go to the end of the selection, then erase backwards over it
+    const cur = b.cursorX;
+    const move = en > cur ? ARROW_R.repeat(en - cur) : ARROW_L.repeat(cur - en);
+    sendBytes(enc.encode(move + BKSP.repeat(en - s)));
+    term.clearSelection();
+    return false;
+  });
 }
 let termOpened = false;
 function openTerm() {
@@ -1461,17 +1512,41 @@ $('#rename-form').addEventListener('submit', (e) => {
   if (v && name) send({ op: 'rename', m: v.m, sid: v.sid, name });
   closeSheet($('#dlg-rename'));
 });
-$('#act-fit').onclick = () => {
-  const v = S.view; if (!v) return;
-  closeSheet($('#dlg-more')); setMode('term');
+// ---- terminal size: fit to this screen, back to the size before the last change, or a common size
+const SIZE_PRESETS = [[100, 32], [120, 40], [160, 48], [200, 56]];
+function screenSize() {
+  const wrap = $('#term-wrap');
+  let cw = S.fontSize * 0.6; let ch = S.fontSize * 1.2;
+  try { const c = term._core._renderService.dimensions.css.cell; if (c.width) { cw = c.width; ch = c.height; } } catch (_) {}
+  const cols = Math.floor((wrap.clientWidth - 12) / cw); const rows = Math.floor((wrap.clientHeight - 12) / ch);
+  return cols > 0 && rows > 0 ? [Math.max(40, cols), Math.max(10, rows)] : null;
+}
+function prevSizeKey(v) { return 'glimpse.prevSize.' + v.m + '/' + v.sid; }
+function setTermSize(cols, rows) {
+  const v = S.view; const s = v && session(v.m, v.sid); if (!s) return;
+  if (s.cols !== cols || s.rows !== rows) LS.setItem(prevSizeKey(v), JSON.stringify([s.cols, s.rows]));
+  send({ op: 'resize', m: v.m, sid: v.sid, cols, rows });
+  closeSheet($('#dlg-size'));
+  toast('终端尺寸', cols + ' × ' + rows, null, 'done');
+}
+function openSizeSheet() {
+  const v = S.view; const s = v && session(v.m, v.sid); if (!s) return;
+  setMode('term');
   requestAnimationFrame(() => {
-    const wrap = $('#term-wrap');
-    let cw = S.fontSize * 0.6; let ch = S.fontSize * 1.2;
-    try { const c = term._core._renderService.dimensions.css.cell; if (c.width) { cw = c.width; ch = c.height; } } catch (_) {}
-    const cols = Math.floor((wrap.clientWidth - 12) / cw); const rows = Math.floor((wrap.clientHeight - 12) / ch);
-    if (cols > 0 && rows > 0) { send({ op: 'resize', m: v.m, sid: v.sid, cols: Math.max(40, cols), rows: Math.max(10, rows) }); toast('终端尺寸', Math.max(40, cols) + ' × ' + Math.max(10, rows)); }
+    const fit = screenSize();
+    let prev = null; try { prev = JSON.parse(LS.getItem(prevSizeKey(v)) || 'null'); } catch (_) {}
+    const rows = [];
+    if (prev && (prev[0] !== s.cols || prev[1] !== s.rows)) rows.push(['恢复到之前的尺寸', prev, '改尺寸之前是 ' + prev[0] + ' × ' + prev[1]]);
+    if (fit) rows.push(['适应这块屏幕', fit, '不用左右滑动，每行字更少']);
+    for (const p of SIZE_PRESETS) rows.push([p[0] + ' × ' + p[1], p, p[0] === 120 ? '常用的电脑终端大小' : '']);
+    setHTML($('#size-opts'), '<div class="cell"><span class="grow">当前<div class="sub">' + s.cols + ' × ' + s.rows + '</div></span></div>' +
+      rows.map(([t, sz, sub], i) => '<button type="button" class="cell" data-size="' + i + '"><span class="grow">' + esc(t) +
+        (sub ? '<div class="sub">' + esc(sub) + '</div>' : '') + '</span>' + (sz[0] === s.cols && sz[1] === s.rows ? ic('check', 'chk on') : '') + '</button>').join(''));
+    for (const b of $$('#size-opts [data-size]')) b.onclick = () => { const sz = rows[+b.dataset.size][1]; setTermSize(sz[0], sz[1]); };
+    openSheet($('#dlg-size'));
   });
-};
+}
+$('#act-fit').onclick = () => { closeSheet($('#dlg-more')); setTimeout(openSizeSheet, 230); };
 $('#act-kill').onclick = async () => {
   const v = S.view; if (!v) return;
   closeSheet($('#dlg-more'));
@@ -2406,5 +2481,7 @@ $('#btn-logout').onclick = async () => {
   LS.removeItem('glimpse.token');
   location.replace('/');
 };
+
+$('#term-size-btn').onclick = () => openSizeSheet();
 
 boot();

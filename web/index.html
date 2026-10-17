@@ -174,7 +174,10 @@
     </header>
     <div class="body">
       <div id="chat" class="chat" role="tabpanel" aria-label="对话" tabindex="-1"></div>
-      <div id="term-wrap" class="term-wrap" role="tabpanel" aria-label="终端" hidden><div id="term"></div></div>
+      <div id="term-wrap" class="term-wrap" role="tabpanel" aria-label="终端" hidden>
+        <div id="term"></div>
+        <button type="button" id="term-size-btn" class="term-size-btn" aria-label="终端尺寸"><svg class="ic" aria-hidden="true"><use href="#i-resize"/></svg></button>
+      </div>
       <button type="button" id="jump" class="jump" hidden><svg class="ic" aria-hidden="true"><use href="#i-arrow-down"/></svg>回到最新</button>
     </div>
     <div class="dock">
@@ -352,7 +355,7 @@
       <div class="cell" id="act-ac-row"><span class="cell-ic" style="background:#0A84FF" aria-hidden="true"><svg class="ic"><use href="#i-refresh"/></svg></span>
         <span class="grow">临时错误自动继续<div class="sub" id="act-ac-sub">服务器过载、流中断、输出被截断时自动发送“继续”</div></span>
         <span class="switch"><input type="checkbox" role="switch" id="act-ac" aria-label="临时错误自动继续"><i></i></span></div>
-      <button type="button" class="cell" id="act-fit"><span class="cell-ic" style="background:#2FB457" aria-hidden="true"><svg class="ic"><use href="#i-resize"/></svg></span><span class="grow">按手机屏幕调整终端尺寸<div class="sub" id="act-fit-sub"></div></span></button>
+      <button type="button" class="cell" id="act-fit"><span class="cell-ic" style="background:#2FB457" aria-hidden="true"><svg class="ic"><use href="#i-resize"/></svg></span><span class="grow">终端尺寸<div class="sub" id="act-fit-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
     </div>
     <div class="g-h">在其他地方打开</div>
     <div class="group">
@@ -394,6 +397,17 @@
     <button type="button" class="txt-btn strong r" data-close>完成</button>
   </div>
   <div class="sh-body" id="mem-body" aria-live="polite"></div>
+</dialog>
+<dialog id="dlg-size" class="sheet" aria-labelledby="dlg-size-title">
+  <div class="sh-grab" aria-hidden="true"></div>
+  <div class="sh-head">
+    <span class="l"></span><h2 id="dlg-size-title">终端尺寸</h2>
+    <button type="button" class="txt-btn strong r" data-close>完成</button>
+  </div>
+  <div class="sh-body">
+    <div class="group" id="size-opts"></div>
+    <p class="g-f">尺寸改的是进程的终端（所有连着这个会话的地方看到的都一样）。超出屏幕的部分可以左右滑动查看。</p>
+  </div>
 </dialog>
 <dialog id="dlg-rename" class="sheet" aria-labelledby="dlg-rename-title">
   <form id="rename-form" novalidate>

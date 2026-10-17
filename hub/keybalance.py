@@ -128,17 +128,22 @@ def ratio(c, r, k, sess_rate, extra=0):
     return spend / c
 
 
-def usable(n, usage, exhausted, avoid):
+def usable(n, usage, exhausted, avoid, any_window=False):
+    """any_window: also skip a key whose short (5 h) window is full (a replacement after a no-balance error
+    must work right away); balancing itself only looks at the 7-day window."""
     if n in avoid or n in exhausted:
         return False
     u = usage.get(n)
     if isinstance(u, dict) and u.get("error"):
         return False                    # the usage API says the key is invalid / disabled
+    if any_window:
+        pct = usage_percent(u)
+        return pct is None or pct < 100
     w = week_window(u)
     return not (w and isinstance(w.get("percent"), (int, float)) and w["percent"] >= 100)
 
 
-def pick_key(names, usage, exhausted=(), in_use=None, avoid=(), rates=None, now=None):
+def pick_key(names, usage, exhausted=(), in_use=None, avoid=(), rates=None, now=None, any_window=False):
     """Key for one more session: the one whose 7-day load ratio is lowest after adding it (keeps all keys
     burning at the same relative pace). Without usage data: fewest sessions. Then config order."""
     in_use = in_use or {}
@@ -146,7 +151,7 @@ def pick_key(names, usage, exhausted=(), in_use=None, avoid=(), rates=None, now=
     sr = per_session_rate(ld) or 1.0
     best = None
     for i, n in enumerate(names):
-        if not usable(n, usage, exhausted, avoid):
+        if not usable(n, usage, exhausted, avoid, any_window):
             continue
         c, r, k = ld[n]
         q = ratio(c, r, k, sr, extra=1)

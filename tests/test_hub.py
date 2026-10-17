@@ -543,6 +543,7 @@ def test_keybalance_pick_equalises_burn_rate():
     u["k5"] = _wk(500, 10, 3, now)
     u["k5"]["windows"][0]["percent"] = 100                # 5 h full: left to on_exhausted
     assert KB.pick_key(["k3", "k4", "k5"], u, now=now) == "k5"
+    assert KB.pick_key(["k3", "k4", "k5"], u, now=now, any_window=True) is None   # replacement after no balance
     assert KB.pick_key(["k3", "k4"], u, now=now) is None
     # no usage data at all: fewest sessions, then order
     assert KB.pick_key(["a", "b"], {}, in_use={"a": 2}) == "b"

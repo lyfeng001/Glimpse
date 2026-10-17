@@ -324,10 +324,10 @@ class Hub:
                     n[s["key"]] = n.get(s["key"], 0) + 1
         return n
 
-    def best_key(self, avoid=()):
+    def best_key(self, avoid=(), any_window=False):
         self.key_exhausted = KB.live_exhausted(self.key_exhausted, self.key_usage)
         return KB.pick_key(KB.pool(self.cfg), self.key_usage, self.key_exhausted, self.keys_in_use(), avoid,
-                           rates=self.key_rates.rate)
+                           rates=self.key_rates.rate, any_window=any_window)
 
     async def balance_on_event(self, m, sid, ev):
         """An error event: when the session's key ran out / was rejected, switch it to another key (live when
@@ -343,7 +343,7 @@ class Hub:
         recent = [x for x in self.key_swaps.get((m.id, sid), []) if t - x < KB.SWAP_WINDOW]
         if len(recent) >= KB.SWAP_LIMIT:
             return dict(ev, title="%s 不可用，已自动换过 %d 次，请手动处理" % (cur, len(recent)))
-        new = self.best_key(avoid=(cur,))
+        new = self.best_key(avoid=(cur,), any_window=True)    # the replacement must work now, 5 h window included
         if not new:
             return dict(ev, title="%s 不可用，没有其他可用的 Key" % cur)
         self.key_swaps[(m.id, sid)] = recent + [t]

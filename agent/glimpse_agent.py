@@ -1325,6 +1325,7 @@ class Session:
         self.menu = None               # interactive picker visible on the screen (parse_menu)
         self.init_cmds = []            # slash commands typed once after the first SessionStart (claude)
         self.delete_req = None         # callback(ok) while a delete waits for the process to exit
+        self.config_file = None        # codex config.toml, claude settings.json (hot swap: touch it to flush cache)
 
     # --- info
     @property
@@ -1429,6 +1430,12 @@ class Session:
         except OSError:
             return False
         self.env, self.key = dict(env), key
+        # claude/codex watch the config file; touching it forces a reload + helper cache clear
+        if self.config_file:
+            try:
+                os.utime(self.config_file, None)
+            except OSError:
+                pass
         it = self.add_chat("system", "—— 已切换到 %s（无需重启）——" % (key or "新 key"))
         if it:
             self.d.send_subs(self, {"t": "chat", "sid": self.sid, "items": [it]})
@@ -1459,6 +1466,10 @@ class Session:
             argv, self.settings_file = prepare_claude_argv(argv, self.sid, self.d.sdir, None if hot else self.env,
                                                            self.d.approval_wait, self.d.memory.claude_allow(self),
                                                            key_file=self.key_file if hot else None)
+            self.config_file = self.settings_file
+        elif self.kind == "codex":
+            home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+            self.config_file = os.path.join(home, "config.toml")
         shell = env.get("SHELL")
         if not shell:
             try:

@@ -378,8 +378,8 @@ class Hub:
         return bool(r.get("hot")) if r.get("t") == "restarted" else None
 
     async def continue_after_swap(self, m, sid, hot):
-        # claude serves its old key once more after the helper file changed; a restart needs the TUI ready
-        await asyncio.sleep(5 if hot else 3)
+        # the agent touches the config file to flush the helper cache; give it a beat for the reload, then wait for idle
+        await asyncio.sleep(1.5 if hot else 3)
         for _ in range(40):
             s = m.sessions.get(sid) or {}
             if s.get("status") in ("idle", "error") and not s.get("menu"):

@@ -708,6 +708,28 @@ def test_fs_list_read_confined_to_the_session_dir(tmp_path):
         A.fs_read(str(root), "src")                                                    # a directory
 
 
+def test_fs_gates_glimpse_secrets_and_keys_in_content(tmp_path, monkeypatch):
+    # a session in the Glimpse checkout itself: data/ (token, auth, VAPID, memory) and config.json are gated
+    root = tmp_path / "glimpse"
+    (root / "data" / "agent").mkdir(parents=True)
+    (root / "data" / "token").write_text("plain-token-value")
+    (root / "data" / "agent" / "sessions.json").write_text("{}")
+    (root / "config.json").write_text('{"keys": {"profiles": [{"name": "k", "value": "abc"}]}}')
+    (root / "notes.txt").write_text("hello")
+    monkeypatch.setenv("GLIMPSE_CONFIG", str(root / "config.json"))
+    monkeypatch.setattr(A, "FS_PRIVATE", A.fs_private_paths(str(root / "data" / "agent")))
+    for p in ("data/token", "data/agent/sessions.json", "config.json"):
+        assert A.fs_read(str(root), p)["kind"] == "sensitive", p
+    assert A.fs_read(str(root), "notes.txt")["kind"] == "text"
+    assert {e["name"]: e.get("sensitive") for e in A.fs_list(str(root), "")["entries"]}["config.json"]
+    assert A.fs_read(str(root), "config.json", force=True)["kind"] == "text"
+    # a long value assigned to a key / token / password field, in any file
+    (root / "app.yml").write_text("db:\n  password: 'Xk29fhQ0aLm3PzR8tY5uW1vB'\n")
+    (root / "ok.yml").write_text("token_ttl: 3600\nname: some-really-long-but-ordinary-name\n")
+    assert A.fs_read(str(root), "app.yml") == dict(A.fs_read(str(root), "app.yml"), kind="sensitive", reason="content")
+    assert A.fs_read(str(root), "ok.yml")["kind"] == "text"
+
+
 def test_fs_git_status_and_diff(tmp_path):
     import subprocess
     root = tmp_path / "repo"
@@ -740,14 +762,18 @@ def test_fs_git_status_and_diff(tmp_path):
 
 
 def test_fs_op_replies_in_place(tmp_path):
-    d = _daemon(tmp_path)
+    (tmp_path / "state").mkdir()
+    d = _daemon(tmp_path / "state")
     d.background = lambda fn: fn()
     sent = []
     d.send = lambda c, obj: sent.append(obj)
 
+    proj = tmp_path / "proj"                   # the session's directory, next to (not inside) the daemon's state dir
+    proj.mkdir()
+
     class S:
-        sid, cwd = "s9", str(tmp_path)
-    (tmp_path / "x.txt").write_text("hello")
+        sid, cwd = "s9", str(proj)
+    (proj / "x.txt").write_text("hello")
     d.fs_op(None, 3, S, "read", "x.txt", False)
     assert sent[-1]["t"] == "fs" and sent[-1]["req"] == 3 and sent[-1]["text"] == "hello" and sent[-1]["action"] == "read"
     d.fs_op(None, 4, S, "read", "../etc/passwd", False)

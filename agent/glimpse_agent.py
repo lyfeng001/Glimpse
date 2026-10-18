@@ -2655,12 +2655,34 @@ FS_SENSITIVE_RE = re.compile(
     r"\.netrc|\.npmrc|\.pypirc|\.pgpass|\.htpasswd|credentials(\.json)?|secrets?(\..*)?|.*\.secrets?|"
     r"service[-_]?account.*\.json|key-[0-9a-f]+)$", re.I)
 FS_NOT_SENSITIVE_RE = re.compile(r"\.(example|sample|template|dist|defaults?)$|\.pub$", re.I)
-# unmistakable secrets in a file's first bytes (a config.json with a key in it is gated as well)
+# secrets in a file's first bytes (a config.json with a key in it is gated as well): well-known key formats, and
+# a long random-looking value assigned to a key / token / secret / password field
 FS_SECRET_RE = re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(sk-(ant-|proj-)?[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|"
-                          rb"gh[pousr]_[A-Za-z0-9]{30,}|xox[abp]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35})")
+                          rb"gh[pousr]_[A-Za-z0-9]{30,}|xox[abp]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35})|"
+                          rb"(?i:(api[_-]?key|secret|token|passw(or)?d|private[_-]?key|access[_-]?key)[\"']?\s*[:=]\s*[\"']?)"
+                          rb"[A-Za-z0-9+/_\-.=]{24,}")
 
 
-def fs_sensitive(name):
+# Glimpse's own secrets on this machine (data/: login token, VAPID / auth keys, per-session key files; config.json
+# with the API keys): always gated, whatever their names. Filled in by the daemon (real paths).
+FS_PRIVATE = set()
+
+
+def fs_private_paths(sdir):
+    out = set()
+    if sdir:
+        d = os.path.realpath(sdir)
+        out.add(d)
+        if os.path.basename(d) == "agent" and os.path.basename(os.path.dirname(d)) == "data":
+            out.add(os.path.dirname(d))                     # <project>/data (hub token, auth, VAPID, push, memory)
+    cfg = os.environ.get("GLIMPSE_CONFIG") or os.path.join(project_dir(), "config.json")
+    out.add(os.path.realpath(cfg))
+    return out
+
+
+def fs_sensitive(name, real=None):
+    if real and any(real == p or real.startswith(p.rstrip(os.sep) + os.sep) for p in FS_PRIVATE):
+        return True
     return bool(FS_SENSITIVE_RE.match(name)) and not FS_NOT_SENSITIVE_RE.search(name)
 
 
@@ -2706,7 +2728,7 @@ def fs_list(root, rel):
                 item["size"], item["mtime"] = st.st_size, int(st.st_mtime)
             if is_dir and e.name in FS_DIM:
                 item["dim"] = True
-            if not is_dir and fs_sensitive(e.name):
+            if not is_dir and fs_sensitive(e.name, os.path.realpath(e.path) if FS_PRIVATE else None):
                 item["sensitive"] = True
             out.append(item)
     out.sort(key=lambda x: (not x["dir"], x["name"].lower()))
@@ -2730,7 +2752,7 @@ def fs_read(root, rel, force=False):
         raise ValueError("不是普通文件")
     name = os.path.basename(p)
     r = {"path": fs_rel(base, p), "size": st.st_size, "mtime": int(st.st_mtime)}
-    if fs_sensitive(name) and not force:
+    if fs_sensitive(name, p) and not force:
         return dict(r, kind="sensitive")
     mime = FS_IMAGES.get(os.path.splitext(name)[1].lower())
     if mime:
@@ -2809,7 +2831,7 @@ def fs_git(root):
 def fs_diff(root, rel, force=False):
     base, p = fs_resolve(root, rel)
     r = {"path": fs_rel(base, p)}
-    if fs_sensitive(os.path.basename(p)) and not force:
+    if fs_sensitive(os.path.basename(p), p) and not force:
         return dict(r, kind="sensitive")
     rp = os.path.relpath(p, base)
     try:
@@ -2893,6 +2915,7 @@ class Daemon:
     def __init__(self, sock_name, sdir):
         self.sock_name = sock_name     # "@name" = linux abstract socket
         self.sdir = sdir               # None = keep no files
+        FS_PRIVATE.update(fs_private_paths(sdir))      # the files view never shows these without 显示内容
         self.sessions = {}
         self.order = []
         self.clients = set()

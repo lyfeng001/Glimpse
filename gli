@@ -14,6 +14,8 @@
 #   gli ls | kill ID     list / stop sessions on this machine
 #   gli attach [ID]      attach this terminal (no ID: latest live session; M2:ID for another machine)
 #   gli shell-init       shell functions so plain `claude` / `codex` run as Glimpse sessions
+#   gli new [PATH]       open the new-session form in the browser with PATH (default: here) filled in
+#   gli finder-install   Finder right-click → 快速操作 → 用 Glimpse 新建会话 (macOS); gli finder-uninstall removes it
 #   gli test             run the test suite
 set -e
 
@@ -60,6 +62,14 @@ case "${1:-help}" in
   devices)  exec "$PY" "$HUB" --devices ;;
   logout)   shift; exec "$PY" "$HUB" --revoke "${1:?usage: gli logout DEVICE_ID|all}" ;;
   test)     exec "$PY" -m pytest -q "$DIR/tests" ;;
+  new)
+    # the new-session form in the browser, with this computer and PATH (default: here) filled in
+    URL="$("$PY" "$HUB" --new-url "${2:-.}")"
+    if [ "$(uname)" = Darwin ]; then exec open "$URL"; fi
+    if command -v xdg-open >/dev/null 2>&1; then exec xdg-open "$URL"; fi
+    echo "$URL" ;;
+  finder-install)   exec "$PY" "$DIR/hub/finder.py" install ;;
+  finder-uninstall) exec "$PY" "$DIR/hub/finder.py" uninstall ;;
   attach)
     shift
     # attaching through the hub needs aiohttp (the .venv); without it only local sessions can be attached

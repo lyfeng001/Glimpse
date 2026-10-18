@@ -1882,6 +1882,8 @@ class Session:
             msg = d.get("message") or {}
             us = msg.get("usage") or {}
             mid = msg.get("id")
+            if msg.get("model") == "<synthetic>":
+                return     # written by claude itself (API error, interrupted turn): no model, all-zero usage
             if not us or mid == getattr(self, "_last_mid", None):
                 return     # claude writes one line per content block with the same usage
             self._last_mid = mid
@@ -2769,7 +2771,122 @@ def fs_read(root, rel, force=False):
     if not force and FS_SECRET_RE.search(data[:65536]):
         return dict(r, kind="sensitive", reason="content")
     text, enc = fs_decode(data)
-    return dict(r, kind="text", text=text, encoding=enc, truncated=st.st_size > FS_TEXT_MAX)
+    full = st.st_size <= FS_TEXT_MAX
+    r = dict(r, kind="text", text=text, encoding=enc, truncated=not full)
+    if full:
+        r["sig"] = fs_sig(data)                        # the save checks the file still is this one
+        r["editable"] = enc in ("utf-8", "gb18030") and fs_writable_why(base, p) is None
+    return r
+
+
+# --------------------------------------------------------------------------- files: writing (edit / new file / new folder)
+# Same confinement as reading, plus: never Glimpse's own data / config.json, never inside .git, no delete.
+# A save names the version it was edited from (sig); if the file changed meanwhile (the AI edited it) it is refused.
+FS_WRITE_MAX = 2 * 1024 * 1024
+FS_NAME_RE = re.compile(r"^[^\x00-\x1f/\\]+$")
+
+
+def fs_sig(data):
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def fs_writable_why(base, p):
+    """None if `p` (a real path inside `base`) may be written, else the reason."""
+    if any(p == q or p.startswith(q.rstrip(os.sep) + os.sep) for q in FS_PRIVATE):
+        return "Glimpse 自己的数据，不能在这里修改"
+    if ".git" in fs_rel(base, p).split("/"):
+        return "不能修改 .git 里的文件"
+    return None
+
+
+def fs_atomic_write(p, data, mode=None):
+    d = os.path.dirname(p)
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix=".glimpse-", dir=d)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def fs_write(root, rel, text, sig, force=False):
+    """Save an edited text file. sig = fs_sig of the version it was edited from; a different file on disk is a
+    conflict unless `force`. Keeps the file's encoding and CRLF line ends (a browser textarea gives LF)."""
+    import stat as _stat
+    if not isinstance(text, str):
+        raise ValueError("无效的内容")
+    base, p = fs_resolve(root, rel)
+    why = fs_writable_why(base, p)
+    if why:
+        raise ValueError(why)
+    st = os.stat(p)
+    if not _stat.S_ISREG(st.st_mode):
+        raise ValueError("不是普通文件")
+    if st.st_size > FS_TEXT_MAX:
+        raise ValueError("文件太大，不能在这里编辑")
+    with open(p, "rb") as f:
+        old = f.read()
+    cur = fs_sig(old)
+    if cur != sig and not force:
+        return {"conflict": True, "sig": cur}
+    _, enc = fs_decode(old)
+    if enc not in ("utf-8", "gb18030"):
+        raise ValueError("文件编码无法识别，不能保存")
+    if b"\r\n" in old and "\r\n" not in text:
+        text = text.replace("\n", "\r\n")
+    data = text.encode(enc)
+    if len(data) > FS_WRITE_MAX:
+        raise ValueError("内容太大")
+    fs_atomic_write(p, data, _stat.S_IMODE(st.st_mode))
+    return {"saved": True, "sig": fs_sig(data), "size": len(data), "mtime": int(os.stat(p).st_mtime)}
+
+
+def fs_new_path(root, rel):
+    """(real root, real path) for a file / folder that does not exist yet; parents are created by the caller."""
+    if not isinstance(rel, str) or len(rel) > 1024:
+        raise ValueError("无效的路径")
+    parts = [x for x in rel.strip().strip("/").split("/") if x not in ("", ".")]
+    if not parts or any(x == ".." or not FS_NAME_RE.match(x) for x in parts):
+        raise ValueError("名称无效")
+    base, p = fs_resolve(root, "/".join(parts))
+    why = fs_writable_why(base, p)
+    if why:
+        raise ValueError(why)
+    if os.path.lexists(p):
+        raise ValueError("已经存在同名的文件或文件夹")
+    parent = os.path.dirname(p)
+    _, rp = fs_resolve(root, fs_rel(base, parent))        # an existing parent may be a symlink: still inside
+    if os.path.exists(rp) and not os.path.isdir(rp):
+        raise ValueError("上级路径不是文件夹")
+    return base, p
+
+
+def fs_create(root, rel, text=""):
+    base, p = fs_new_path(root, rel)
+    data = (text or "").encode("utf-8")
+    if len(data) > FS_WRITE_MAX:
+        raise ValueError("内容太大")
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    return {"created": fs_rel(base, p), "dir": False, "sig": fs_sig(data)}
+
+
+def fs_mkdir(root, rel):
+    base, p = fs_new_path(root, rel)
+    os.makedirs(p)
+    return {"created": fs_rel(base, p), "dir": True}
 
 
 def fs_git_run(cwd, args, limit=4 * 1024 * 1024, timeout=10, ok=(0,)):
@@ -3544,12 +3661,15 @@ class Daemon:
         import threading
         threading.Thread(target=fn, daemon=True).start()
 
-    def fs_op(self, c, req, s, action, path, force):
-        """Read-only file browsing of the session's directory (list / read / git / diff). The reply always is
+    def fs_op(self, c, req, s, action, path, force, text=None, sig=None):
+        """Files of the session's directory: list / read / git / diff, and write (save an edit; `sig` = the version
+        it was edited from, `force` = overwrite a changed file) / create (new file) / mkdir. The reply always is
         {"t": "fs", "action", "path", ...} so the phone can show errors in place."""
         head = {"t": "fs", "req": req, "sid": s.sid, "action": action, "path": path}
         fns = {"list": lambda: fs_list(s.cwd, path), "read": lambda: fs_read(s.cwd, path, force),
-               "git": lambda: fs_git(s.cwd), "diff": lambda: fs_diff(s.cwd, path, force)}
+               "git": lambda: fs_git(s.cwd), "diff": lambda: fs_diff(s.cwd, path, force),
+               "write": lambda: fs_write(s.cwd, path, text, sig, force), "create": lambda: fs_create(s.cwd, path, text or ""),
+               "mkdir": lambda: fs_mkdir(s.cwd, path)}
         fn = fns.get(action)
         if fn is None:
             self.send(c, dict(head, error="unknown action"))
@@ -3741,7 +3861,7 @@ class Daemon:
                 self.menu_op(s, m.get("index"), m.get("key"))
                 self.send(c, {"t": "ok", "req": req, "sid": sid})
             elif op == "fs":
-                self.fs_op(c, req, s, m.get("action"), m.get("path") or "", bool(m.get("force")))
+                self.fs_op(c, req, s, m.get("action"), m.get("path") or "", bool(m.get("force")), m.get("text"), m.get("sig"))
             elif op == "rename":
                 s.name = clip(m.get("name") or s.name, 80)
                 s.touch()

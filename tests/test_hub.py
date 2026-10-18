@@ -312,6 +312,65 @@ def test_resolve_hub_auto(hub_mod, monkeypatch):
     server.RUNTIME.clear()
 
 
+def test_new_session_url(hub_mod, monkeypatch, tmp_path):
+    from urllib.parse import parse_qs, urlsplit
+    C, server = hub_mod
+    monkeypatch.setattr(server, "detect_tailscale", lambda: ("100.1.2.3", "mac.tail.ts.net"))
+    server.RUNTIME.clear()
+    cfg = C.load()
+    cfg["hub"]["listen"] = [{"host": "auto", "port": 8443}]
+    cfg["hub"]["tailscale_hostname"] = "auto"
+    cfg["machines"] = [{"id": "M2", "type": "ssh"}, {"id": "M1", "type": "local"}]
+    d = tmp_path / "我的 项目 & #1"
+    (d / "src").mkdir(parents=True)
+    (d / "src" / "a.py").write_text("x")
+
+    def parse(url):
+        assert url.startswith("https://mac.tail.ts.net:8443/#new?")
+        q = parse_qs(urlsplit(url).fragment[4:])               # what the web app's URLSearchParams sees
+        return q["cwd"][0], q.get("m", [None])[0]
+    assert parse(server.new_session_url(cfg, str(d))) == (str(d), "M1")
+    assert parse(server.new_session_url(cfg, str(d / "src" / "a.py"))) == (str(d / "src"), "M1")   # a file: its folder
+    url = server.new_session_url(cfg, str(d))
+    assert " " not in url and "&m=" in url and url.count("#") == 1
+    monkeypatch.chdir(d)
+    assert parse(server.new_session_url(cfg, "src")) == (str(d / "src"), "M1")                    # relative to here
+    with pytest.raises(ValueError):
+        server.new_session_url(cfg, str(d / "missing"))
+    cfg["machines"] = []
+    assert parse(server.new_session_url(cfg, str(d)))[1] is None
+    server.RUNTIME.clear()
+
+
+def test_finder_quick_action(tmp_path):
+    import plistlib
+    import shlex
+    import subprocess
+    import finder
+    gli = "/Users/x/my code/glimpse/gli"
+    dest = finder.write(str(tmp_path / "Glimpse.workflow"), gli, "/opt/homebrew/bin:/usr/bin:/bin")
+    info = plistlib.load(open(os.path.join(dest, "Contents", "Info.plist"), "rb"))
+    svc = info["NSServices"][0]
+    assert svc["NSMenuItem"]["default"] == finder.MENU and svc["NSMessage"] == "runWorkflowAsService"
+    assert svc["NSRequiredContext"]["NSApplicationIdentifier"] == "com.apple.finder"
+    assert finder.ours(dest) and not finder.ours(str(tmp_path))
+    doc = plistlib.load(open(os.path.join(dest, "Contents", "document.wflow"), "rb"))
+    p = doc["actions"][0]["action"]["ActionParameters"]
+    assert p["inputMethod"] == 1 and p["shell"] == "/bin/sh"           # the selection arrives as "$@", not as text
+    assert doc["workflowMetaData"]["serviceApplicationBundleID"] == "com.apple.finder"
+    # the script: the installer's PATH (tailscale), then `gli new` with the selected path as one argument
+    sh = tmp_path / "run.sh"
+    assert shlex.quote(gli) in p["COMMAND_STRING"]
+    sh.write_text(p["COMMAND_STRING"].replace(shlex.quote(gli), "printf '%s|' \"$PATH\""))
+    out = subprocess.run(["/bin/sh", str(sh), "/tmp/a b/$(x)"], capture_output=True, text=True).stdout
+    assert out == "/opt/homebrew/bin:/usr/bin:/bin|new|/tmp/a b/$(x)|"          # one argument, never evaluated
+    out = subprocess.run(["/bin/sh", str(sh)], capture_output=True, text=True, env={"HOME": "/h"}).stdout
+    assert out.endswith("|new|/h|")                                              # nothing selected: home
+    if sys.platform == "darwin":
+        for f in ("Info.plist", "document.wflow"):
+            subprocess.run(["plutil", "-lint", os.path.join(dest, "Contents", f)], check=True, capture_output=True)
+
+
 def test_create_ultracode_and_codex_ultra_control(hub_mod):
     C, server = hub_mod
 
@@ -577,8 +636,20 @@ def test_fs_op_validation_and_routing(hub_mod):
         await hub.phone_op(p, {"op": "fs", "m": "M1", "sid": "s1", "action": "list", "path": ""})
         await hub.on_machine_msg(m, {"t": "error", "req": m.written[-1]["req"], "msg": "unknown op 'fs'"})
         assert p.sent[-1]["t"] == "fs" and p.sent[-1]["action"] == "list" and "需要更新" in p.sent[-1]["error"]
+        # a save carries the text and the version it was edited from; new file / folder
+        await hub.phone_op(p, {"op": "fs", "m": "M1", "sid": "s1", "action": "write", "path": "a.py", "text": "x = 1\n",
+                               "sig": "0123456789abcdef"})
+        w = m.written[-1]
+        assert w["action"] == "write" and w["text"] == "x = 1\n" and w["sig"] == "0123456789abcdef" and w["force"] is False
+        await hub.phone_op(p, {"op": "fs", "m": "M1", "sid": "s1", "action": "create", "path": "new.md", "text": ""})
+        assert m.written[-1]["action"] == "create" and m.written[-1]["text"] == "" and m.written[-1]["sig"] is None
+        await hub.phone_op(p, {"op": "fs", "m": "M1", "sid": "s1", "action": "mkdir", "path": "d"})
+        assert m.written[-1]["action"] == "mkdir" and "text" not in m.written[-1]
         n = len(m.written)
-        for bad in ({"action": "write", "path": "a"}, {"action": "read", "path": "x" * 5000}, {"action": "read", "path": 3}):
+        for bad in ({"action": "write", "path": "a"}, {"action": "write", "path": "a", "text": "x"},                 # no version
+                    {"action": "write", "path": "a", "text": "x", "sig": "../../x"}, {"action": "create", "path": "a"},
+                    {"action": "write", "path": "a", "text": "x" * (server.FS_TEXT_LIMIT + 1), "sig": "0" * 16},
+                    {"action": "delete", "path": "a"}, {"action": "read", "path": "x" * 5000}, {"action": "read", "path": 3}):
             await hub.phone_op(p, dict({"op": "fs", "m": "M1", "sid": "s1"}, **bad))
             assert p.sent[-1]["t"] == "error"
         await hub.phone_op(p, {"op": "fs", "m": "M1", "action": "list", "path": ""})            # no session

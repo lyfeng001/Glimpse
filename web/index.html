@@ -174,11 +174,12 @@
       <div id="v-widgets" class="wstrip" role="region" aria-label="会话插件"></div>
       <div id="v-banner" class="banner" hidden role="status"></div>
     </header>
-    <!-- files of the session's directory (read-only): a tab on phones, a column on wide screens -->
+    <!-- files of the session's directory (browse, edit, new file / folder): a tab on phones, a column on wide screens -->
     <section id="fpane" class="fpane" role="tabpanel" aria-labelledby="f-title" hidden>
       <div class="f-head">
         <button type="button" id="f-back" class="icon-btn" aria-label="返回文件列表" hidden><svg class="ic"><use href="#i-back"/></svg></button>
         <div class="f-titles"><div id="f-title" class="f-title"></div><div id="f-sub" class="f-sub"></div></div>
+        <button type="button" id="f-new" class="icon-btn" aria-label="新建文件或文件夹"><svg class="ic sm"><use href="#i-plus"/></svg></button>
         <button type="button" id="f-refresh" class="icon-btn" aria-label="刷新"><svg class="ic sm"><use href="#i-refresh"/></svg></button>
       </div>
       <div id="f-tabs" class="f-tabs" role="radiogroup" aria-label="文件视图">
@@ -437,6 +438,29 @@
     <div class="sh-body">
       <div class="group"><label class="cell" for="rename-input"><span class="sr">任务名</span>
         <input id="rename-input" style="text-align:left" enterkeyhint="done" required></label></div>
+    </div>
+  </form>
+</dialog>
+
+<!-- new file / folder in the session's directory -->
+<dialog id="dlg-fnew" class="sheet" aria-labelledby="dlg-fnew-title">
+  <form id="fnew-form" novalidate>
+    <div class="sh-grab" aria-hidden="true"></div>
+    <div class="sh-head">
+      <button type="button" class="txt-btn l" data-close>取消</button>
+      <h2 id="dlg-fnew-title">新建</h2>
+      <button type="submit" class="txt-btn strong r" id="fnew-ok">创建</button>
+    </div>
+    <div class="sh-body">
+      <div class="f-tabs fnew-kind" role="radiogroup" aria-label="类型">
+        <button type="button" role="radio" data-fk="file" aria-checked="true">文件</button>
+        <button type="button" role="radio" data-fk="dir" aria-checked="false">文件夹</button>
+      </div>
+      <div class="group"><label class="cell" for="fnew-path"><span class="sr">路径</span>
+        <input id="fnew-path" class="mono" style="text-align:left" placeholder="例如 docs/notes.md" enterkeyhint="done"
+          autocapitalize="off" autocorrect="off" spellcheck="false" required></label></div>
+      <p class="g-f" id="fnew-hint">相对于会话目录，可以带子文件夹（不存在的会一起建好）。</p>
+      <p class="sh-err" id="fnew-err" role="alert"></p>
     </div>
   </form>
 </dialog>

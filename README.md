@@ -36,7 +36,10 @@ Glimpse turns your phone into a remote control for those sessions. What you see 
 - **Three views**:
   - **Chat** renders the Claude Code / Codex transcript as chat bubbles, with expandable tool calls and output; Markdown tables, quotes and links are rendered and code blocks are highlighted.
   - **Terminal** is the full terminal screen, rendered with xterm.js.
-  - **Files** browses the session's working directory, read-only: a folder tree with git status marks, previews of text (line numbers, wrap, syntax highlighting for about 20 languages), Markdown (渲染 | 源码), images and diffs, and a 改动 list of changed files with +/− counts. 引用 puts `@path` into the composer. On a wide screen (≥ 1200 px) the files are a column next to chat / terminal; drag its edge to resize it (double-click for the default). Requests are confined to the session's directory (symlinks out of it are refused) and nothing is ever written; files that usually hold secrets (`.env`, keys, credentials) or contain something that looks like a key are listed, but their content is only shown after tapping 显示内容.
+  - **Files** browses the session's working directory: a folder tree with git status marks, previews of text (line numbers, wrap, syntax highlighting for about 20 languages), Markdown (渲染 | 源码), images and diffs, and a 改动 list of changed files with +/− counts. 引用 puts `@path` into the composer. On a wide screen (≥ 1200 px) the files are a column next to chat / terminal; drag its edge to resize it (double-click for the default).
+    - **编辑** edits a text file in place (highlighted, Tab / Shift+Tab indent, ⌘S / Ctrl+S saves). Saving names the version you started from: if the file changed meanwhile (the AI edited it), you are asked before it is overwritten. An unsaved edit survives leaving the session or reloading the page. The file keeps its encoding (UTF-8 or GB18030), line endings and permissions; the write is atomic.
+    - **＋** creates a file (opened in the editor) or a folder, missing parent folders included. Nothing is ever deleted or renamed from here.
+    - Requests are confined to the session's directory (symlinks out of it are refused). `.git` and Glimpse's own `data/` and `config.json` can't be changed. Files that usually hold secrets (`.env`, keys, credentials) or contain something that looks like a key are listed, but their content is only shown (and editable) after tapping 显示内容.
 - **Type from the phone**: messages are submitted to the session's process exactly as if typed. The quick-key bar (Esc, ^C, Tab, arrows, 1/2/3, paste…) is customisable in Settings → 快捷键: turn keys on or off, reorder them, or add your own (`^X`, `\e`, `\r`, `\xNN` escapes). The paste key sends the clipboard as a bracketed paste, and code blocks in chat have a copy button.
 - **TUI menus in chat view**: when `/model`, `/effort` or another interactive picker opens in the terminal, chat view shows it as a menu card with large tappable rows (current choice and cursor marked), plus Esc and, for Claude, "s · this session only". A "/" button in the composer types common slash commands (`/model`, `/effort`, `/compact`, `/clear`, `/status`).
 - **One-tap approvals**: when Claude Code asks for permission, an approval card offers Allow, Always allow, Deny or Handle in terminal. This uses the official `PermissionRequest` hook, not simulated key presses.
@@ -136,6 +139,7 @@ scripts/install_launchd.sh       # optional (macOS): start at login and restart 
   - Arguments after `--` go to the tool unchanged, e.g. `gli run claude -- --model sonnet`.
   - It uses the machine's preset from `config.json` (argv and default key, the same as the phone). `-k/--key NAME` picks another key, `--key none` uses none. It prints the key name, never its value.
   - `gli run claude --resume <id>` continues a conversation. If a Glimpse session already holds it, you attach to that session (restarted in place if it had exited) instead of getting a second copy.
+- **From Finder (macOS)**: run `gli finder-install` once. Then right-click a folder → 快速操作 (or 服务) → **用 Glimpse 新建会话**: the browser opens the new-session form with this computer and that folder filled in (a file: its folder). Everything else keeps its default, and nothing starts until you tap 启动. `gli new [PATH]` does the same from a terminal. The menu entry is `~/Library/Services/Glimpse 新建会话.workflow`; `gli finder-uninstall` removes it. If it doesn't show up, turn it on in System Settings → 键盘 → 键盘快捷键 → 服务 (or 隐私与安全性 → 扩展 → 访达). The browser needs to be logged in to the hub at the same address as `gli url` prints.
 
 - **Shell integration (keep typing your usual commands)**: add one line to `~/.zshrc` (or `~/.bashrc`) on the hub computer:
 
@@ -302,6 +306,7 @@ hub/machines.py          stdio channel to each machine (local subprocess / ssh)
 hub/webpush.py           Web Push (RFC 8291 encryption + RFC 8292 VAPID), no third-party push library
 hub/config.py            configuration loading
 hub/attach_client.py     `gli attach` through the hub (sessions on other machines)
+hub/finder.py            the Finder Quick Action (`gli finder-install`)
 web/                     the PWA (vanilla JS + xterm.js, no build step); web/icon.svg is the master logo (PNGs are generated from it)
 ```
 

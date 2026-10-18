@@ -586,7 +586,7 @@ function connect() {
     flushOutbox();
     send({ op: 'visible', v: onScreen() });
     ping();
-    if (S.view) subscribe();
+    if (S.view) { subscribe(); fsChanged(); }        // fs requests sent before the socket was up were dropped
   };
   ws.onmessage = (ev) => {
     if (S.ws !== ws) return;
@@ -658,6 +658,7 @@ function onMsg(m) {
       renderHome();
       if (S.view) renderView();
       refreshOpenSheets();
+      newFromRouteNow();
       break;
     case 'pong':
       clearTimeout(S.pongTimer); S.pongTimer = null; S.lastPong = performance.now();
@@ -1054,6 +1055,7 @@ function sendBytes(bytes) {
 }
 
 function routeTo(h) {
+  if (/^new(\?|$)/.test(h || '')) { newFromRoute(h); return; }
   const [m, sid] = (h || '').split('/');
   if (m && sid) { if (!S.view || S.view.m !== m || S.view.sid !== sid) openSession(m, sid, true); }
   else if (S.view) closeSession();
@@ -1235,7 +1237,7 @@ $('#seg').addEventListener('keydown', (e) => {
 // Phones: a third tab next to 对话 / 终端. Wide screens: a column on the left that stays next to chat / terminal
 // (toggled with #btn-files). The agent confines every request to the session's directory and never writes.
 const WIDE_FILES = matchMedia('(min-width: 1200px)');
-const FS = { key: null, open: new Set(['']), dirs: {}, tab: 'tree', git: null, file: null, wrap: false, stale: true, at: 0 };
+const FS = { key: null, open: new Set(['']), dirs: {}, tab: 'tree', git: null, file: null, edit: null, lastDir: '', wrap: false, stale: true, at: 0 };
 function filesWide() { return WIDE_FILES.matches; }
 function filesColumn() { return filesWide() && LS.getItem('glimpse.filesCol') !== '0'; }
 function layoutPanes() {
@@ -1319,14 +1321,16 @@ function fsEnsure() {
   const v = S.view; if (!v) return;
   const key = v.m + '/' + v.sid;
   if (FS.key !== key) {
-    Object.assign(FS, { key, open: new Set(['']), dirs: {}, tab: 'tree', git: null, file: null, stale: true, at: 0 });
+    edStash();                                    // an unsaved edit of the session we leave is kept for later
+    Object.assign(FS, { key, open: new Set(['']), dirs: {}, tab: 'tree', git: null, file: null, edit: null, reEdit: null, lastDir: '', stale: true, at: 0 });
+    const host = $('#f-preview'); host._h = null; host.innerHTML = ''; host.classList.remove('editing');
   }
   if (FS.stale || Date.now() - FS.at > 20000) fsRefresh(true);
   renderFiles();
 }
-function fsSend(action, path, force) {
+function fsSend(action, path, force, extra) {
   const v = S.view; if (!v) return false;
-  return send({ op: 'fs', m: v.m, sid: v.sid, action, path: path || '', force: !!force });
+  return send(Object.assign({ op: 'fs', m: v.m, sid: v.sid, action, path: path || '', force: !!force }, extra || {}));
 }
 // reload what is shown (open folders, git status, the open file); quiet = keep the old content until the new arrives
 function fsRefresh(quiet) {
@@ -1364,7 +1368,12 @@ function onFs(m) {
     }
   } else if ((m.action === 'read' || m.action === 'diff') && FS.file && FS.file.path === m.path && FS.file.mode === m.action) {
     FS.file.loading = false; FS.file.res = m;
-  }
+    // the file was reloaded while it is being edited (a turn ended, 刷新): never replace the text, only tell
+    const e = FS.edit;
+    if (e && e.path === m.path && m.action === 'read' && !m.error && m.sig && m.sig !== e.sig) e.stale = true;
+    if (FS.reEdit === m.path && m.action === 'read') { FS.reEdit = null; if (!e && m.editable) { edStart(); return; } }
+  } else if (m.action === 'write') { edSaved(m); return; }
+  else if (m.action === 'create' || m.action === 'mkdir') { fnewDone(m); return; }
   renderFiles();
 }
 function fsOpen(path, mode, force, quiet) {
@@ -1384,6 +1393,7 @@ function renderFiles() {
   const s = session(v.m, v.sid);
   const f = FS.file;
   $('#f-back').hidden = !f;
+  $('#f-new').hidden = !!FS.edit;
   $('#f-tabs').hidden = !!f;
   $('#f-list').hidden = !!f;
   $('#f-preview').hidden = !f;
@@ -1453,6 +1463,9 @@ function gitHTML() {
 }
 function renderPreview() {
   const f = FS.file; const r = f.res; const host = $('#f-preview');
+  if (FS.edit && FS.edit.path === f.path) { renderEditor(host); return; }
+  host.classList.remove('editing');
+  if (host.querySelector('.f-ed')) host._h = null;   // leaving the editor: rebuild the preview
   const isMd = /\.(md|markdown|mdx)$/i.test(f.path);
   const st = FS.git && FS.git.map ? FS.git.map[f.path] : null;
   const lang = window.HL ? HL.detect(f.path, r && r.text) : '';
@@ -1465,6 +1478,8 @@ function renderPreview() {
   if (st) bar += '<div class="f-seg" role="radiogroup" aria-label="显示">' +
     (st !== 'D' ? '<button type="button" role="radio" data-fmode="read" aria-checked="' + (f.mode === 'read') + '">文件</button>' : '') +
     '<button type="button" role="radio" data-fmode="diff" aria-checked="' + (f.mode === 'diff') + '">改动</button></div>';
+  if (r && r.kind === 'text' && r.editable && f.mode === 'read') bar += '<button type="button" class="f-chip" data-fedit>' + ic('pencil', 'xs') +
+    (LS.getItem(edKey(f.path)) ? '继续编辑' : '编辑') + '</button>';
   if (!rendered) bar += '<button type="button" class="f-chip" data-fwrap aria-pressed="' + FS.wrap + '">自动换行</button>';
   bar += '<button type="button" class="f-chip" data-fref title="在输入框插入 @' + esc(f.path) + '">引用</button>' +
     '<button type="button" class="f-chip" data-fcopy>复制路径</button>' +
@@ -1501,6 +1516,224 @@ function renderPreview() {
   setHTML(host, bar + body);
   host.scrollTop = top;
 }
+// ---- editing a file: a textarea over the highlighted text (same font and padding, scrolled together), line
+// numbers on the left. Saving names the version it was edited from; a file that changed meanwhile (the AI edited it)
+// is not overwritten without asking. An unsaved edit survives leaving the session / reloading (localStorage).
+function edKey(path) { return 'glimpse.edit.' + FS.key + ':' + path; }
+function edStash() {
+  const e = FS.edit;
+  if (e && FS.key && e.text !== e.base) LS.setItem(edKey(e.path), JSON.stringify({ sig: e.sig, text: e.text.slice(0, 2e6) }));
+}
+function edDrop(path) { if (FS.key) LS.removeItem(edKey(path)); }
+function edIndent(text, path) {
+  if (/(^|\/)(makefile|gnumakefile)$|\.mk$/i.test(path)) return '\t';
+  let tabs = 0; let sp = 0; let unit = 0;
+  for (const l of text.split('\n', 400)) {
+    const m = /^([ \t]+)\S/.exec(l); if (!m) continue;
+    if (m[1][0] === '\t') tabs++;
+    else { sp++; const n = m[1].length; if (n === 2 || n === 4) unit = unit && unit < n ? unit : n; }
+  }
+  return tabs > sp ? '\t' : ' '.repeat(unit || 4);
+}
+function edStart() {
+  const f = FS.file; const r = f && f.res; if (!r || !r.editable) return;
+  let text = r.text; let restored = false;
+  try {
+    const s = JSON.parse(LS.getItem(edKey(f.path)) || 'null');
+    if (s && s.sig === r.sig && typeof s.text === 'string' && s.text !== r.text) { text = s.text; restored = true; }
+  } catch (_) {}
+  FS.edit = { path: f.path, sig: r.sig, base: r.text, text, lang: window.HL ? HL.detect(f.path, r.text) : '', indent: edIndent(r.text, f.path),
+    stale: false, saving: false, sent: null };
+  renderFiles();
+  const ta = $('#f-preview .f-ed-ta'); if (ta) ta.focus();
+  if (restored) toast('已恢复未保存的修改', f.path, null, 'done');
+}
+// leave the editor; asks first when there are unsaved changes. Resolves true when left.
+async function edLeave() {
+  const e = FS.edit; if (!e) return true;
+  if (e.text !== e.base && !(await confirmSheet('放弃未保存的修改？', fsName(e.path) + ' 的修改还没有保存。', '放弃修改'))) return false;
+  edDrop(e.path);
+  FS.edit = null;
+  if (FS.file) fsOpen(FS.file.path, 'read', FS.file.force, true);
+  renderFiles();
+  return true;
+}
+function edSave(force) {
+  const e = FS.edit; if (!e || e.saving) return;
+  e.saving = true; e.sent = e.text;
+  if (!fsSend('write', e.path, force, { text: e.text, sig: e.sig })) { e.saving = false; toast('未连接', '稍后再试', null, 'error'); }
+  renderEditorBar();
+}
+async function edSaved(m) {
+  const e = FS.edit;
+  if (!e || e.path !== m.path) {                         // the editor was left while saving
+    if (m.saved) fsChanged(); else if (m.error || m.conflict) toast('没有保存', fsName(m.path) + (m.error ? '：' + m.error : ' 在别处被改过'), null, 'error');
+    return;
+  }
+  e.saving = false;
+  if (m.error) { toast('保存失败', m.error, null, 'error'); renderEditorBar(); return; }
+  if (m.conflict) {
+    e.stale = true; renderEditorBar();
+    if (await confirmSheet('文件在别处被改过', fsName(e.path) + ' 在你编辑时被修改了（可能是 AI 改的）。用你的版本覆盖，还是先取消，用“载入最新”查看？', '用我的版本覆盖')) edSave(true);
+    return;
+  }
+  e.sig = m.sig; e.base = e.sent; e.stale = false; e.sent = null; e.saved = true;
+  edDrop(e.path);
+  if (FS.file && FS.file.res) Object.assign(FS.file.res, { text: e.base, sig: m.sig, size: m.size });
+  toast('已保存', e.path, null, 'done');
+  FS.git = Object.assign({}, FS.git || {}, { loading: !FS.git });
+  fsSend('git'); fsSend('list', fsDir(e.path));
+  renderEditorBar();
+}
+// throw the edit away and edit what is on disk now (onFs starts the editor again when the read arrives)
+async function edReload() {
+  const e = FS.edit; if (!e) return;
+  if (e.text !== e.base && !(await confirmSheet('载入磁盘上的最新内容？', '你的修改会被丢掉。', '载入最新'))) return;
+  if (FS.edit !== e) return;
+  edDrop(e.path); FS.edit = null; FS.reEdit = e.path;
+  fsOpen(e.path, 'read', FS.file && FS.file.force);
+}
+function renderEditorBar() {
+  const host = $('#f-preview'); const e = FS.edit; const bar = host.querySelector('.f-ed-bar'); if (!e || !bar) return;
+  const dirty = e.text !== e.base;
+  const st = e.saving ? '<span class="spinner" aria-hidden="true"></span>保存中…' : e.stale ? '磁盘上的文件已被修改' : dirty ? '未保存' : e.saved ? '已保存' : '';
+  setHTML(bar, '<button type="button" class="f-chip primary" data-fsave' + (e.saving || !dirty ? ' disabled' : '') + '>保存</button>' +
+    '<button type="button" class="f-chip" data-fcancel>' + (dirty ? '放弃修改' : '完成') + '</button>' +
+    (e.stale ? '<button type="button" class="f-chip warn" data-freload>载入最新</button>' : '') +
+    '<span class="f-ed-st' + (e.stale ? ' warn' : dirty ? ' dirty' : '') + '" role="status">' + st + '</span>' +
+    (e.lang ? '<span class="f-lang">' + esc(HL.label(e.lang)) + '</span>' : ''));
+}
+function renderEditor(host) {
+  const e = FS.edit;
+  host.classList.add('editing');
+  if (!host.querySelector('.f-ed') || host.querySelector('.f-ed').dataset.path !== e.path) {
+    host._h = null;
+    host.innerHTML = '<div class="f-bar f-ed-bar"></div><div class="f-ed" data-path="' + esc(e.path) + '"><div class="f-ed-gut" aria-hidden="true"></div>' +
+      '<div class="f-ed-main"><pre class="f-ed-hl" aria-hidden="true"></pre><textarea class="f-ed-ta" spellcheck="false" autocapitalize="off" ' +
+      'autocomplete="off" autocorrect="off" wrap="off" aria-label="编辑 ' + esc(e.path) + '" aria-describedby="f-ed-help"></textarea></div></div>' +
+      '<span id="f-ed-help" class="sr">Tab 缩进，Shift+Tab 取消缩进，⌘S 或 Ctrl+S 保存；先按 Esc 再按 Tab 离开编辑框。</span>';
+    const ta = host.querySelector('.f-ed-ta');
+    ta.value = e.text;
+    edWire(ta);
+    edPaint(true);
+  }
+  renderEditorBar();
+}
+let edTimer = null;
+function edPaint(now) {
+  const host = $('#f-preview'); const e = FS.edit; if (!e) return;
+  const pre = host.querySelector('.f-ed-hl'); const gut = host.querySelector('.f-ed-gut'); if (!pre) return;
+  const n = e.text.split('\n').length;
+  if (gut._n !== n) { gut._n = n; gut.textContent = Array.from({ length: n }, (_, i) => i + 1).join('\n'); }
+  const paint = () => { pre.innerHTML = (e.lang && window.HL ? HL.html(e.text, e.lang) : esc(e.text)) + '\n'; edScroll(); };
+  clearTimeout(edTimer);
+  if (now || e.text.length < 60000) paint(); else edTimer = setTimeout(paint, 250);   // big files: after a pause
+}
+function edScroll() {
+  const host = $('#f-preview'); const ta = host.querySelector('.f-ed-ta'); if (!ta) return;
+  const pre = host.querySelector('.f-ed-hl'); const gut = host.querySelector('.f-ed-gut');
+  pre.scrollTop = ta.scrollTop; pre.scrollLeft = ta.scrollLeft; gut.scrollTop = ta.scrollTop;
+}
+// insert as if typed: the browser's undo (⌘Z) keeps working
+function edInsert(ta, s) {
+  ta.focus();
+  if (document.execCommand && document.execCommand('insertText', false, s)) return;       // fires "input" itself
+  ta.setRangeText(s, ta.selectionStart, ta.selectionEnd, 'end');
+  ta.dispatchEvent(new Event('input'));
+}
+function edLineStart(v, i) { return i > 0 ? v.lastIndexOf('\n', i - 1) + 1 : 0; }
+function edWire(ta) {
+  ta.addEventListener('input', () => {
+    const e = FS.edit; if (!e) return;
+    const was = e.text !== e.base;
+    e.text = ta.value;
+    edPaint(false);
+    if (was !== (e.text !== e.base)) renderEditorBar();
+  });
+  ta.addEventListener('scroll', edScroll, { passive: true });
+  ta.addEventListener('focus', () => $('#view').classList.add('f-typing'));
+  ta.addEventListener('blur', () => $('#view').classList.remove('f-typing'));
+  let esc1 = false;                                                     // Esc, then Tab leaves the editor (no keyboard trap)
+  ta.addEventListener('keydown', (ev) => {
+    const e = FS.edit; if (!e || ev.isComposing || ev.keyCode === 229) return;
+    const escaped = esc1; esc1 = ev.key === 'Escape';
+    if ((ev.metaKey || ev.ctrlKey) && !ev.altKey && ev.key.toLowerCase() === 's') { ev.preventDefault(); edSave(false); return; }
+    if (ev.key === 'Tab' && !escaped && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
+      ev.preventDefault();
+      const v = ta.value; const a = ta.selectionStart; const b = ta.selectionEnd;
+      if (!ev.shiftKey && !v.slice(a, b).includes('\n')) { edInsert(ta, e.indent); return; }
+      // indent / outdent every line the selection touches (a selection ending at a line start leaves that line alone)
+      const ls = edLineStart(v, a);
+      const end = b > a && v[b - 1] === '\n' ? b - 1 : b;
+      let le = v.indexOf('\n', end); if (le < 0) le = v.length;
+      const un = new RegExp('^(\\t|' + (e.indent === '\t' ? ' {1,4}' : ' {1,' + e.indent.length + '}') + ')');
+      const out = v.slice(ls, le).split('\n').map((l) => ev.shiftKey ? l.replace(un, '') : (l ? e.indent + l : l)).join('\n');
+      if (out === v.slice(ls, le)) return;
+      const single = a === b;
+      ta.setSelectionRange(ls, le); edInsert(ta, out);
+      if (single) { const p = Math.max(ls, a + out.length - (le - ls)); ta.setSelectionRange(p, p); }
+      else ta.setSelectionRange(ls, ls + out.length);
+      return;
+    }
+    if (ev.key === 'Enter' && !ev.shiftKey && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
+      const v = ta.value; const a = ta.selectionStart;
+      const ind = /^[ \t]*/.exec(v.slice(edLineStart(v, a), a))[0];
+      if (ind) { ev.preventDefault(); edInsert(ta, '\n' + ind); }         // keep the line's indentation
+    }
+  });
+}
+window.addEventListener('beforeunload', (ev) => {
+  const e = FS.edit; if (!e || e.text === e.base) return;
+  edStash(); ev.preventDefault(); ev.returnValue = '';
+});
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') edStash(); });
+
+// ---- new file / folder
+function fnewOpen() {
+  const kind = LS.getItem('glimpse.fnewKind') === 'dir' ? 'dir' : 'file';
+  fnewKind(kind);
+  $('#fnew-path').value = FS.lastDir ? FS.lastDir + '/' : '';
+  $('#fnew-err').textContent = ''; $('#fnew-ok').disabled = false;
+  openSheet($('#dlg-fnew'));
+  setTimeout(() => { const i = $('#fnew-path'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }, 60);
+}
+function fnewKind(k) {
+  for (const b of $$('#dlg-fnew [data-fk]')) b.setAttribute('aria-checked', String(b.dataset.fk === k));
+  $('#fnew-path').placeholder = k === 'dir' ? '例如 docs/drafts' : '例如 docs/notes.md';
+  $('#dlg-fnew-title').textContent = k === 'dir' ? '新建文件夹' : '新建文件';
+}
+for (const b of $$('#dlg-fnew [data-fk]')) b.onclick = () => { LS.setItem('glimpse.fnewKind', b.dataset.fk); fnewKind(b.dataset.fk); };
+$('#fnew-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const dir = $('#dlg-fnew [data-fk="dir"]').getAttribute('aria-checked') === 'true';
+  const p = $('#fnew-path').value.trim().replace(/^\/+|\/+$/g, '');
+  if (!p || /(^|\/)\.\.?(\/|$)/.test(p)) { $('#fnew-err').textContent = '请填写文件' + (dir ? '夹' : '') + '名（不能用 . 或 ..）'; return; }
+  $('#fnew-err').textContent = ''; $('#fnew-ok').disabled = true;
+  if (!fsSend(dir ? 'mkdir' : 'create', p, false, dir ? null : { text: '' })) { $('#fnew-ok').disabled = false; $('#fnew-err').textContent = '未连接'; }
+});
+// open (and reload: one of them may be new) the root and every folder on the way to `path`
+function fsReveal(path) {
+  let a = ''; const dirs = [''];
+  for (const part of path ? path.split('/') : []) { a = a ? a + '/' + part : part; dirs.push(a); }
+  for (const d of dirs) { FS.open.add(d); FS.dirs[d] = Object.assign({}, FS.dirs[d] || {}, { loading: !FS.dirs[d] }); fsSend('list', d); }
+}
+function fnewDone(m) {
+  if (!$('#dlg-fnew').open) { if (!m.error) fsRefresh(true); return; }
+  $('#fnew-ok').disabled = false;
+  if (m.error) { $('#fnew-err').textContent = m.error; return; }
+  const p = m.created; const d = $('#dlg-fnew');
+  // the modal keeps focus until it has closed (and then gives it back to 新建): the editor takes it after that
+  d.addEventListener('close', () => { const ta = $('#f-preview .f-ed-ta'); if (ta && FS.edit && FS.edit.path === p) ta.focus(); }, { once: true });
+  closeSheet(d);
+  FS.tab = 'tree'; fsSend('git');
+  if (m.dir) { fsReveal(p); FS.lastDir = p; renderFiles(); toast('已新建文件夹', p, null, 'done'); return; }
+  fsReveal(fsDir(p)); FS.lastDir = fsDir(p);
+  // a new empty file: straight into the editor
+  FS.file = { path: p, mode: 'read', force: false, loading: false, md: false,
+    res: { t: 'fs', action: 'read', path: p, kind: 'text', text: '', sig: m.sig, size: 0, editable: true, encoding: 'utf-8', truncated: false } };
+  edStart();
+}
+
 function fsRef(path) {
   const t = $('#input'); const ref = '@' + (/\s/.test(path) ? '"' + path + '"' : path);
   t.value = t.value + (t.value && !/\s$/.test(t.value) ? ' ' : '') + ref + ' ';
@@ -1510,16 +1743,17 @@ function fsRef(path) {
 }
 $('#fpane').addEventListener('click', (e) => {
   const t = e.target.closest('button'); if (!t || !$('#fpane').contains(t)) return;
-  if (t.id === 'f-back') { FS.file = null; renderFiles(); return; }
+  if (t.id === 'f-back') { edLeave().then((ok) => { if (ok) { FS.file = null; renderFiles(); } }); return; }
   if (t.id === 'f-refresh') { fsRefresh(false); return; }
+  if (t.id === 'f-new') { fnewOpen(); return; }
   if (t.dataset.ft) { FS.tab = t.dataset.ft; renderFiles(); return; }
   if (t.dataset.dir != null) {
     const p = t.dataset.dir;
     if (FS.open.has(p)) FS.open.delete(p);
-    else { FS.open.add(p); if (!FS.dirs[p] || FS.dirs[p].error) { FS.dirs[p] = { loading: true }; fsSend('list', p); } }
+    else { FS.open.add(p); FS.lastDir = p; if (!FS.dirs[p] || FS.dirs[p].error) { FS.dirs[p] = { loading: true }; fsSend('list', p); } }
     renderFiles(); return;
   }
-  if (t.dataset.file != null) { fsOpen(t.dataset.file, 'read'); return; }
+  if (t.dataset.file != null) { FS.lastDir = fsDir(t.dataset.file); fsOpen(t.dataset.file, 'read'); return; }
   if (t.dataset.diff != null) { fsOpen(t.dataset.diff, 'diff'); return; }
   if (t.dataset.gdir != null) {
     // an untracked folder: show it in the tree, opened
@@ -1528,6 +1762,10 @@ $('#fpane').addEventListener('click', (e) => {
     FS.tab = 'tree'; renderFiles(); return;
   }
   const f = FS.file; if (!f) return;
+  if (t.dataset.fedit != null) { edStart(); return; }
+  if (t.dataset.fsave != null) { edSave(false); return; }
+  if (t.dataset.fcancel != null) { edLeave(); return; }
+  if (t.dataset.freload != null) { edReload(); return; }
   if (t.dataset.fshow != null) { fsOpen(f.path, f.mode, true); return; }
   if (t.dataset.fmode) { if (t.dataset.fmode !== f.mode) fsOpen(f.path, t.dataset.fmode, f.force); return; }
   if (t.dataset.fmd) { f.md = t.dataset.fmd === 'render'; LS.setItem('glimpse.mdView', f.md ? 'render' : 'raw'); renderFiles(); return; }
@@ -2255,6 +2493,21 @@ function openNew(mid) {
   $('#new-machine').value = '';
   fillNew();
   openSheet($('#dlg-new'));
+}
+// #new?cwd=PATH&m=M1 (`gli new`, the Finder Quick Action): the new-session form with the machine and folder filled
+// in. Only fills it: nothing starts until 创建. The hash is dropped at once, so a reload doesn't open it again.
+let newRoute = null;
+function newFromRoute(h) {
+  const q = new URLSearchParams(h.slice(4));
+  newRoute = { cwd: (q.get('cwd') || '').slice(0, 4096), m: q.get('m') || '' };
+  history.replaceState(history.state, '', location.pathname + (S.view ? '#' + S.view.m + '/' + S.view.sid : ''));
+  if (S.haveState) newFromRouteNow();                // else: when the first state arrives (the machine list)
+}
+function newFromRouteNow() {
+  const r = newRoute; if (!r) return; newRoute = null;
+  const local = S.machines.find((x) => x.type === 'local');
+  openNew(S.byId[r.m] ? r.m : local && local.id);
+  if (r.cwd) { $('#new-cwd').value = r.cwd; $('#new-cwd').dataset.touched = '1'; }
 }
 $('#btn-new').onclick = () => openNew();
 $('#fab').onclick = () => openNew();

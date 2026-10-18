@@ -244,6 +244,17 @@ def test_usage_tracking_claude_dedupes_message_ids():
     assert u["context_used"] == 130 and u["model"] == "claude-x"
 
 
+def test_usage_tracking_ignores_claudes_synthetic_messages():
+    # an API error / interrupted turn: claude writes an assistant line with model "<synthetic>" and zero usage
+    _, s = _session()
+    s.tail_kind = "claude"
+    s.track_usage({"type": "assistant", "message": {"id": "m1", "model": "claude-sonnet-4-5",
+                                                     "usage": {"input_tokens": 5, "cache_read_input_tokens": 1000, "output_tokens": 7}}})
+    s.track_usage({"type": "assistant", "message": {"id": "m2", "model": "<synthetic>",
+                                                     "usage": {"input_tokens": 0, "output_tokens": 0}}})
+    assert s.usage["model"] == "claude-sonnet-4-5" and s.usage["context_used"] == 1005 and s.usage["turns"] == 1
+
+
 def test_usage_tracking_codex_token_count():
     _, s = _session("codex")
     s.tail_kind = "codex"
@@ -759,6 +770,62 @@ def test_fs_git_status_and_diff(tmp_path):
     assert A.fs_diff(str(root), ".env")["kind"] == "sensitive" and "+K=2" in A.fs_diff(str(root), ".env", force=True)["text"]
     # a session started in a sub directory only sees changes below it, with paths relative to it
     assert [f["path"] for f in A.fs_git(str(root / "sub"))["files"]] == ["b.txt"]
+
+
+def test_fs_write_create_mkdir(tmp_path, monkeypatch):
+    import pytest
+    root = tmp_path / "proj"
+    (root / "src").mkdir(parents=True)
+    (root / ".git").mkdir()
+    (root / ".git" / "config").write_text("[core]\n")
+    (root / "src" / "a.py").write_text("x = 1\n")
+    (root / "win.txt").write_bytes(b"a\r\nb\r\n")
+    (root / "gbk.txt").write_bytes("旧内容".encode("gb18030"))
+    (tmp_path / "outside.txt").write_text("o")
+    (root / "out_link").symlink_to(tmp_path / "outside.txt")
+    (root / "in_link").symlink_to(root / "src" / "a.py")
+    os.chmod(root / "src" / "a.py", 0o640)
+    monkeypatch.setattr(A, "FS_PRIVATE", {str(root / "data")})
+    (root / "data").mkdir()
+    (root / "data" / "token").write_text("t")
+    r = A.fs_read(str(root), "src/a.py")
+    assert r["editable"] and r["sig"] == A.fs_sig(b"x = 1\n")
+    # a save from the version that is on disk
+    w = A.fs_write(str(root), "src/a.py", "x = 2\n", r["sig"])
+    assert w["saved"] and (root / "src" / "a.py").read_text() == "x = 2\n" and w["sig"] == A.fs_sig(b"x = 2\n")
+    assert oct(os.stat(root / "src" / "a.py").st_mode & 0o777) == "0o640"                 # mode kept
+    # the file changed meanwhile (the AI edited it): refused unless forced
+    (root / "src" / "a.py").write_text("x = 3  # by the AI\n")
+    c = A.fs_write(str(root), "src/a.py", "x = 4\n", w["sig"])
+    assert c == {"conflict": True, "sig": A.fs_sig(b"x = 3  # by the AI\n")} and "AI" in (root / "src" / "a.py").read_text()
+    assert A.fs_write(str(root), "src/a.py", "x = 4\n", w["sig"], force=True)["saved"]
+    # CRLF and gb18030 files keep their line ends / encoding
+    rw = A.fs_read(str(root), "win.txt")
+    A.fs_write(str(root), "win.txt", rw["text"].replace("\r\n", "\n") + "c\n", rw["sig"])
+    assert (root / "win.txt").read_bytes() == b"a\r\nb\r\nc\r\n"
+    rg = A.fs_read(str(root), "gbk.txt")
+    A.fs_write(str(root), "gbk.txt", "新内容", rg["sig"])
+    assert (root / "gbk.txt").read_bytes() == "新内容".encode("gb18030")
+    # a symlink inside: the target is written, the link stays
+    ri = A.fs_read(str(root), "in_link")
+    A.fs_write(str(root), "in_link", "y = 1\n", ri["sig"])
+    assert (root / "in_link").is_symlink() and (root / "src" / "a.py").read_text() == "y = 1\n"
+    # never outside, never Glimpse's data, never .git
+    for bad in ("../outside.txt", "out_link", "data/token", ".git/config"):
+        with pytest.raises(ValueError):
+            A.fs_write(str(root), bad, "x", "0" * 16, force=True)
+    assert (tmp_path / "outside.txt").read_text() == "o" and (root / "data" / "token").read_text() == "t"
+    assert not A.fs_read(str(root), ".git/config")["editable"]
+    # new files / folders
+    assert A.fs_create(str(root), "docs/new/notes.md", "# hi\n") == {"created": "docs/new/notes.md", "dir": False, "sig": A.fs_sig(b"# hi\n")}
+    assert (root / "docs" / "new" / "notes.md").read_text() == "# hi\n"
+    assert A.fs_mkdir(str(root), "lib") == {"created": "lib", "dir": True} and (root / "lib").is_dir()
+    for bad in ("src/a.py", "lib", "", "/", "..", "a/../../x", "../x", "out_link/x", ".git/hooks/x", "data/x", "a\nb", "a\\b"):
+        with pytest.raises(ValueError):
+            A.fs_create(str(root), bad, "x")
+    with pytest.raises(ValueError):
+        A.fs_mkdir(str(root), "src")
+    assert not (tmp_path / "x").exists()
 
 
 def test_fs_op_replies_in_place(tmp_path):

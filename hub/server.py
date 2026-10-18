@@ -33,6 +33,8 @@ log = logging.getLogger("glimpse.hub")
 PHONE_QUEUE_MAX = 4000       # messages; a phone that falls this far behind is disconnected
 VISIBLE_FRESH = 15           # s; a "visible" phone that has been silent longer is treated as gone (push again)
 CODE_CHECK_EVERY = 10        # s; how often the agent source on disk is checked against what the machines run
+FS_ACTIONS = ("list", "read", "git", "diff", "write", "create", "mkdir")
+FS_TEXT_LIMIT = 2 * 1024 * 1024   # characters in a saved / new file (the agent checks the encoded size too)
 CERT_RETRY = 600             # s between certificate attempts while serving without one
 CERT_RENEW = 12 * 3600
 HOST_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
@@ -754,11 +756,19 @@ class Hub:
                 kind = msg.get("kind") if msg.get("kind") in ("claude", "codex") else None
                 self.forward(p, m, {"op": "history", "kind": kind, "limit": 30})
             elif op == "fs":
-                # read-only browsing of the session's directory; the agent confines it to that directory
+                # files of the session's directory (browse, edit, new file / folder); the agent confines every
+                # request to that directory and refuses Glimpse's own data and .git
                 action, path = msg.get("action"), msg.get("path") or ""
-                if not sid or action not in ("list", "read", "git", "diff") or not isinstance(path, str) or len(path) > 4096:
+                if not sid or action not in FS_ACTIONS or not isinstance(path, str) or len(path) > 4096:
                     raise ValueError("无效的文件请求")
-                self.forward(p, m, {"op": "fs", "sid": sid, "action": action, "path": path, "force": bool(msg.get("force"))})
+                out = {"op": "fs", "sid": sid, "action": action, "path": path, "force": bool(msg.get("force"))}
+                if action in ("write", "create"):
+                    text, sig = msg.get("text"), msg.get("sig")
+                    if not isinstance(text, str) or len(text) > FS_TEXT_LIMIT or (action == "write" and not
+                                                                                   (isinstance(sig, str) and re.fullmatch(r"[0-9a-f]{16}", sig))):
+                        raise ValueError("无效的文件内容")
+                    out.update(text=text, sig=sig if action == "write" else None)
+                self.forward(p, m, out)
             elif op == "control":
                 action, value = msg.get("action"), msg.get("value")
                 if action not in CONTROL_ACTIONS or not isinstance(value, str) or len(value) > 500:
@@ -1382,6 +1392,22 @@ def hub_base_url(cfg):
     return "https://%s:%s/" % (name or first["host"], first["port"])
 
 
+def new_session_url(cfg, path):
+    """`gli new PATH` / the Finder Quick Action: a link that opens the web app's new-session sheet with this
+    computer and PATH filled in (a file: its folder). It only fills the form; nothing starts until 创建."""
+    from urllib.parse import quote
+    p = os.path.abspath(os.path.expanduser(path or "."))
+    if not os.path.exists(p):
+        raise ValueError("no such file or folder: " + p)
+    if not os.path.isdir(p):
+        p = os.path.dirname(p)
+    q = "cwd=" + quote(p, safe="")
+    local = next((m for m in cfg.get("machines") or [] if m.get("type") == "local" and m.get("id")), None)
+    if local:
+        q += "&m=" + quote(str(local["id"]), safe="")
+    return hub_base_url(cfg) + "#new?" + q
+
+
 async def serve(cfg, hub):
     runner = web.AppRunner(hub.app(), access_log=None)
     await runner.setup()
@@ -1428,6 +1454,7 @@ def main():
     ap.add_argument("--set-password", action="store_true", help="set / change the login password")
     ap.add_argument("--devices", action="store_true", help="list logged-in devices")
     ap.add_argument("--revoke", metavar="ID", help="log out a device (ID from --devices, or 'all')")
+    ap.add_argument("--new-url", metavar="PATH", help="print a link that opens the new-session form for PATH")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
@@ -1437,6 +1464,12 @@ def main():
         print(login_url(cfg))
         print("(one-time link, valid %d minutes; the device stays logged in afterwards)" % (PAIR_TTL // 60),
               file=sys.stderr)
+        return
+    if a.new_url is not None:
+        try:
+            print(new_session_url(cfg, a.new_url))
+        except ValueError as e:
+            raise SystemExit("gli new: %s" % e)
         return
     auth = Auth(os.path.join(DATA, "auth.json"), C.write_secret)
     if a.set_password:

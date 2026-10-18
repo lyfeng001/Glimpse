@@ -72,7 +72,7 @@ Glimpse 让手机变成这些会话的遥控器。手机上看到的就是它们
 - **进程不受连接影响**：会话由 agent 守护进程托管（原理同 tmux）。hub 重启、ssh 断线、手机锁屏都不会中断 AI 进程，重连后从断点续传输出。
 - **更新**：`git pull` 之后重启 `gli hub`。每台机器的守护进程会报告自己运行的 agent 代码版本：版本旧、且没有正在运行的会话的，会直接换成新版；有会话在跑的，继续运行，并在 设置 → 机器 和网络插件里显示“需要更新”。点“更新”会用新代码重启它：Claude / Codex 会话以同一个会话恢复、接着原来的对话，用 `gli attach` 连着的终端会自动重连。
 - **电脑和手机同时操作**：`gli run claude` 把电脑终端接到同一个会话上，按 `Ctrl-]` 断开。
-- **浅色 / 深色**：设置 → 外观里可选“跟随系统 · 浅色 · 深色”。终端视图始终是深色。
+- **主题**：设置 → 外观里可选“跟随系统 · 浅色 · 深色 · Solarized”。Solarized 就是 Warp 的 Solarized Dark 配色，终端颜色也一起换。每台设备单独记住自己的选择。终端视图始终是深色。
 
 <p align="center"><img src="docs/img/controls-v4.png" width="18%" alt="模型与模式"> <img src="docs/img/adopt-v4.png" width="18%" alt="接管电脑上的会话"> <img src="docs/img/restart-v4.png" width="18%" alt="Key"> <img src="docs/img/home-light-v4.png" width="18%" alt="Light"> <img src="docs/img/devices-v4.png" width="18%" alt="账号与设备"></p>
 

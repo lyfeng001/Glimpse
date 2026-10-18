@@ -62,7 +62,7 @@ Glimpse turns your phone into a remote control for those sessions. What you see 
 - **Sessions outlive every connection**: an agent daemon owns the PTYs, the same idea as tmux. Restarting the hub, dropping SSH or locking the phone never stops the AI process. Output resumes from the exact byte offset on reconnect.
 - **Updating**: after `git pull`, restart `gli hub`. The daemon on each machine reports which agent code it runs; one that is outdated and has no running sessions is replaced right away. One with running sessions keeps going and shows 需要更新 (Settings → 机器, and the network widget); tapping 更新 restarts it on the new code, Claude / Codex sessions come back under the same id with their conversation resumed, and terminals attached with `gli attach` reconnect by themselves.
 - **Laptop and phone together**: `gli run claude` attaches your laptop terminal to the same session. `Ctrl-]` detaches.
-- **Light / dark**: Settings → 外观 switches between follow system, light and dark. The terminal view stays dark.
+- **Themes**: Settings → 外观 switches between follow system, light, dark and Solarized (Warp's Solarized Dark, terminal colours included). The choice is per device. The terminal view stays dark.
 
 <p align="center"><img src="docs/img/controls-v4.png" width="18%" alt="Model & mode"> <img src="docs/img/adopt-v4.png" width="18%" alt="Continue a conversation"> <img src="docs/img/restart-v4.png" width="18%" alt="Key"> <img src="docs/img/home-light-v4.png" width="18%" alt="Light"> <img src="docs/img/devices-v4.png" width="18%" alt="Devices"></p>
 

@@ -51,6 +51,26 @@
   --shadow-2: 0 10px 30px rgba(16,18,23,.14);
   --shadow-sheet: 0 -10px 40px rgba(16,18,23,.16);
 }
+/* Solarized Dark (Settings → 外观 → Solarized; the palette of Warp's built-in theme). It is the dark scheme
+   (data-theme=dark) with these tokens on top, so every dark-only rule keeps applying. Text uses base1 / base0
+   and a lighter blue / red than the canonical accents so they stay readable (WCAG AA) on base03 / base02. */
+:root[data-palette=solarized] {
+  --bg: #002B36; --surface: #073642; --surface-2: #0A3D4A; --surface-3: #104654; --elev: #08394A;
+  --fill: rgba(147,161,161,.08); --fill-2: rgba(147,161,161,.13); --fill-press: rgba(147,161,161,.18);
+  --line: rgba(147,161,161,.12); --line-2: rgba(147,161,161,.20);
+  --text: #C1CBCB; --text-2: #93A1A1; --text-3: #7B9198;
+  --accent: #1D6FA5; --accent-text: #4AA3E6; --on-accent: #FFFFFF; --accent-soft: rgba(38,139,210,.20);
+  --c-run: #4AA3E6; --c-wait: #C99A12; --c-ok: #97AC0C; --c-err: #F0605A; --c-off: #7B9198;
+  --nav-bg: rgba(0,43,54,.82);
+  --shadow-1: 0 1px 0 rgba(147,161,161,.04) inset, 0 1px 2px rgba(0,0,0,.35);
+  --shadow-2: 0 10px 30px rgba(0,0,0,.45);
+  --shadow-sheet: 0 -10px 40px rgba(0,0,0,.55);
+  --term-bg: #002B36;
+}
+:root[data-palette=solarized] .tag.claude { color: #E2733A; background: rgba(203,75,22,.18); }
+:root[data-palette=solarized] .tag.codex { color: #9A9EE6; background: rgba(108,113,196,.20); }
+.sw-sol { width: 13px; height: 13px; border-radius: 50%; flex: none;
+  background: conic-gradient(#268BD2 0 25%, #859900 0 50%, #B58900 0 75%, #DC322F 0); box-shadow: 0 0 0 1.5px #002B36; }
 
 /* ------------------------------------------------------------ base */
 *, *::before, *::after { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -719,7 +739,8 @@ dialog.sheet.tall { min-height: min(560px, calc(var(--app-h) - var(--safe-t) - 1
 #inst-go { margin-bottom: var(--s2); }
 
 /* ------------------------------------------------------------ v4: manual theme, model pickers, TUI menu card, slash commands */
-.tseg { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px; padding: 2px; margin-top: 6px; border-radius: 10px; background: var(--fill-2); }
+.tseg { display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px; padding: 2px; margin-top: 6px; border-radius: 10px; background: var(--fill-2); }
+@media (max-width: 520px) { .tseg { grid-template-columns: repeat(2, 1fr); } }      /* 2 x 2 on a phone */
 .tseg button { min-height: 34px; border-radius: 8px; font-size: 14px; font-weight: 600; color: var(--text-2); display: inline-flex; align-items: center;
   justify-content: center; gap: 5px; }
 .tseg button .ic { width: 15px; height: 15px; }

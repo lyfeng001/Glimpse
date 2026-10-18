@@ -2,19 +2,23 @@
 // Glimpse phone app (v4). State lives on the hub; this page renders it and forwards input.
 const APP_VERSION = '0.4.0';
 // ---- manual light / dark theme (Settings → 外观). Runs first so the forced theme is in place before anything renders.
-// glimpse.theme = auto | light | dark  ->  <html data-theme="light|dark"> (auto: no attribute, CSS follows prefers-color-scheme)
-const THEME_BG = { dark: '#0B0C0F', light: '#F2F2F7' };
-function themePref() { const t = window.localStorage.getItem('glimpse.theme'); return t === 'light' || t === 'dark' ? t : 'auto'; }
+// glimpse.theme = auto | light | dark | solarized  ->  <html data-theme="light|dark"> (auto: no attribute, CSS follows
+// prefers-color-scheme). solarized = dark + data-palette="solarized" (Warp's Solarized Dark), so every dark rule still applies.
+const THEME_BG = { dark: '#0B0C0F', light: '#F2F2F7', solarized: '#002B36' };
+function themePref() { const t = window.localStorage.getItem('glimpse.theme'); return ['light', 'dark', 'solarized'].includes(t) ? t : 'auto'; }
 function applyTheme(t) {
   const root = document.documentElement;
-  if (t === 'light' || t === 'dark') root.setAttribute('data-theme', t); else root.removeAttribute('data-theme');
+  const scheme = t === 'solarized' ? 'dark' : t;
+  if (scheme === 'light' || scheme === 'dark') root.setAttribute('data-theme', scheme); else root.removeAttribute('data-theme');
+  if (t === 'solarized') root.setAttribute('data-palette', 'solarized'); else root.removeAttribute('data-palette');
   // status bar / browser chrome: forced = one colour for both media queries; auto = per-scheme colours again
   for (const m of document.querySelectorAll('meta[name=theme-color]')) {
-    const scheme = /light/.test(m.media || '') ? 'light' : 'dark';
-    m.setAttribute('content', THEME_BG[t === 'auto' ? scheme : t]);
+    const s = /light/.test(m.media || '') ? 'light' : 'dark';
+    m.setAttribute('content', THEME_BG[t === 'auto' ? s : t]);
   }
   const cs = document.querySelector('meta[name=color-scheme]');
-  if (cs) cs.setAttribute('content', t === 'auto' ? 'dark light' : t);
+  if (cs) cs.setAttribute('content', t === 'auto' ? 'dark light' : scheme);
+  if (window.onThemeApplied) window.onThemeApplied();      // the terminal (created later) follows the palette
 }
 applyTheme(themePref());
 const $ = (s, r) => (r || document).querySelector(s);
@@ -964,13 +968,22 @@ $('#home-scroll').addEventListener('scroll', (e) => { $('#home-nav').classList.t
 
 // ------------------------------------------------------------------ session view
 let term = null;
+const TERM_THEMES = {
+  dark: { background: '#0B0D10', foreground: '#DCE1E8', cursor: '#5AA9FF', cursorAccent: '#0B0D10', selectionBackground: 'rgba(90,169,255,.35)',
+    black: '#1C1F25', red: '#FF6B63', green: '#3DDC6A', yellow: '#FFB547', blue: '#5AA9FF', magenta: '#C792EA', cyan: '#56D4DD', white: '#DCE1E8',
+    brightBlack: '#5C636E', brightRed: '#FF8E86', brightGreen: '#6EE7A0', brightYellow: '#FFD07A', brightBlue: '#8CC4FF', brightMagenta: '#DDB3F5', brightCyan: '#8BE8EE', brightWhite: '#FFFFFF' },
+  // Solarized Dark (Ethan Schoonover's palette, as in Warp's built-in theme)
+  solarized: { background: '#002B36', foreground: '#93A1A1', cursor: '#93A1A1', cursorAccent: '#002B36', selectionBackground: 'rgba(147,161,161,.28)',
+    black: '#073642', red: '#DC322F', green: '#859900', yellow: '#B58900', blue: '#268BD2', magenta: '#D33682', cyan: '#2AA198', white: '#EEE8D5',
+    brightBlack: '#586E75', brightRed: '#CB4B16', brightGreen: '#93A1A1', brightYellow: '#839496', brightBlue: '#839496', brightMagenta: '#6C71C4', brightCyan: '#93A1A1', brightWhite: '#FDF6E3' },
+};
+function termTheme() { return TERM_THEMES[document.documentElement.getAttribute('data-palette') === 'solarized' ? 'solarized' : 'dark']; }
+window.onThemeApplied = () => { if (term) term.options.theme = termTheme(); };
 function ensureTerm() {
   if (term) return term;
   term = new window.Terminal({
     fontSize: S.fontSize, fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace', scrollback: 5000, convertEol: false,
-    theme: { background: '#0B0D10', foreground: '#DCE1E8', cursor: '#5AA9FF', cursorAccent: '#0B0D10', selectionBackground: 'rgba(90,169,255,.35)',
-      black: '#1C1F25', red: '#FF6B63', green: '#3DDC6A', yellow: '#FFB547', blue: '#5AA9FF', magenta: '#C792EA', cyan: '#56D4DD', white: '#DCE1E8',
-      brightBlack: '#5C636E', brightRed: '#FF8E86', brightGreen: '#6EE7A0', brightYellow: '#FFD07A', brightBlue: '#8CC4FF', brightMagenta: '#DDB3F5', brightCyan: '#8BE8EE', brightWhite: '#FFFFFF' },
+    theme: termTheme(),
     // a thin blinking accent bar (Warp-like); TUIs that set their own cursor shape still win
     cursorStyle: 'bar', cursorWidth: 2, cursorBlink: true, cursorInactiveStyle: 'outline',
     allowProposedApi: true, screenReaderMode: false,
@@ -2697,7 +2710,7 @@ async function renderSettings() {
   $('#nav-push-sub').textContent = /已开启/.test(ps) ? '已开启' : /拒绝/.test(ps) ? '权限被拒绝' : /主屏幕/.test(ps) ? '需从主屏幕图标打开' : /不支持/.test(ps) ? '此浏览器不支持' : ps;
 }
 // ---- settings sub-pages: the main list links to pages that slide in from the right
-const THEME_NAMES = { auto: '跟随系统', light: '浅色', dark: '深色' };
+const THEME_NAMES = { auto: '跟随系统', light: '浅色', dark: '深色', solarized: 'Solarized' };
 function renderSettingsNav() {
   $('#nav-look-sub').textContent = THEME_NAMES[themePref()] + ' · 终端字号 ' + S.fontSize;
   const w = $$('#set-widgets input[type=checkbox]'); const won = w.filter((x) => x.checked).length;

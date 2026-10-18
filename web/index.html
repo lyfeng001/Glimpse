@@ -166,12 +166,28 @@
           <span class="thumb" aria-hidden="true"></span>
           <button type="button" id="mode-chat" role="tab" aria-controls="chat"><svg class="ic" aria-hidden="true"><use href="#i-chat"/></svg>对话</button>
           <button type="button" id="mode-term" role="tab" aria-controls="term-wrap"><svg class="ic" aria-hidden="true"><use href="#i-term"/></svg>终端</button>
+          <button type="button" id="mode-files" role="tab" aria-controls="fpane"><svg class="ic" aria-hidden="true"><use href="#i-folder"/></svg>文件</button>
         </div>
+        <button type="button" id="btn-files" class="wtoggle" aria-pressed="true" aria-controls="fpane" aria-label="文件栏" hidden><svg class="ic sm" aria-hidden="true"><use href="#i-folder"/></svg></button>
         <button type="button" id="btn-wstrip" class="wtoggle" aria-expanded="true" aria-controls="v-widgets" aria-label="显示会话插件"><svg class="ic sm" aria-hidden="true"><use href="#i-gauge"/></svg><svg class="ic xs" aria-hidden="true"><use href="#i-down"/></svg></button>
       </div>
       <div id="v-widgets" class="wstrip" role="region" aria-label="会话插件"></div>
       <div id="v-banner" class="banner" hidden role="status"></div>
     </header>
+    <!-- files of the session's directory (read-only): a tab on phones, a column on wide screens -->
+    <section id="fpane" class="fpane" role="tabpanel" aria-labelledby="f-title" hidden>
+      <div class="f-head">
+        <button type="button" id="f-back" class="icon-btn" aria-label="返回文件列表" hidden><svg class="ic"><use href="#i-back"/></svg></button>
+        <div class="f-titles"><div id="f-title" class="f-title"></div><div id="f-sub" class="f-sub"></div></div>
+        <button type="button" id="f-refresh" class="icon-btn" aria-label="刷新"><svg class="ic sm"><use href="#i-refresh"/></svg></button>
+      </div>
+      <div id="f-tabs" class="f-tabs" role="radiogroup" aria-label="文件视图">
+        <button type="button" role="radio" data-ft="tree">目录</button>
+        <button type="button" role="radio" data-ft="git">改动<span id="f-gitn" class="f-n" hidden></span></button>
+      </div>
+      <div id="f-list" class="f-list"></div>
+      <div id="f-preview" class="f-preview" hidden></div>
+    </section>
     <div class="body">
       <div id="chat" class="chat" role="tabpanel" aria-label="对话" tabindex="-1"></div>
       <div id="term-wrap" class="term-wrap" role="tabpanel" aria-label="终端" hidden>

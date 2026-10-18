@@ -557,6 +557,35 @@ def test_new_agent_code_flags_and_updates_idle_machines(hub_mod):
     assert M.agent_code() == M.agent_source()[1]
 
 
+def test_fs_op_validation_and_routing(hub_mod):
+    C, server = hub_mod
+
+    async def run():
+        hub = server.Hub(C.load())
+        m = FakeMachine()
+        hub.machines[m.id] = m
+        hub.order.append(m.id)
+        p, other = FakePhone(), FakePhone()
+        hub.phones.update([p, other])
+        await hub.phone_op(p, {"op": "fs", "m": "M1", "sid": "s1", "action": "read", "path": "src/a.py"})
+        w = m.written[-1]
+        assert w["op"] == "fs" and w["action"] == "read" and w["path"] == "src/a.py" and w["force"] is False
+        await hub.on_machine_msg(m, {"t": "fs", "req": w["req"], "sid": "s1", "action": "read", "path": "src/a.py",
+                                     "kind": "text", "text": "x"})
+        assert p.sent[-1]["t"] == "fs" and p.sent[-1]["text"] == "x" and p.sent[-1]["m"] == "M1" and other.sent == []
+        # an agent without file browsing answers "unknown op": shown in place as "needs update"
+        await hub.phone_op(p, {"op": "fs", "m": "M1", "sid": "s1", "action": "list", "path": ""})
+        await hub.on_machine_msg(m, {"t": "error", "req": m.written[-1]["req"], "msg": "unknown op 'fs'"})
+        assert p.sent[-1]["t"] == "fs" and p.sent[-1]["action"] == "list" and "需要更新" in p.sent[-1]["error"]
+        n = len(m.written)
+        for bad in ({"action": "write", "path": "a"}, {"action": "read", "path": "x" * 5000}, {"action": "read", "path": 3}):
+            await hub.phone_op(p, dict({"op": "fs", "m": "M1", "sid": "s1"}, **bad))
+            assert p.sent[-1]["t"] == "error"
+        await hub.phone_op(p, {"op": "fs", "m": "M1", "action": "list", "path": ""})            # no session
+        assert p.sent[-1]["t"] == "error" and len(m.written) == n
+    asyncio.run(run())
+
+
 def test_bridge_argv_code_and_replace(hub_mod):
     import machines as M
     src, code = M.agent_source()

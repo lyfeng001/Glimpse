@@ -681,6 +681,7 @@ function onMsg(m) {
     case 'history': onHistory(m); break;
     case 'models': onModels(m, false); break;
     case 'memory': onMemory(m); break;
+    case 'fs': onFs(m); break;
     case 'speedtest_done': {
       clearTimeout(NETI.testing[m.m]); delete NETI.testing[m.m];
       const mc = S.byId[m.m]; if (mc && m.speed) mc.speed = m.speed;   // show it now; the state broadcast follows
@@ -693,6 +694,8 @@ function onMsg(m) {
     case 'machine_test': mcTested(m); break;
     case 'machines_ok': mcSaved(); break;
     case 'event': {
+      // a turn of the open session ended: its files may have changed
+      if (isView(m) && m.ev && (m.ev.kind === 'done' || m.ev.kind === 'error')) fsChanged();
       const here = isView(m) && document.visibilityState === 'visible';
       if (!here) toast(m.title || (m.ev && m.ev.title) || 'Glimpse', m.ev && m.ev.body, () => openSession(m.m, m.sid), m.ev && m.ev.kind === 'keyswap' ? 'done' : m.ev && m.ev.kind);
       break;
@@ -1193,23 +1196,275 @@ for (const host of [$('#home-widgets'), $('#v-widgets')]) {
 
 function setMode(mode, initial) {
   const v = S.view;
-  if (v) { LS.setItem('glimpse.mode.' + v.m + '/' + v.sid, mode); if (!initial) LS.setItem('glimpse.mode', mode); }
+  // wide screens show the files as a column next to chat / terminal, so "files" is not a mode there
+  if (mode === 'files' && filesWide()) mode = S.mode && S.mode !== 'files' ? S.mode : 'chat';
+  // remembered per session; only chat / terminal become the default for other sessions
+  if (v) { LS.setItem('glimpse.mode.' + v.m + '/' + v.sid, mode); if (!initial && mode !== 'files') LS.setItem('glimpse.mode', mode); }
   S.mode = mode;
-  $('#mode-chat').setAttribute('aria-selected', String(mode === 'chat'));
-  $('#mode-term').setAttribute('aria-selected', String(mode === 'term'));
-  $('#mode-chat').tabIndex = mode === 'chat' ? 0 : -1; $('#mode-term').tabIndex = mode === 'term' ? 0 : -1;
-  $('#seg').classList.toggle('right', mode === 'term');
-  $('#chat').hidden = mode !== 'chat';
-  $('#term-wrap').hidden = mode !== 'term';
+  layoutPanes();
   $('#jump').hidden = true;
   if (v) { v.cardSig = null; renderCard(); }     // the menu card only shows in chat mode
   if (mode === 'term') requestAnimationFrame(() => { openTerm(); if (term) { term.refresh(0, term.rows - 1); term.scrollToBottom(); } termFollow(); });
-  else { scheduleLive(); requestAnimationFrame(() => { const c = $('#chat'); c.scrollTop = c.scrollHeight; }); }
+  else if (mode === 'chat') { scheduleLive(); requestAnimationFrame(() => { const c = $('#chat'); c.scrollTop = c.scrollHeight; }); }
 }
 $('#mode-chat').onclick = () => setMode('chat');
 $('#mode-term').onclick = () => setMode('term');
+$('#mode-files').onclick = () => setMode('files');
 $('#seg').addEventListener('keydown', (e) => {
-  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { e.preventDefault(); const m = S.mode === 'chat' ? 'term' : 'chat'; setMode(m); $('#mode-' + m).focus(); }
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+  e.preventDefault();
+  const tabs = ['chat', 'term', 'files'].filter((m) => !$('#mode-' + m).hidden);
+  const m = tabs[(tabs.indexOf(S.mode) + (e.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length];
+  setMode(m); $('#mode-' + m).focus();
+});
+
+// ------------------------------------------------------------------ files (read-only browser of the session's directory)
+// Phones: a third tab next to 对话 / 终端. Wide screens: a column on the left that stays next to chat / terminal
+// (toggled with #btn-files). The agent confines every request to the session's directory and never writes.
+const WIDE_FILES = matchMedia('(min-width: 1200px)');
+const FS = { key: null, open: new Set(['']), dirs: {}, tab: 'tree', git: null, file: null, wrap: false, stale: true, at: 0 };
+function filesWide() { return WIDE_FILES.matches; }
+function filesColumn() { return filesWide() && LS.getItem('glimpse.filesCol') !== '0'; }
+function layoutPanes() {
+  const wide = filesWide(); const col = filesColumn(); const mode = S.mode;
+  const view = $('#view');
+  view.classList.toggle('files-col', col);
+  $('#btn-files').hidden = !wide;
+  $('#btn-files').setAttribute('aria-pressed', String(col));
+  $('#mode-files').hidden = wide;
+  const tabs = ['chat', 'term', 'files'].filter((m) => !$('#mode-' + m).hidden);
+  const seg = $('#seg');
+  seg.style.setProperty('--n', tabs.length);
+  seg.style.setProperty('--i', Math.max(0, tabs.indexOf(mode)));
+  for (const m of ['chat', 'term', 'files']) {
+    $('#mode-' + m).setAttribute('aria-selected', String(m === mode));
+    $('#mode-' + m).tabIndex = m === mode ? 0 : -1;
+  }
+  const showFiles = col || mode === 'files';
+  $('#fpane').hidden = !showFiles;
+  $('#chat').hidden = mode !== 'chat';
+  $('#term-wrap').hidden = mode !== 'term';
+  view.classList.toggle('files-only', !wide && mode === 'files');
+  if (showFiles) fsEnsure();
+}
+WIDE_FILES.addEventListener('change', () => { if (S.view) setMode(S.mode === 'files' && filesWide() ? 'chat' : S.mode); });
+$('#btn-files').onclick = () => {
+  LS.setItem('glimpse.filesCol', filesColumn() ? '0' : '1');
+  layoutPanes();
+  if (S.mode === 'term') requestAnimationFrame(() => { if (term) term.refresh(0, term.rows - 1); });
+};
+// the pane became visible (or the session changed): load the root and the git status
+function fsEnsure() {
+  const v = S.view; if (!v) return;
+  const key = v.m + '/' + v.sid;
+  if (FS.key !== key) {
+    Object.assign(FS, { key, open: new Set(['']), dirs: {}, tab: 'tree', git: null, file: null, stale: true, at: 0 });
+  }
+  if (FS.stale || Date.now() - FS.at > 20000) fsRefresh(true);
+  renderFiles();
+}
+function fsSend(action, path, force) {
+  const v = S.view; if (!v) return false;
+  return send({ op: 'fs', m: v.m, sid: v.sid, action, path: path || '', force: !!force });
+}
+// reload what is shown (open folders, git status, the open file); quiet = keep the old content until the new arrives
+function fsRefresh(quiet) {
+  FS.stale = false; FS.at = Date.now();
+  for (const p of FS.open) {
+    const d = FS.dirs[p];
+    if (!d || !quiet) FS.dirs[p] = Object.assign({}, d || {}, { loading: true });
+    fsSend('list', p);
+  }
+  if (!FS.git || !quiet) FS.git = Object.assign({}, FS.git || {}, { loading: true });
+  fsSend('git');
+  if (FS.file) fsOpen(FS.file.path, FS.file.mode, FS.file.force, true);
+  renderFiles();
+}
+// a turn ended / the files changed: refresh what is visible now, or on the next show
+function fsChanged() {
+  if (!S.view || $('#fpane').hidden) { FS.stale = true; return; }
+  fsRefresh(true);
+}
+function onFs(m) {
+  const v = S.view;
+  if (!v || m.m !== v.m || m.sid !== v.sid || FS.key !== v.m + '/' + v.sid) return;
+  if (m.action === 'list') {
+    FS.dirs[m.path || ''] = m.error ? { error: m.error } : { entries: m.entries || [], more: m.more };
+  } else if (m.action === 'git') {
+    if (m.error) FS.git = { error: m.error };
+    else {
+      const map = {}; const dirty = new Set();
+      for (const f of m.files || []) {
+        map[f.path] = f.st;
+        let p = f.path; let i;
+        while ((i = p.lastIndexOf('/')) > 0) { p = p.slice(0, i); dirty.add(p); }
+      }
+      FS.git = { repo: !!m.repo, branch: m.branch || '', files: m.files || [], map, dirty };
+    }
+  } else if ((m.action === 'read' || m.action === 'diff') && FS.file && FS.file.path === m.path && FS.file.mode === m.action) {
+    FS.file.loading = false; FS.file.res = m;
+  }
+  renderFiles();
+}
+function fsOpen(path, mode, force, quiet) {
+  const same = FS.file && FS.file.path === path && FS.file.mode === mode;
+  FS.file = { path, mode: mode || 'read', force: !!force, loading: !quiet || !same, res: same && quiet ? FS.file.res : null, md: FS.file && same ? FS.file.md : true };
+  if (!same && !quiet) $('#f-preview').scrollTop = 0;
+  fsSend(FS.file.mode, path, force);
+  renderFiles();
+}
+const FS_ST = { M: '已修改', A: '新增', D: '已删除', R: '重命名', U: '未跟踪', C: '冲突' };
+function fsSize(n) { return n == null ? '' : n < 1024 ? n + ' B' : fmtBytes(n); }
+function fsName(p) { return p.split('/').pop() || p; }
+function fsDir(p) { const i = p.lastIndexOf('/'); return i > 0 ? p.slice(0, i) : ''; }
+function renderFiles() {
+  const v = S.view; if (!v || $('#fpane').hidden) return;
+  const s = session(v.m, v.sid);
+  const f = FS.file;
+  $('#f-back').hidden = !f;
+  $('#f-tabs').hidden = !!f;
+  $('#f-list').hidden = !!f;
+  $('#f-preview').hidden = !f;
+  $('#fpane').classList.toggle('previewing', !!f);
+  $('#view').classList.toggle('files-preview', !!f);
+  if (f) {
+    $('#f-title').textContent = fsName(f.path);
+    $('#f-sub').textContent = (fsDir(f.path) || '.') + (f.res && f.res.size != null ? ' · ' + fsSize(f.res.size) : '');
+    renderPreview();
+    return;
+  }
+  const cwd = (s && s.cwd) || '';
+  $('#f-title').textContent = fsName(cwd.replace(/\/+$/, '')) || cwd || '文件';
+  $('#f-sub').textContent = cwd + (FS.git && FS.git.branch ? ' · ' + FS.git.branch : '');
+  const n = FS.git && FS.git.files ? FS.git.files.length : 0;
+  $('#f-gitn').hidden = !n; $('#f-gitn').textContent = n > 999 ? '999+' : String(n);
+  for (const b of $$('#f-tabs [data-ft]')) b.setAttribute('aria-checked', String(b.dataset.ft === FS.tab));
+  setHTML($('#f-list'), FS.tab === 'git' ? gitHTML() : treeHTML('', 0));
+}
+function treeHTML(path, depth) {
+  const d = FS.dirs[path];
+  const pad = 'style="padding-left:' + (12 + Math.min(depth, 10) * 14) + 'px"';
+  if (!d || (d.loading && !d.entries)) return '<div class="f-row f-note" ' + pad + '><span class="spinner" aria-hidden="true"></span>读取中…</div>';
+  if (d.error) return '<div class="f-row f-note err" ' + pad + '>' + esc(d.error) + '</div>';
+  if (!d.entries.length) return '<div class="f-row f-note" ' + pad + '>' + (depth ? '空文件夹' : '这个目录是空的') + '</div>';
+  const st = FS.git && FS.git.map || {};
+  let h = '';
+  for (const e of d.entries) {
+    const p = path ? path + '/' + e.name : e.name;
+    if (e.out) {
+      h += '<div class="f-row dim" ' + pad + ' title="指向会话目录之外，不能打开"><span class="f-chev"></span>' + ic(e.dir ? 'folder' : 'file', 'sm') +
+        '<span class="f-name">' + esc(e.name) + '</span><span class="f-meta">↗ 目录外</span></div>';
+      continue;
+    }
+    if (e.dir) {
+      const open = FS.open.has(p);
+      const mark = st[p] ? '<span class="f-st st-' + st[p] + '" title="' + esc(FS_ST[st[p]] || '') + '">' + st[p] + '</span>' :
+        FS.git && FS.git.dirty && FS.git.dirty.has(p) ? '<span class="f-dot" title="里面有改动"></span>' : '';
+      h += '<button type="button" class="f-row' + (e.dim ? ' dim' : '') + '" ' + pad + ' data-dir="' + esc(p) + '" aria-expanded="' + open + '">' +
+        '<span class="f-chev' + (open ? ' open' : '') + '">' + ic('chev', 'xs') + '</span>' + ic('folder', 'sm') +
+        '<span class="f-name">' + esc(e.name) + '</span>' + mark + '</button>';
+      if (open) h += treeHTML(p, depth + 1);
+    } else {
+      const s2 = st[p];
+      h += '<button type="button" class="f-row" ' + pad + ' data-file="' + esc(p) + '"' + (s2 ? ' data-st="' + s2 + '"' : '') + '>' +
+        '<span class="f-chev"></span>' + ic(e.sensitive ? 'key' : 'file', 'sm') + '<span class="f-name">' + esc(e.name) + '</span>' +
+        (s2 ? '<span class="f-st st-' + s2 + '" title="' + esc(FS_ST[s2] || '') + '">' + s2 + '</span>' : '<span class="f-meta">' + esc(fsSize(e.size)) + '</span>') + '</button>';
+    }
+  }
+  if (d.more) h += '<div class="f-row f-note" ' + pad + '>只显示前 2000 项</div>';
+  return h;
+}
+function gitHTML() {
+  const g = FS.git;
+  if (!g || (g.loading && !g.files)) return '<div class="f-row f-note"><span class="spinner" aria-hidden="true"></span>读取 git 状态…</div>';
+  if (g.error) return '<div class="f-row f-note err">' + esc(g.error) + '</div>';
+  if (!g.repo) return '<div class="f-empty">' + ic('folder', 'lg') + '<div>这个目录不在 git 仓库里</div></div>';
+  if (!g.files.length) return '<div class="f-empty">' + ic('check-c', 'lg') + '<div>没有改动' + (g.branch ? '<br><span class="f-sub">' + esc(g.branch) + '</span>' : '') + '</div></div>';
+  return g.files.map((x) => {
+    const counts = x.add != null ? '<span class="f-cnt"><span class="a">+' + x.add + '</span> <span class="d">−' + x.del + '</span></span>' : '';
+    const dir = fsDir(x.path);
+    return '<button type="button" class="f-row f-change" ' + (x.dir ? 'data-gdir="' : 'data-diff="') + esc(x.path) + '" data-st="' + esc(x.st) + '">' +
+      '<span class="f-st st-' + esc(x.st) + '" title="' + esc(FS_ST[x.st] || '') + '">' + esc(x.st) + '</span>' +
+      '<span class="f-name">' + esc(fsName(x.path)) + (x.dir ? '/' : '') + (dir ? '<span class="f-path">' + esc(dir) + '</span>' : '') + '</span>' + counts + '</button>';
+  }).join('');
+}
+function renderPreview() {
+  const f = FS.file; const r = f.res; const host = $('#f-preview');
+  const isMd = /\.(md|markdown|mdx)$/i.test(f.path);
+  const st = FS.git && FS.git.map ? FS.git.map[f.path] : null;
+  // toolbar: full file / changes, preview / source for markdown, wrap, reference in the composer, copy the path
+  let bar = '<div class="f-bar">';
+  if (st) bar += '<div class="f-seg" role="radiogroup" aria-label="显示">' +
+    (st !== 'D' ? '<button type="button" role="radio" data-fmode="read" aria-checked="' + (f.mode === 'read') + '">文件</button>' : '') +
+    '<button type="button" role="radio" data-fmode="diff" aria-checked="' + (f.mode === 'diff') + '">改动</button></div>';
+  if (isMd && f.mode === 'read') bar += '<button type="button" class="f-chip" data-fmd aria-pressed="' + f.md + '">' + (f.md ? '源码' : '预览') + '</button>';
+  bar += '<button type="button" class="f-chip" data-fwrap aria-pressed="' + FS.wrap + '">自动换行</button>' +
+    '<button type="button" class="f-chip" data-fref title="在输入框插入 @' + esc(f.path) + '">引用</button>' +
+    '<button type="button" class="f-chip" data-fcopy>复制路径</button></div>';
+  let body;
+  if (f.loading && !r) body = '<div class="f-msg"><span class="spinner" aria-hidden="true"></span>读取中…</div>';
+  else if (r.error) body = '<div class="f-msg err">' + esc(r.error) + '</div>';
+  else if (r.kind === 'sensitive') body = '<div class="f-msg">' + ic('key', 'lg') + '<div><b>可能包含密钥或密码</b><br>' +
+    (r.reason === 'content' ? '内容里有像密钥的字符串。' : '这类文件通常保存密钥。') + '为了不在屏幕上露出来，默认不显示内容。</div>' +
+    '<button type="button" class="btn sm" data-fshow>显示内容</button></div>';
+  else if (r.kind === 'binary') body = '<div class="f-msg">' + ic('file', 'lg') + '<div>二进制文件，不能预览' + (r.size != null ? '（' + esc(fsSize(r.size)) + '）' : '') + '</div></div>';
+  else if (r.kind === 'large') body = '<div class="f-msg">' + ic('file', 'lg') + '<div>文件太大，不能预览（' + esc(fsSize(r.size)) + '）</div></div>';
+  else if (r.kind === 'image') {
+    const ok = /^image\/(png|jpeg|gif|webp|svg\+xml|bmp|x-icon)$/.test(r.mime || '') && /^[A-Za-z0-9+/=]*$/.test(r.data || '');
+    body = ok ? '<div class="f-img"><img alt="' + esc(fsName(f.path)) + '" src="data:' + r.mime + ';base64,' + r.data + '"></div>' : '<div class="f-msg err">无法显示</div>';
+  } else if (r.kind === 'diff') {
+    body = r.text ? '<div class="f-code diff' + (FS.wrap ? ' wrap' : '') + '">' + r.text.replace(/\n$/, '').split('\n').map((l) =>
+      '<div class="' + (/^\+(?!\+\+)/.test(l) ? 'add' : /^-(?!--)/.test(l) ? 'del' : /^@@/.test(l) ? 'hunk' : /^(diff |index |\+\+\+|---)/.test(l) ? 'meta' : '') + '">' + (esc(l) || ' ') + '</div>').join('') + '</div>' +
+      (r.truncated ? '<div class="f-msg sm">改动太多，只显示前一部分</div>' : '') : '<div class="f-msg">没有改动</div>';
+  } else if (isMd && f.md) {
+    body = '<div class="f-md md">' + md(r.text) + '</div>';
+  } else {
+    const lines = r.text.replace(/\n$/, '').split('\n');
+    body = '<div class="f-code' + (FS.wrap ? ' wrap' : '') + '" style="--gw:' + String(lines.length).length + 'ch">' +
+      lines.map((l, i) => '<div><span class="ln">' + (i + 1) + '</span>' + (esc(l) || ' ') + '</div>').join('') + '</div>' +
+      (r.truncated ? '<div class="f-msg sm">文件较大，只显示前 512 KB</div>' : '');
+  }
+  const top = host.scrollTop;
+  setHTML(host, bar + body);
+  host.scrollTop = top;
+}
+function fsRef(path) {
+  const t = $('#input'); const ref = '@' + (/\s/.test(path) ? '"' + path + '"' : path);
+  t.value = t.value + (t.value && !/\s$/.test(t.value) ? ' ' : '') + ref + ' ';
+  autoGrow(); draftSave();
+  if (DESKTOP) t.focus();
+  toast('已插入引用', ref, null, 'done');
+}
+$('#fpane').addEventListener('click', (e) => {
+  const t = e.target.closest('button'); if (!t || !$('#fpane').contains(t)) return;
+  if (t.id === 'f-back') { FS.file = null; renderFiles(); return; }
+  if (t.id === 'f-refresh') { fsRefresh(false); return; }
+  if (t.dataset.ft) { FS.tab = t.dataset.ft; renderFiles(); return; }
+  if (t.dataset.dir != null) {
+    const p = t.dataset.dir;
+    if (FS.open.has(p)) FS.open.delete(p);
+    else { FS.open.add(p); if (!FS.dirs[p] || FS.dirs[p].error) { FS.dirs[p] = { loading: true }; fsSend('list', p); } }
+    renderFiles(); return;
+  }
+  if (t.dataset.file != null) { fsOpen(t.dataset.file, 'read'); return; }
+  if (t.dataset.diff != null) { fsOpen(t.dataset.diff, 'diff'); return; }
+  if (t.dataset.gdir != null) {
+    // an untracked folder: show it in the tree, opened
+    const p = t.dataset.gdir; let a = '';
+    for (const part of p.split('/')) { a = a ? a + '/' + part : part; if (!FS.open.has(a)) { FS.open.add(a); FS.dirs[a] = { loading: true }; fsSend('list', a); } }
+    FS.tab = 'tree'; renderFiles(); return;
+  }
+  const f = FS.file; if (!f) return;
+  if (t.dataset.fshow != null) { fsOpen(f.path, f.mode, true); return; }
+  if (t.dataset.fmode) { if (t.dataset.fmode !== f.mode) fsOpen(f.path, t.dataset.fmode, f.force); return; }
+  if (t.dataset.fmd != null) { f.md = !f.md; renderFiles(); return; }
+  if (t.dataset.fwrap != null) { FS.wrap = !FS.wrap; renderFiles(); return; }
+  if (t.dataset.fref != null) { fsRef(f.path); return; }
+  if (t.dataset.fcopy != null) { copyText(f.path, '路径'); return; }
+  if (t.classList.contains('copy-code')) {
+    const code = t.parentElement.querySelector('code');
+    copyText(code ? code.textContent : '', '代码');
+  }
 });
 
 // ------------------------------------------------------------------ chat rendering
@@ -1378,7 +1633,14 @@ function renderCard() {
   const host = $('#v-card'); const v = S.view;
   const s = v && session(v.m, v.sid);
   let sig = ''; let html = '';
-  if (s && s.pending) {
+  if (s && (s.pending || s.question) && $('#view').classList.contains('files-only')) {
+    // the files tab on a phone: a one-line reminder instead of the full card (it would cover the list)
+    const q = s.question;
+    sig = 'mini:' + (s.pending ? s.pending.id : q.question + ':' + (q.qi || 0) + (q.review ? 'r' : ''));
+    html = '<button type="button" class="acard mini" data-amini>' + '<span class="a-ic">' + ic(s.pending ? 'shield' : 'help') + '</span>' +
+      '<span class="grow"><b>' + (s.pending ? esc(s.pending.tool) + ' 请求授权' : '有问题需要回答') + '</b><span>' +
+      esc(s.pending ? s.pending.summary : q.review ? '确认答案并提交' : q.question) + '</span></span><span class="btn sm">去处理</span></button>';
+  } else if (s && s.pending) {
     const p = s.pending; sig = 'p:' + p.id + ':' + (v.approving || '');
     const busy = (d) => (v.approving === d ? '<span class="spinner" aria-hidden="true"></span>' : '');
     const dis = v.approving ? ' disabled' : '';
@@ -1452,6 +1714,7 @@ function renderCard() {
   for (const b of $$('[data-mi]', host)) b.onclick = () => menuSend({ index: +b.dataset.mi }, +b.dataset.mi);
   for (const b of $$('[data-mk]', host)) b.onclick = () => menuSend({ key: b.dataset.mk }, -1);
   for (const b of $$('[data-a]', host)) b.onclick = () => approve(b.dataset.a);
+  for (const b of $$('[data-amini]', host)) b.onclick = () => setMode('chat');
   for (const b of $$('[data-q]', host)) b.onclick = () => {
     if (b.dataset.q === 'other') { $('#input').focus(); return; }
     sendBytes(enc.encode(b.dataset.q));

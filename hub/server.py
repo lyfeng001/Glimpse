@@ -556,7 +556,7 @@ class Hub:
                     p.send(out)
         elif t == "event":
             await self.on_event(m, msg["sid"], msg["ev"])
-        elif t in ("replay", "error", "restarted", "ok", "history"):
+        elif t in ("replay", "error", "restarted", "ok", "history", "fs"):
             r = self.reply_to.pop((m.id, msg.get("req")), None)
             if r is None:
                 return               # unsolicited errors are not broadcast to everyone
@@ -571,6 +571,11 @@ class Hub:
             if t == "history":
                 p.send({"t": "history", "m": m.id, "req": msg.get("req"), "kind": info.get("kind"),
                         "items": msg.get("items") or []})
+                return
+            if info.get("op") == "fs" and t == "error":
+                # an agent without file browsing (older) or a session that is gone: shown in the files view
+                p.send({"t": "fs", "m": m.id, "sid": info.get("sid"), "action": info.get("action"), "path": info.get("path"),
+                        "error": agent_error(msg, "读取失败")})
                 return
             out = dict(msg, m=m.id)
             if t == "error" and not out.get("sid") and info.get("sid"):
@@ -625,7 +630,8 @@ class Hub:
     def forward(self, p, m, obj):
         """Send an op to a machine; its error/reply comes back only to this phone."""
         req = m.next_req()
-        self.reply_to[(m.id, req)] = (p, {"op": obj.get("op"), "sid": obj.get("sid"), "kind": obj.get("kind")})
+        self.reply_to[(m.id, req)] = (p, {"op": obj.get("op"), "sid": obj.get("sid"), "kind": obj.get("kind"),
+                                          "action": obj.get("action"), "path": obj.get("path")})
         if len(self.reply_to) > 5000:
             for k in list(self.reply_to)[:1000]:
                 del self.reply_to[k]
@@ -689,6 +695,12 @@ class Hub:
             elif op == "history":
                 kind = msg.get("kind") if msg.get("kind") in ("claude", "codex") else None
                 self.forward(p, m, {"op": "history", "kind": kind, "limit": 30})
+            elif op == "fs":
+                # read-only browsing of the session's directory; the agent confines it to that directory
+                action, path = msg.get("action"), msg.get("path") or ""
+                if not sid or action not in ("list", "read", "git", "diff") or not isinstance(path, str) or len(path) > 4096:
+                    raise ValueError("无效的文件请求")
+                self.forward(p, m, {"op": "fs", "sid": sid, "action": action, "path": path, "force": bool(msg.get("force"))})
             elif op == "control":
                 action, value = msg.get("action"), msg.get("value")
                 if action not in CONTROL_ACTIONS or not isinstance(value, str) or len(value) > 500:

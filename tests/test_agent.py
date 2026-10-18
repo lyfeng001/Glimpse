@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import sys
@@ -659,6 +660,105 @@ def test_ask_user_question_keeps_every_question_and_follows_the_picker():
     one = dict(ASK3, tool_input={"questions": ASK3["tool_input"]["questions"][:1]})
     s.on_hook(one)
     assert "questions" not in s.question and s.question["question"] == "文件功能的范围？"
+
+
+def test_fs_list_read_confined_to_the_session_dir(tmp_path):
+    import pytest
+    root = tmp_path / "proj"
+    (root / "src").mkdir(parents=True)
+    (root / ".git").mkdir()
+    (root / "node_modules").mkdir()
+    (root / "src" / "a.py").write_text("print('hi')\n")
+    (root / "README.md").write_text("# T\n")
+    (root / ".env").write_text("TOKEN=x\n")
+    (root / ".env.example").write_text("TOKEN=\n")
+    (root / "cfg.json").write_text('{"k": "sk-ant-' + "a" * 30 + '"}')
+    (root / "gbk.txt").write_bytes("中文内容".encode("gb18030"))
+    (root / "bin.dat").write_bytes(b"\x00\x01\x02" * 10)
+    (root / "pic.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 20)
+    (root / "big.txt").write_text("x" * (A.FS_TEXT_MAX + 10))
+    (tmp_path / "outside.txt").write_text("secret")
+    (root / "link_out").symlink_to(tmp_path / "outside.txt")
+    (root / "link_in").symlink_to(root / "README.md")
+    ls = A.fs_list(str(root), "")
+    names = [e["name"] for e in ls["entries"]]
+    assert ".git" not in names and names[:2] == ["node_modules", "src"]               # dirs first, .git hidden
+    by = {e["name"]: e for e in ls["entries"]}
+    assert by["node_modules"].get("dim") and by[".env"].get("sensitive") and not by[".env.example"].get("sensitive")
+    assert by["link_out"].get("out") and not by["link_in"].get("out")
+    assert A.fs_list(str(root), "src")["entries"][0]["name"] == "a.py"
+    # nothing outside the session directory: .., absolute-looking paths, symlinks out
+    for bad in ("../outside.txt", "src/../../outside.txt", "link_out"):
+        with pytest.raises(ValueError):
+            A.fs_read(str(root), bad)
+    assert A.fs_read(str(root), "/README.md")["text"] == "# T\n"                       # "/" = the session root
+    assert A.fs_read(str(root), "link_in")["text"] == "# T\n"
+    assert A.fs_read(str(root), "src/a.py")["kind"] == "text"
+    assert A.fs_read(str(root), ".env")["kind"] == "sensitive" and "text" not in A.fs_read(str(root), ".env")
+    assert A.fs_read(str(root), ".env", force=True)["text"] == "TOKEN=x\n"
+    assert A.fs_read(str(root), "cfg.json") == dict(A.fs_read(str(root), "cfg.json"), kind="sensitive", reason="content")
+    g = A.fs_read(str(root), "gbk.txt")
+    assert g["text"] == "中文内容" and g["encoding"] == "gb18030"
+    assert A.fs_read(str(root), "bin.dat")["kind"] == "binary"
+    im = A.fs_read(str(root), "pic.png")
+    assert im["kind"] == "image" and im["mime"] == "image/png" and base64.b64decode(im["data"]).startswith(b"\x89PNG")
+    big = A.fs_read(str(root), "big.txt")
+    assert big["truncated"] and len(big["text"]) == A.FS_TEXT_MAX
+    with pytest.raises(ValueError):
+        A.fs_read(str(root), "src")                                                    # a directory
+
+
+def test_fs_git_status_and_diff(tmp_path):
+    import subprocess
+    root = tmp_path / "repo"
+    (root / "sub").mkdir(parents=True)
+    git = lambda *a: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=root, check=True,
+                                    capture_output=True)
+    assert A.fs_git(str(root)) == {"repo": False, "files": []}
+    git("init", "-q")
+    (root / "a.txt").write_text("one\ntwo\n")
+    (root / "sub" / "b.txt").write_text("b\n")
+    (root / ".env").write_text("K=1\n")
+    git("add", "a.txt", "sub/b.txt", ".env")
+    git("commit", "-qm", "init")
+    (root / "a.txt").write_text("one\nTWO\nthree\n")
+    (root / "new.txt").write_text("fresh\n")
+    (root / "sub" / "b.txt").unlink()
+    (root / ".env").write_text("K=2\n")
+    st = A.fs_git(str(root))
+    files = {f["path"]: f for f in st["files"]}
+    assert st["repo"] and st["branch"] in ("master", "main")
+    assert files["a.txt"]["st"] == "M" and files["a.txt"]["add"] == 2 and files["a.txt"]["del"] == 1
+    assert files["new.txt"]["st"] == "U" and files["sub/b.txt"]["st"] == "D"
+    d = A.fs_diff(str(root), "a.txt")
+    assert d["kind"] == "diff" and "+TWO" in d["text"] and "-two" in d["text"]
+    u = A.fs_diff(str(root), "new.txt")
+    assert u["kind"] == "diff" and "+fresh" in u["text"]
+    assert A.fs_diff(str(root), ".env")["kind"] == "sensitive" and "+K=2" in A.fs_diff(str(root), ".env", force=True)["text"]
+    # a session started in a sub directory only sees changes below it, with paths relative to it
+    assert [f["path"] for f in A.fs_git(str(root / "sub"))["files"]] == ["b.txt"]
+
+
+def test_fs_op_replies_in_place(tmp_path):
+    d = _daemon(tmp_path)
+    d.background = lambda fn: fn()
+    sent = []
+    d.send = lambda c, obj: sent.append(obj)
+
+    class S:
+        sid, cwd = "s9", str(tmp_path)
+    (tmp_path / "x.txt").write_text("hello")
+    d.fs_op(None, 3, S, "read", "x.txt", False)
+    assert sent[-1]["t"] == "fs" and sent[-1]["req"] == 3 and sent[-1]["text"] == "hello" and sent[-1]["action"] == "read"
+    d.fs_op(None, 4, S, "read", "../etc/passwd", False)
+    assert sent[-1]["error"] == "路径不在会话目录内" and sent[-1]["path"] == "../etc/passwd"
+    d.fs_op(None, 5, S, "list", "nope", False)
+    assert sent[-1]["error"] and sent[-1]["action"] == "list"
+    d.fs_op(None, 6, S, "git", "", False)
+    while d.bg_done:
+        cb, res, err = d.bg_done.pop(0)
+        cb(res, err)
+    assert sent[-1]["action"] == "git" and sent[-1]["repo"] is False
 
 
 def test_upgrade_daemon_replaces_only_outdated_idle_daemons(monkeypatch):

@@ -2637,6 +2637,195 @@ def fetch_netinfo(timeout=8):
     return {k: clip(str(d.get(k) or ""), 80) for k in ("ip", "city", "region", "country", "org", "timezone")}
 
 
+# --------------------------------------------------------------------------- files (read-only, session cwd)
+# The phone browses the session's working directory: list / read / git status / git diff. Everything is
+# confined to that directory (realpath, so `..` and symlinks cannot leave it) and nothing is ever written.
+FS_HIDE = {".git", ".DS_Store", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".idea", "Thumbs.db"}
+FS_DIM = {"node_modules", ".venv", "venv", "dist", "build", "target", ".next", ".cache", ".tox", ".gradle"}
+FS_MAX_ENTRIES = 2000
+FS_TEXT_MAX = 512 * 1024
+FS_IMAGE_MAX = 3 * 1024 * 1024
+FS_GIT_MAX = 2000
+FS_DIFF_MAX = 400 * 1024
+FS_IMAGES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+             ".webp": "image/webp", ".svg": "image/svg+xml", ".bmp": "image/bmp", ".ico": "image/x-icon"}
+# names whose content is only read after an explicit "show" on the phone
+FS_SENSITIVE_RE = re.compile(
+    r"^(\.env(\..*)?|.*\.(pem|key|p12|pfx|jks|keystore|kdbx|tfstate|tfvars)|id_(rsa|dsa|ecdsa|ed25519)(\.old)?|"
+    r"\.netrc|\.npmrc|\.pypirc|\.pgpass|\.htpasswd|credentials(\.json)?|secrets?(\..*)?|.*\.secrets?|"
+    r"service[-_]?account.*\.json|key-[0-9a-f]+)$", re.I)
+FS_NOT_SENSITIVE_RE = re.compile(r"\.(example|sample|template|dist|defaults?)$|\.pub$", re.I)
+# unmistakable secrets in a file's first bytes (a config.json with a key in it is gated as well)
+FS_SECRET_RE = re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(sk-(ant-|proj-)?[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|"
+                          rb"gh[pousr]_[A-Za-z0-9]{30,}|xox[abp]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35})")
+
+
+def fs_sensitive(name):
+    return bool(FS_SENSITIVE_RE.match(name)) and not FS_NOT_SENSITIVE_RE.search(name)
+
+
+def fs_resolve(root, rel):
+    """(real root, real path) for `rel` inside the session directory `root`; ValueError when it leaves it."""
+    if not isinstance(rel, str) or len(rel) > 4096 or "\0" in rel:
+        raise ValueError("无效的路径")
+    base = os.path.realpath(root)
+    p = os.path.realpath(os.path.join(base, rel.lstrip("/")))
+    if p != base and not p.startswith(base.rstrip(os.sep) + os.sep):
+        raise ValueError("路径不在会话目录内")
+    return base, p
+
+
+def fs_rel(base, p):
+    r = os.path.relpath(p, base)
+    return "" if r == "." else r.replace(os.sep, "/")
+
+
+def fs_list(root, rel):
+    base, p = fs_resolve(root, rel)
+    out, more = [], False
+    with os.scandir(p) as it:
+        for e in it:
+            if e.name in FS_HIDE:
+                continue
+            if len(out) >= FS_MAX_ENTRIES:
+                more = True
+                break
+            item = {"name": e.name}
+            try:
+                if e.is_symlink():
+                    item["link"] = True
+                    t = os.path.realpath(e.path)
+                    if t != base and not t.startswith(base.rstrip(os.sep) + os.sep):
+                        item["out"] = True            # points outside the session directory: not opened
+                is_dir = e.is_dir()
+                st = e.stat() if not item.get("out") else e.stat(follow_symlinks=False)
+            except OSError:
+                is_dir, st = False, None
+            item["dir"] = is_dir
+            if st is not None and not is_dir:
+                item["size"], item["mtime"] = st.st_size, int(st.st_mtime)
+            if is_dir and e.name in FS_DIM:
+                item["dim"] = True
+            if not is_dir and fs_sensitive(e.name):
+                item["sensitive"] = True
+            out.append(item)
+    out.sort(key=lambda x: (not x["dir"], x["name"].lower()))
+    return {"path": fs_rel(base, p), "entries": out, "more": more}
+
+
+def fs_decode(data):
+    for enc in ("utf-8", "gb18030"):
+        try:
+            return data.decode(enc), enc
+        except UnicodeDecodeError:
+            pass
+    return data.decode("utf-8", "replace"), "utf-8?"
+
+
+def fs_read(root, rel, force=False):
+    base, p = fs_resolve(root, rel)
+    st = os.stat(p)
+    import stat as _stat
+    if not _stat.S_ISREG(st.st_mode):
+        raise ValueError("不是普通文件")
+    name = os.path.basename(p)
+    r = {"path": fs_rel(base, p), "size": st.st_size, "mtime": int(st.st_mtime)}
+    if fs_sensitive(name) and not force:
+        return dict(r, kind="sensitive")
+    mime = FS_IMAGES.get(os.path.splitext(name)[1].lower())
+    if mime:
+        if st.st_size > FS_IMAGE_MAX:
+            return dict(r, kind="large")
+        with open(p, "rb") as f:
+            return dict(r, kind="image", mime=mime, data=b64e(f.read(FS_IMAGE_MAX)))
+    with open(p, "rb") as f:
+        data = f.read(FS_TEXT_MAX)
+    if b"\0" in data[:8192]:
+        return dict(r, kind="binary")
+    if not force and FS_SECRET_RE.search(data[:65536]):
+        return dict(r, kind="sensitive", reason="content")
+    text, enc = fs_decode(data)
+    return dict(r, kind="text", text=text, encoding=enc, truncated=st.st_size > FS_TEXT_MAX)
+
+
+def fs_git_run(cwd, args, limit=4 * 1024 * 1024, timeout=10, ok=(0,)):
+    import subprocess
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", LC_ALL="C", GIT_TERMINAL_PROMPT="0")
+    r = subprocess.run(["git", "-c", "core.quotepath=off"] + args, cwd=cwd, env=env, capture_output=True, timeout=timeout)
+    if r.returncode not in ok:
+        raise RuntimeError(r.stderr.decode("utf-8", "replace").strip()[:200] or "git failed")
+    return r.stdout[:limit]
+
+
+def fs_git(root):
+    """Changed files under the session directory: {"repo": bool, "branch", "files": [{"path", "st", "add", "del"}]}."""
+    base, _ = fs_resolve(root, "")
+    try:
+        top = fs_git_run(base, ["rev-parse", "--show-toplevel"]).decode().strip()
+    except (RuntimeError, OSError):
+        return {"repo": False, "files": []}
+    try:
+        branch = fs_git_run(base, ["rev-parse", "--abbrev-ref", "HEAD"]).decode().strip()
+    except (RuntimeError, OSError):
+        branch = ""
+    raw = fs_git_run(base, ["status", "--porcelain=v1", "-z", "--untracked-files=normal", "--", "."]).split(b"\0")
+    files, i = [], 0
+    while i < len(raw):
+        ent = raw[i]
+        i += 1
+        if len(ent) < 4:
+            continue
+        xy, path = ent[:2].decode(), ent[3:].decode("utf-8", "replace")
+        if xy[0] in "RC" and i < len(raw):
+            i += 1                                     # the old path of a rename
+        rel = fs_rel(base, os.path.join(top, path))
+        if rel.startswith("../") or rel == "..":
+            continue
+        st = "U" if xy == "??" else "C" if "U" in xy or xy in ("AA", "DD") else \
+            "D" if "D" in xy else "A" if "A" in xy else "R" if "R" in xy else "M"
+        files.append({"path": rel.rstrip("/"), "st": st, "dir": path.endswith("/")})
+        if len(files) >= FS_GIT_MAX:
+            break
+    try:                                               # line counts against HEAD (none in a repo without commits)
+        num = fs_git_run(base, ["diff", "--numstat", "-z", "HEAD", "--", "."]).split(b"\0")
+        counts, j = {}, 0
+        while j < len(num):
+            f = num[j].split(b"\t")
+            j += 1
+            if len(f) == 3:
+                path = f[2]
+                if not path and j + 1 < len(num):      # rename: "a\td\t" then old\0new\0
+                    path, j = num[j + 1], j + 2
+                counts[fs_rel(base, os.path.join(top, path.decode("utf-8", "replace")))] = (f[0].decode(), f[1].decode())
+        for x in files:
+            a, d = counts.get(x["path"], ("", ""))
+            if a.isdigit():
+                x["add"], x["del"] = int(a), int(d)
+    except (RuntimeError, OSError):
+        pass
+    return {"repo": True, "branch": branch, "files": files}
+
+
+def fs_diff(root, rel, force=False):
+    base, p = fs_resolve(root, rel)
+    r = {"path": fs_rel(base, p)}
+    if fs_sensitive(os.path.basename(p)) and not force:
+        return dict(r, kind="sensitive")
+    rp = os.path.relpath(p, base)
+    try:
+        out = fs_git_run(base, ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "HEAD", "--", rp], FS_DIFF_MAX)
+    except RuntimeError:
+        out = fs_git_run(base, ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--", rp], FS_DIFF_MAX)
+    if not out and os.path.isfile(p):                  # untracked: everything is new (--no-index exits 1 on a difference)
+        out = fs_git_run(base, ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-index", "--",
+                                os.devnull, rp], FS_DIFF_MAX, ok=(0, 1))
+    if not force and FS_SECRET_RE.search(out[:65536]):
+        return dict(r, kind="sensitive", reason="content")
+    if b"Binary files" in out[:4096] and b"@@" not in out[:4096]:
+        return dict(r, kind="binary")
+    return dict(r, kind="diff", text=fs_decode(out)[0], truncated=len(out) >= FS_DIFF_MAX)
+
+
 def sys_stats(prev):
     """load, cpu count, memory %, NIC byte rates. Returns (stats, state)."""
     st = {"load": list(os.getloadavg()) if hasattr(os, "getloadavg") else None, "ncpu": os.cpu_count() or 1,
@@ -3330,6 +3519,37 @@ class Daemon:
         import threading
         threading.Thread(target=fn, daemon=True).start()
 
+    def fs_op(self, c, req, s, action, path, force):
+        """Read-only file browsing of the session's directory (list / read / git / diff). The reply always is
+        {"t": "fs", "action", "path", ...} so the phone can show errors in place."""
+        head = {"t": "fs", "req": req, "sid": s.sid, "action": action, "path": path}
+        fns = {"list": lambda: fs_list(s.cwd, path), "read": lambda: fs_read(s.cwd, path, force),
+               "git": lambda: fs_git(s.cwd), "diff": lambda: fs_diff(s.cwd, path, force)}
+        fn = fns.get(action)
+        if fn is None:
+            self.send(c, dict(head, error="unknown action"))
+            return
+
+        def run():
+            try:
+                return fn(), None
+            except (OSError, ValueError, RuntimeError) as e:
+                msg = e.strerror if isinstance(e, OSError) and e.strerror else str(e)
+                return None, clip(msg or type(e).__name__, 200)
+            except Exception as e:  # subprocess.TimeoutExpired etc.
+                return None, clip(str(e) or type(e).__name__, 200)
+
+        def reply(res, err):
+            # the requested path is echoed (not the resolved one: a symlink must still match the phone's request)
+            self.send(c, dict(head, error=err) if err else dict(res, **head))
+        if action in ("git", "diff"):                  # git can be slow in a big repo: off the event loop
+            def work():
+                res, err = run()
+                self.bg_done.append((reply, res, err))
+            self.background(work)
+        else:
+            reply(*run())
+
     def cycle_mode(self, s, target, done, tries=6, gap=0.3):
         """Press Shift+Tab until claude's footer shows the target mode (best effort)."""
         def step(left):
@@ -3448,7 +3668,7 @@ class Daemon:
                 self.background(work)
             elif s is None:
                 if op in ("sub", "unsub", "in", "text", "resize", "kill", "forget", "rename", "ack", "replay", "auto_continue",
-                          "approve", "restart", "control", "delete", "menu"):
+                          "approve", "restart", "control", "delete", "menu", "fs"):
                     self.send(c, {"t": "error", "req": req, "sid": sid, "msg": "no such session %s" % sid})
                 else:
                     self.send(c, {"t": "error", "req": req, "msg": "unknown op %r" % op})
@@ -3495,6 +3715,8 @@ class Daemon:
             elif op == "menu":
                 self.menu_op(s, m.get("index"), m.get("key"))
                 self.send(c, {"t": "ok", "req": req, "sid": sid})
+            elif op == "fs":
+                self.fs_op(c, req, s, m.get("action"), m.get("path") or "", bool(m.get("force")))
             elif op == "rename":
                 s.name = clip(m.get("name") or s.name, 80)
                 s.touch()

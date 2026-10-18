@@ -1258,8 +1258,56 @@ function layoutPanes() {
   $('#chat').hidden = mode !== 'chat';
   $('#term-wrap').hidden = mode !== 'term';
   view.classList.toggle('files-only', !wide && mode === 'files');
+  applyFw();
   if (showFiles) fsEnsure();
 }
+// ---- the files column's width (wide screens): drag the divider on its right edge, ← → when focused, double-click = default.
+// The tree and the preview each remember their own width; none stored = the CSS default (340 px / wider for a preview).
+const FW_MIN = 220; const FW_RIGHT = 420;                         // the right side keeps at least this much
+function fwKey() { return FS.file ? 'glimpse.fwPreview' : 'glimpse.fwTree'; }
+function fwMax() { return Math.max(FW_MIN, window.innerWidth - FW_RIGHT); }
+function fwClamp(w) { return Math.round(Math.min(fwMax(), Math.max(FW_MIN, w))); }
+function applyFw() {
+  const view = $('#view'); const sp = $('#f-split');
+  const w = parseInt(LS.getItem(fwKey()) || '', 10);
+  if (filesColumn() && w > 0) view.style.setProperty('--fw', fwClamp(w) + 'px'); else view.style.removeProperty('--fw');
+  const now = Math.round($('#fpane').getBoundingClientRect().width) || 0;
+  sp.setAttribute('aria-valuemin', String(FW_MIN)); sp.setAttribute('aria-valuemax', String(fwMax()));
+  sp.setAttribute('aria-valuenow', String(now));
+}
+function setFw(w) { LS.setItem(fwKey(), String(fwClamp(w))); applyFw(); }
+(function () {
+  const sp = $('#f-split'); let drag = null;
+  sp.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || !filesColumn()) return;
+    e.preventDefault();
+    drag = { x0: e.clientX, w0: $('#fpane').getBoundingClientRect().width };
+    sp.setPointerCapture(e.pointerId);
+    document.body.classList.add('col-resizing');
+  });
+  sp.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    $('#view').style.setProperty('--fw', fwClamp(drag.w0 + e.clientX - drag.x0) + 'px');
+  });
+  const end = (e) => {
+    if (!drag) return;
+    setFw(drag.w0 + e.clientX - drag.x0);
+    drag = null;
+    document.body.classList.remove('col-resizing');
+  };
+  sp.addEventListener('pointerup', end);
+  sp.addEventListener('pointercancel', end);
+  sp.addEventListener('dblclick', () => { LS.removeItem(fwKey()); applyFw(); });
+  sp.addEventListener('keydown', (e) => {
+    const step = e.shiftKey ? 80 : 20; const w = $('#fpane').getBoundingClientRect().width;
+    if (e.key === 'ArrowLeft') setFw(w - step);
+    else if (e.key === 'ArrowRight') setFw(w + step);
+    else if (e.key === 'Home') { LS.removeItem(fwKey()); applyFw(); }
+    else return;
+    e.preventDefault();
+  });
+  window.addEventListener('resize', () => { if (S.view && filesColumn()) applyFw(); });
+})();
 WIDE_FILES.addEventListener('change', () => { if (S.view) setMode(S.mode === 'files' && filesWide() ? 'chat' : S.mode); });
 $('#btn-files').onclick = () => {
   LS.setItem('glimpse.filesCol', filesColumn() ? '0' : '1');
@@ -1321,7 +1369,8 @@ function onFs(m) {
 }
 function fsOpen(path, mode, force, quiet) {
   const same = FS.file && FS.file.path === path && FS.file.mode === mode;
-  FS.file = { path, mode: mode || 'read', force: !!force, loading: !quiet || !same, res: same && quiet ? FS.file.res : null, md: FS.file && same ? FS.file.md : true };
+  FS.file = { path, mode: mode || 'read', force: !!force, loading: !quiet || !same, res: same && quiet ? FS.file.res : null,
+    md: FS.file && same ? FS.file.md : LS.getItem('glimpse.mdView') !== 'raw' };
   if (!same && !quiet) $('#f-preview').scrollTop = 0;
   fsSend(FS.file.mode, path, force);
   renderFiles();
@@ -1340,6 +1389,7 @@ function renderFiles() {
   $('#f-preview').hidden = !f;
   $('#fpane').classList.toggle('previewing', !!f);
   $('#view').classList.toggle('files-preview', !!f);
+  applyFw();
   if (f) {
     $('#f-title').textContent = fsName(f.path);
     $('#f-sub').textContent = (fsDir(f.path) || '.') + (f.res && f.res.size != null ? ' · ' + fsSize(f.res.size) : '');
@@ -1405,15 +1455,20 @@ function renderPreview() {
   const f = FS.file; const r = f.res; const host = $('#f-preview');
   const isMd = /\.(md|markdown|mdx)$/i.test(f.path);
   const st = FS.git && FS.git.map ? FS.git.map[f.path] : null;
-  // toolbar: full file / changes, preview / source for markdown, wrap, reference in the composer, copy the path
+  const lang = window.HL ? HL.detect(f.path, r && r.text) : '';
+  const rendered = isMd && f.mode === 'read' && f.md;
+  // toolbar: rendered / source (markdown), full file / changes, wrap, reference in the composer, copy the path, language
   let bar = '<div class="f-bar">';
+  if (isMd && f.mode === 'read') bar += '<div class="f-seg" role="radiogroup" aria-label="Markdown 显示方式">' +
+    '<button type="button" role="radio" data-fmd="render" aria-checked="' + f.md + '">渲染</button>' +
+    '<button type="button" role="radio" data-fmd="raw" aria-checked="' + !f.md + '">源码</button></div>';
   if (st) bar += '<div class="f-seg" role="radiogroup" aria-label="显示">' +
     (st !== 'D' ? '<button type="button" role="radio" data-fmode="read" aria-checked="' + (f.mode === 'read') + '">文件</button>' : '') +
     '<button type="button" role="radio" data-fmode="diff" aria-checked="' + (f.mode === 'diff') + '">改动</button></div>';
-  if (isMd && f.mode === 'read') bar += '<button type="button" class="f-chip" data-fmd aria-pressed="' + f.md + '">' + (f.md ? '源码' : '预览') + '</button>';
-  bar += '<button type="button" class="f-chip" data-fwrap aria-pressed="' + FS.wrap + '">自动换行</button>' +
-    '<button type="button" class="f-chip" data-fref title="在输入框插入 @' + esc(f.path) + '">引用</button>' +
-    '<button type="button" class="f-chip" data-fcopy>复制路径</button></div>';
+  if (!rendered) bar += '<button type="button" class="f-chip" data-fwrap aria-pressed="' + FS.wrap + '">自动换行</button>';
+  bar += '<button type="button" class="f-chip" data-fref title="在输入框插入 @' + esc(f.path) + '">引用</button>' +
+    '<button type="button" class="f-chip" data-fcopy>复制路径</button>' +
+    (lang && !rendered && r && (r.kind === 'text' || r.kind === 'diff') ? '<span class="f-lang">' + esc(HL.label(lang)) + '</span>' : '') + '</div>';
   let body;
   if (f.loading && !r) body = '<div class="f-msg"><span class="spinner" aria-hidden="true"></span>读取中…</div>';
   else if (r.error) body = '<div class="f-msg err">' + esc(r.error) + '</div>';
@@ -1426,15 +1481,20 @@ function renderPreview() {
     const ok = /^image\/(png|jpeg|gif|webp|svg\+xml|bmp|x-icon)$/.test(r.mime || '') && /^[A-Za-z0-9+/=]*$/.test(r.data || '');
     body = ok ? '<div class="f-img"><img alt="' + esc(fsName(f.path)) + '" src="data:' + r.mime + ';base64,' + r.data + '"></div>' : '<div class="f-msg err">无法显示</div>';
   } else if (r.kind === 'diff') {
-    body = r.text ? '<div class="f-code diff' + (FS.wrap ? ' wrap' : '') + '">' + r.text.replace(/\n$/, '').split('\n').map((l) =>
-      '<div class="' + (/^\+(?!\+\+)/.test(l) ? 'add' : /^-(?!--)/.test(l) ? 'del' : /^@@/.test(l) ? 'hunk' : /^(diff |index |\+\+\+|---)/.test(l) ? 'meta' : '') + '">' + (esc(l) || ' ') + '</div>').join('') + '</div>' +
-      (r.truncated ? '<div class="f-msg sm">改动太多，只显示前一部分</div>' : '') : '<div class="f-msg">没有改动</div>';
-  } else if (isMd && f.md) {
+    // each changed / context line highlighted on its own (after its +/-/space), on the add / del background
+    const hl1 = (s) => (lang && window.HL ? HL.lines(s, lang)[0] : esc(s));
+    body = r.text ? '<div class="f-code diff' + (FS.wrap ? ' wrap' : '') + '">' + r.text.replace(/\n$/, '').split('\n').map((l) => {
+      const c = /^\+(?!\+\+)/.test(l) ? 'add' : /^-(?!--)/.test(l) ? 'del' : /^@@/.test(l) ? 'hunk' : /^(diff |index |\+\+\+|---|\\ )/.test(l) ? 'meta' : '';
+      const code = c === 'hunk' || c === 'meta' ? esc(l) : esc(l.slice(0, 1)) + hl1(l.slice(1));
+      return '<div class="' + c + '">' + (code || ' ') + '</div>';
+    }).join('') + '</div>' + (r.truncated ? '<div class="f-msg sm">改动太多，只显示前一部分</div>' : '') : '<div class="f-msg">没有改动</div>';
+  } else if (rendered) {
     body = '<div class="f-md md">' + md(r.text) + '</div>';
   } else {
-    const lines = r.text.replace(/\n$/, '').split('\n');
+    const text = r.text.replace(/\n$/, '');
+    const lines = lang && window.HL ? HL.lines(text, lang) : text.split('\n').map(esc);
     body = '<div class="f-code' + (FS.wrap ? ' wrap' : '') + '" style="--gw:' + String(lines.length).length + 'ch">' +
-      lines.map((l, i) => '<div><span class="ln">' + (i + 1) + '</span>' + (esc(l) || ' ') + '</div>').join('') + '</div>' +
+      lines.map((l, i) => '<div><span class="ln">' + (i + 1) + '</span>' + (l || ' ') + '</div>').join('') + '</div>' +
       (r.truncated ? '<div class="f-msg sm">文件较大，只显示前 512 KB</div>' : '');
   }
   const top = host.scrollTop;
@@ -1470,7 +1530,7 @@ $('#fpane').addEventListener('click', (e) => {
   const f = FS.file; if (!f) return;
   if (t.dataset.fshow != null) { fsOpen(f.path, f.mode, true); return; }
   if (t.dataset.fmode) { if (t.dataset.fmode !== f.mode) fsOpen(f.path, t.dataset.fmode, f.force); return; }
-  if (t.dataset.fmd != null) { f.md = !f.md; renderFiles(); return; }
+  if (t.dataset.fmd) { f.md = t.dataset.fmd === 'render'; LS.setItem('glimpse.mdView', f.md ? 'render' : 'raw'); renderFiles(); return; }
   if (t.dataset.fwrap != null) { FS.wrap = !FS.wrap; renderFiles(); return; }
   if (t.dataset.fref != null) { fsRef(f.path); return; }
   if (t.dataset.fcopy != null) { copyText(f.path, '路径'); return; }
@@ -1481,12 +1541,20 @@ $('#fpane').addEventListener('click', (e) => {
 });
 
 // ------------------------------------------------------------------ chat rendering
-// tiny, safe markdown: everything is escaped first; only code fences, inline code, bold, headings, lists, links
+// tiny, safe markdown: everything is escaped first; code fences (highlighted), inline code, bold, italic, strikethrough,
+// headings, lists, quotes, rules, tables and http(s) links only (no raw HTML, no images: the page loads nothing remote)
 function mdInline(s) {
-  return esc(s)
-    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+  const keep = [];                                                // finished pieces, out of the way of later rules
+  const hold = (html) => '\u0002' + (keep.push(html) - 1) + '\u0003';
+  const link = (text, url) => '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + text + '</a>';
+  return esc(String(s).replace(/[\u0002\u0003]/g, ''))
+    .replace(/`([^`\n]+)`/g, (_, c) => hold('<code>' + c + '</code>'))
+    .replace(/!?\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, t, u) => hold(link(t, u)))
     .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
-    .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
+    .replace(/(^|[^\w*])\*([^*\s][^*\n]*?)\*(?![\w*])/g, '$1<i>$2</i>')
+    .replace(/~~([^~\n]+)~~/g, '<s>$1</s>')
+    .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, (_, pre, u) => pre + hold(link(u, u)))
+    .replace(/\u0002(\d+)\u0003/g, (_, k) => keep[+k]);
 }
 function md(text) {
   const parts = String(text || '').split(/```/);
@@ -1494,19 +1562,41 @@ function md(text) {
   parts.forEach((p, i) => {
     if (i % 2) {
       const m = p.match(/^([\w+#.-]*)\n/); const lang = m ? m[1] : '';
-      const body = m ? p.slice(m[0].length) : p;
+      const body = (m ? p.slice(m[0].length) : p).replace(/\n$/, '');
+      // highlighted when the fence names a language we know (always the dark palette: the block is dark)
+      const code = window.HL && HL.lang(lang) ? HL.html(body, lang) : esc(body);
       h += '<pre>' + (lang ? '<span class="lang">' + esc(lang) + '</span>' : '') +
         '<button type="button" class="copy-code" aria-label="复制代码">' + ic('copy', 'sm') + '<span>复制</span></button>' +
-        '<code>' + esc(body.replace(/\n$/, '')) + '</code></pre>';
+        '<code>' + code + '</code></pre>';
       return;
     }
     let list = null;
     const close = () => { if (list) { h += '</' + list + '>'; list = null; } };
     let para = [];
     const flush = () => { if (para.length) { h += '<p>' + para.map(mdInline).join('<br>') + '</p>'; para = []; } };
-    for (const line of p.split('\n')) {
+    const lines = p.split('\n');
+    for (let k = 0; k < lines.length; k++) {
+      const line = lines[k];
       let mm;
-      if ((mm = line.match(/^(#{1,4})\s+(.*)$/))) { flush(); close(); h += '<h' + mm[1].length + '>' + mdInline(mm[2]) + '</h' + mm[1].length + '>'; }
+      if (mdTableStart(lines, k)) {                               // | a | b |  +  | --- | :-: |
+        flush(); close();
+        const head = mdCells(line); const al = mdCells(lines[k + 1]).map((c) => /^:-+:$/.test(c) ? ' class="ta-c"' : /-:$/.test(c) ? ' class="ta-r"' : '');
+        k += 2;
+        const rows = [];
+        while (k < lines.length && lines[k].includes('|') && lines[k].trim()) rows.push(mdCells(lines[k++]));
+        k--;
+        h += '<div class="md-table"><table><thead><tr>' + head.map((c, j) => '<th' + (al[j] || '') + '>' + mdInline(c) + '</th>').join('') +
+          '</tr></thead><tbody>' + rows.map((r) => '<tr>' + head.map((_, j) => '<td' + (al[j] || '') + '>' + mdInline(r[j] || '') + '</td>').join('') + '</tr>').join('') +
+          '</tbody></table></div>';
+      }
+      else if ((mm = line.match(/^(#{1,4})\s+(.*)$/))) { flush(); close(); h += '<h' + mm[1].length + '>' + mdInline(mm[2]) + '</h' + mm[1].length + '>'; }
+      else if (/^ {0,3}([-*_])(?:\s*\1){2,}\s*$/.test(line)) { flush(); close(); h += '<hr>'; }
+      else if ((mm = line.match(/^\s*>\s?(.*)$/))) {
+        flush(); close();
+        const q = [mm[1]];
+        while (k + 1 < lines.length && (mm = lines[k + 1].match(/^\s*>\s?(.*)$/))) { q.push(mm[1]); k++; }
+        h += '<blockquote>' + q.map(mdInline).join('<br>') + '</blockquote>';
+      }
       else if ((mm = line.match(/^\s*[-*•]\s+(.*)$/))) { flush(); if (list !== 'ul') { close(); h += '<ul>'; list = 'ul'; } h += '<li>' + mdInline(mm[1]) + '</li>'; }
       else if ((mm = line.match(/^\s*\d+[.)]\s+(.*)$/))) { flush(); if (list !== 'ol') { close(); h += '<ol>'; list = 'ol'; } h += '<li>' + mdInline(mm[1]) + '</li>'; }
       else if (!line.trim()) { flush(); close(); }
@@ -1515,6 +1605,15 @@ function md(text) {
     flush(); close();
   });
   return h;
+}
+// a GFM table: a row with "|" followed by a delimiter row like "| --- | :-: |"
+const MD_DELIM = /^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?\s*$|^\s*\|\s*:?-+:?\s*\|\s*$/;
+function mdTableStart(lines, k) { return lines[k].includes('|') && k + 1 < lines.length && MD_DELIM.test(lines[k + 1]); }
+function mdCells(line) {
+  let s = line.trim().replace(/\\\|/g, '\u0001');                // \| is a "|" inside a cell
+  if (s.startsWith('|')) s = s.slice(1);
+  if (s.endsWith('|')) s = s.slice(0, -1);
+  return s.split('|').map((c) => c.trim().replace(/\u0001/g, '|'));
 }
 const TOOL_ICON = { Bash: 'term', Shell: 'term', Read: 'file', Write: 'pencil', Edit: 'pencil', MultiEdit: 'pencil', Grep: 'search', Glob: 'search',
   WebFetch: 'globe', WebSearch: 'globe', Task: 'sparkle', Agent: 'sparkle', TodoWrite: 'list', AskUserQuestion: 'help' };

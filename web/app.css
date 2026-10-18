@@ -367,6 +367,44 @@ button.f-row:active, button.f-row:hover { background: var(--fill); }
 .f-code.diff .hunk { color: var(--accent-text); margin-top: 6px; }
 .f-code.diff .meta { color: var(--text-2); }
 .f-md { padding: 0 var(--s4) var(--s6); font-size: 15px; line-height: 1.6; max-width: 820px; }
+.f-split { display: none; }
+.f-lang { flex: none; align-self: center; margin-left: auto; padding-left: var(--s2); font-size: 12px; color: var(--text-3); white-space: nowrap; }
+
+/* syntax highlighting (web/hl.js): file previews follow the theme; code blocks in chat sit on the dark terminal
+   colour, so they always use the dark palette (or Solarized's) */
+:root {
+  --hl-kw: #FF7B72; --hl-str: #A5D6FF; --hl-num: #79C0FF; --hl-com: #8B949E; --hl-fn: #D2A8FF; --hl-lit: #79C0FF; --hl-ty: #FFA657;
+  --hl-prop: #7EE787; --hl-var: #FFA657; --hl-tag: #7EE787; --hl-attr: #79C0FF; --hl-pre: #FF7B72;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme=dark]) { --hl-kw: #CF222E; --hl-str: #0A3069; --hl-num: #0550AE; --hl-com: #59636E; --hl-fn: #8250DF; --hl-lit: #0550AE;
+    --hl-ty: #953800; --hl-prop: #116329; --hl-var: #953800; --hl-tag: #116329; --hl-attr: #0550AE; --hl-pre: #CF222E; }
+}
+:root[data-theme=light] { --hl-kw: #CF222E; --hl-str: #0A3069; --hl-num: #0550AE; --hl-com: #59636E; --hl-fn: #8250DF; --hl-lit: #0550AE;
+  --hl-ty: #953800; --hl-prop: #116329; --hl-var: #953800; --hl-tag: #116329; --hl-attr: #0550AE; --hl-pre: #CF222E; }
+.md pre { --hl-kw: #FF7B72; --hl-str: #A5D6FF; --hl-num: #79C0FF; --hl-com: #8B949E; --hl-fn: #D2A8FF; --hl-lit: #79C0FF; --hl-ty: #FFA657;
+  --hl-prop: #7EE787; --hl-var: #FFA657; --hl-tag: #7EE787; --hl-attr: #79C0FF; --hl-pre: #FF7B72; }
+/* Solarized: its accents, lightened a little to stay readable on base03 / base02 */
+:root[data-palette=solarized], :root[data-palette=solarized] .md pre {
+  --hl-kw: #9DB51A; --hl-str: #36B5AA; --hl-num: #EE88A2; --hl-com: #93A6AC; --hl-fn: #4AA3E6; --hl-lit: #EE88A2; --hl-ty: #D4A01C;
+  --hl-prop: #4AA3E6; --hl-var: #E8834A; --hl-tag: #4AA3E6; --hl-attr: #D4A01C; --hl-pre: #E8834A; }
+.hl-kw { color: var(--hl-kw); } .hl-str { color: var(--hl-str); } .hl-num { color: var(--hl-num); }
+.hl-com { color: var(--hl-com); font-style: italic; } .hl-fn { color: var(--hl-fn); } .hl-lit { color: var(--hl-lit); }
+.hl-ty { color: var(--hl-ty); } .hl-prop { color: var(--hl-prop); } .hl-var { color: var(--hl-var); } .hl-tag { color: var(--hl-tag); }
+.hl-attr { color: var(--hl-attr); } .hl-pre { color: var(--hl-pre); }
+.hl-add { color: var(--c-ok); } .hl-del { color: var(--c-err); } .hl-hunk { color: var(--accent-text); }
+.md pre .hl-add { color: #6EE7A0; } .md pre .hl-del { color: #FF8E86; } .md pre .hl-hunk { color: #7FB6FF; }
+
+/* markdown tables / quotes / rules (chat and the .md preview) */
+.md .md-table { max-width: 100%; overflow-x: auto; margin: 6px 0 10px; -webkit-overflow-scrolling: touch; }
+.md table { border-collapse: collapse; font-size: 13.5px; line-height: 1.45; min-width: 60%; }
+.md th, .md td { padding: 6px 10px; border: .5px solid var(--line-2); text-align: left; vertical-align: top;
+  word-break: normal; overflow-wrap: normal; min-width: 4em; }      /* whole words: a wide table scrolls instead */
+.md th { background: var(--fill); font-weight: 600; white-space: nowrap; }
+.md tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--fill) 55%, transparent); }
+.md .ta-c { text-align: center; } .md .ta-r { text-align: right; }
+.md blockquote { margin: 6px 0 8px; padding: 2px 0 2px 12px; border-left: 3px solid var(--line-2); color: var(--text-2); }
+.md hr { border: 0; border-top: .5px solid var(--line-2); margin: 12px 0; }
 .f-img { padding: var(--s3); display: flex; justify-content: center; }
 .f-img img { max-width: 100%; height: auto; border-radius: var(--r-sm);
   background: repeating-conic-gradient(var(--fill-2) 0% 25%, transparent 0% 50%) 0 0 / 16px 16px; }
@@ -879,6 +917,14 @@ dialog.sheet.tall { min-height: min(560px, calc(var(--app-h) - var(--safe-t) - 1
   #view.files-col > .fpane { grid-column: 1; grid-row: 1 / 4; border-right: .5px solid var(--line-2); padding-top: var(--safe-t);
     background: var(--surface); min-width: 0; }
   #view.files-col > .fpane .f-bar { background: var(--surface); }
+  /* the divider: a 10 px grab strip over the column's right edge, a line shows on hover / drag / focus */
+  #view.files-col > .fpane { position: relative; }
+  #view.files-col .f-split { display: block; position: absolute; top: 0; bottom: 0; right: -5px; width: 10px; z-index: 6; cursor: col-resize;
+    touch-action: none; outline: none; }
+  #view.files-col .f-split::after { content: ""; position: absolute; top: 0; bottom: 0; left: 4px; width: 2px; border-radius: 1px;
+    background: var(--accent-text); opacity: 0; transition: opacity .12s; }
+  #view.files-col .f-split:hover::after, #view.files-col .f-split:focus-visible::after, body.col-resizing .f-split::after { opacity: .9; }
+  body.col-resizing, body.col-resizing * { cursor: col-resize !important; -webkit-user-select: none !important; user-select: none !important; }
   #view.files-col > .body { grid-column: 2; grid-row: 2; }
   #view.files-col > .dock { grid-column: 2; grid-row: 3; }
 }

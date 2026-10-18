@@ -43,6 +43,12 @@ MODELS_TTL = 600             # s; model / effort lists per (machine, kind) are c
 RUNTIME = {}                 # resolved hub.listen / tailscale_hostname ("auto" -> tailscale), never saved
 
 
+def agent_error(r, default):
+    """Error text of an agent reply; an agent too old for the op says so instead of "unknown op"."""
+    msg = r.get("msg") or default
+    return "这台机器的 agent 版本较旧，需要更新" if msg.startswith("unknown op") else msg
+
+
 def build_argv(kind, base, msg):
     """argv for a new session: preset argv + phone extras + flags for the advanced create fields."""
     args = msg.get("args")
@@ -691,6 +697,11 @@ class Hub:
                 asyncio.ensure_future(self.machine_netinfo(m, bool(msg.get("refresh"))))
             elif op == "speedtest":
                 asyncio.ensure_future(self.machine_speedtest(p, m))
+            elif op == "agent_update":
+                # restart the machine's agent daemon on the current code; its sessions are restarted and resumed
+                log.info("%s: agent update requested", m.id)
+                m.update_agent()
+                p.send({"t": "agent_update_ok", "m": m.id})
             elif op == "delete":
                 self.forward(p, m, {"op": "delete", "sid": sid})
             elif op == "clean_exited":
@@ -748,7 +759,7 @@ class Hub:
         if r.get("t") == "netinfo":
             m.netinfo = {k: r.get(k) for k in ("ip", "city", "region", "country", "org", "timezone", "ts")}
         else:
-            m.netinfo = {"error": r.get("msg") or "查询失败", "ts": time.time()}
+            m.netinfo = {"error": agent_error(r, "查询失败"), "ts": time.time()}
         self.state_dirty.set()
 
     async def machine_speedtest(self, p, m):
@@ -772,7 +783,7 @@ class Hub:
         if r.get("t") == "speedtest":
             m.speed = {k: r.get(k) for k in ("down_bps", "ttfb_ms", "bytes", "secs")}
         else:
-            m.speed = {"error": r.get("msg") or "测速失败"}
+            m.speed = {"error": agent_error(r, "测速失败")}
         m.speed["ts"] = time.time()
         self.state_dirty.set()
 

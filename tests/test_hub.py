@@ -493,7 +493,31 @@ def test_speedtest_shared_and_netinfo(hub_mod):
         m.replies["netinfo"] = {"t": "error", "msg": "查询公网 IP 失败: x"}
         await hub.machine_netinfo(m)
         assert m.netinfo["error"].startswith("查询公网 IP 失败")
+        # an agent older than the op says so
+        m.replies["speedtest"] = {"t": "error", "msg": "unknown op 'speedtest'"}
+        await hub.phone_op(p, {"op": "speedtest", "m": "M1"})
+        await asyncio.sleep(0.1)
+        assert "需要更新" in m.speed["error"]
+        # the update op asks the machine to replace its daemon
+        m.update_agent = lambda: m.calls.append({"op": "UPDATE"})
+        await hub.phone_op(p, {"op": "agent_update", "m": "M1"})
+        assert m.calls[-1] == {"op": "UPDATE"} and p.sent[-1] == {"t": "agent_update_ok", "m": "M1"}
     asyncio.run(run())
+
+
+def test_bridge_argv_code_and_replace(hub_mod):
+    import machines as M
+    src, code = M.agent_source()
+    assert len(code) == 12 and code == __import__("hashlib").sha256(src).hexdigest()[:12]
+    ssh = M.Machine({"id": "M2", "type": "ssh", "host": "box"}, None, None)
+    cmd = ssh.argv(code, False)[-1]
+    assert 'sys.argv=["glimpse","bridge","--code","%s"]' % code in cmd
+    assert '"--replace"' in ssh.argv(code, True)[-1] and ssh.argv()[-2] == "box"
+    loc = M.Machine({"id": "M1", "type": "local"}, None, None)
+    assert loc.argv(code)[-1] == "bridge" and loc.argv(code, True)[-2:] == ["bridge", "--replace"]
+    loc.reconnect_fresh = lambda: None
+    loc.update_agent()
+    assert loc.replace_next and loc.info({})["outdated"] is False
 
 
 def test_login_pairing_password_devices(hub_mod, tmp_path):

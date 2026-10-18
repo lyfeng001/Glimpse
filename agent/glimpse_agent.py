@@ -33,6 +33,19 @@ import termios
 import time
 
 VERSION = "0.3.0"
+
+
+def code_id(src):
+    """Short hash of the agent source. The daemon outlives the hub (and code updates), so it reports the code
+    it runs in hello; the hub compares it with the source it has and replaces an outdated daemon."""
+    return hashlib.sha256(src).hexdigest()[:12]
+
+
+try:
+    with open(os.path.abspath(__file__), "rb") as _f:
+        CODE_ID = code_id(_f.read())
+except (NameError, OSError):
+    CODE_ID = ""                  # exec'd from stdin over ssh: the hub passes it with `bridge --code`
 RING_MAX = 2 * 1024 * 1024        # raw terminal bytes kept per session
 DEFAULT_REPLAY = 256 * 1024       # bytes replayed to a subscriber that has no offset
 CHAT_MAX = 3000                   # parsed transcript items kept per session
@@ -3277,7 +3290,7 @@ class Daemon:
         try:
             if op == "hello":
                 c.kind = m.get("client") or "cli"
-                self.send(c, {"t": "hello", "version": VERSION, "host": self.host, "pid": os.getpid(),
+                self.send(c, {"t": "hello", "version": VERSION, "code": CODE_ID, "host": self.host, "pid": os.getpid(),
                               "sessions": self.session_list()})
             elif op == "list":
                 self.send(c, {"t": "list", "req": req, "sessions": self.session_list()})
@@ -3728,8 +3741,69 @@ class Conn:
                 return m
 
 
-def cmd_bridge():
-    """stdio <-> daemon socket byte pump. Exits when either side closes; the daemon keeps running."""
+def daemon_hello(addr, timeout=5):
+    """The running daemon's hello reply ({version, code, pid, sessions}), or None when none is reachable."""
+    try:
+        c = Conn(connect(addr, timeout=3))
+    except OSError:
+        return None
+    try:
+        c.send({"op": "hello", "client": "probe"})
+        end = time.time() + timeout
+        while time.time() < end:
+            m = c.recv(timeout=max(0.05, end - time.time()))
+            if m is None:
+                break
+            if m.get("t") == "hello":
+                return m
+    except (OSError, EOFError, ValueError):
+        pass
+    finally:
+        try:
+            c.s.close()
+        except OSError:
+            pass
+    return None
+
+
+def upgrade_daemon(force=False):
+    """Replace a daemon that runs other (older) code than this process. Without `force` only when no session
+    has a live process; the new daemon restores the saved sessions (same ids, resumed conversations).
+    Returns "replaced", "outdated" (left running), or None (current, or no daemon)."""
+    addr, _ = daemon_addr()
+    h = daemon_hello(addr)
+    if not h or not CODE_ID or h.get("code") == CODE_ID:
+        return None
+    if pick_live(h.get("sessions") or []) and not force:
+        return "outdated"
+    pid = h.get("pid")
+    if not isinstance(pid, int) or pid <= 1 or pid == os.getpid():
+        return "outdated"
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return "outdated"
+    end = time.time() + 10
+    while time.time() < end:
+        try:
+            connect(addr, timeout=1).close()
+        except OSError:
+            return "replaced"         # gone: the caller's ensure_daemon() starts the new one
+        time.sleep(0.1)
+    return "outdated"
+
+
+def cmd_bridge(argv=()):
+    """stdio <-> daemon socket byte pump. Exits when either side closes; the daemon keeps running.
+    --code ID: the hash of the source this process runs (given by the hub when exec'd over ssh);
+    --replace: replace an outdated daemon even while sessions run (they are restarted and resumed)."""
+    global CODE_ID
+    argv = list(argv)
+    if "--code" in argv[:-1]:
+        CODE_ID = argv[argv.index("--code") + 1]
+    res = upgrade_daemon(force="--replace" in argv)
+    if res == "replaced":
+        sys.stderr.write("glimpse: replaced the outdated agent daemon\n")
     s = ensure_daemon()
     s.setblocking(False)
     out = sys.stdout.fileno()
@@ -3816,6 +3890,37 @@ def pick_live(sessions):
     return max(live, key=lambda s: s.get("activity") or 0) if live else None
 
 
+def attach_reconnect(sid, wait=30):
+    """After the daemon went away (e.g. replaced by an update): a connection to the new one once it has
+    restored `sid`, or None."""
+    end = time.time() + wait
+    while time.time() < end:
+        time.sleep(0.5)
+        try:
+            c = Conn(connect(daemon_addr()[0], timeout=2))
+            h = c.call({"op": "hello", "client": "attach"}, ("hello",))
+        except (OSError, EOFError, ValueError):
+            continue
+        if any(s["sid"] == sid for s in h.get("sessions") or []):
+            return c
+        c.s.close()
+    return None
+
+
+def attach_draw(c, sid):
+    """Subscribe to `sid`, clear the screen and replay its output. Returns the byte offset reached."""
+    cols, rows = term_size()
+    c.send({"op": "resize", "sid": sid, "cols": cols, "rows": rows})
+    c.send({"op": "sub", "sid": sid})
+    r = c.call({"op": "replay", "req": 1, "sid": sid, "off": None}, ("replay",))
+    if r.get("t") == "error":
+        raise SystemExit(r.get("msg"))
+    out = sys.stdout.buffer
+    out.write(b"\x1b[H\x1b[2J" + base64.b64decode(r["d"]))
+    out.flush()
+    return r["end"]
+
+
 def attach(sid=None):
     import tty
     c = Conn(ensure_daemon())
@@ -3830,16 +3935,8 @@ def attach(sid=None):
         # exit code 3 = not on this machine (the launcher may then try through the hub)
         sys.stderr.write("glimpse: no such session %s here (gli ls)\n" % sid)
         raise SystemExit(3)
-    cols, rows = term_size()
-    c.send({"op": "resize", "sid": sid, "cols": cols, "rows": rows})
-    c.send({"op": "sub", "sid": sid})
-    r = c.call({"op": "replay", "req": 1, "sid": sid, "off": None}, ("replay",))
-    if r.get("t") == "error":
-        raise SystemExit(r.get("msg"))
+    pos = attach_draw(c, sid)
     out = sys.stdout.buffer
-    out.write(b"\x1b[H\x1b[2J" + base64.b64decode(r["d"]))
-    out.flush()
-    pos = r["end"]
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     winch = [False]
@@ -3848,10 +3945,23 @@ def attach(sid=None):
     reason = "detached"
     try:
         while True:
+            if reason == "daemon closed":
+                # the daemon was restarted (an agent update): wait for the new one to restore this session
+                out.write(b"\r\n[glimpse] agent restarting, reconnecting...\r\n")
+                out.flush()
+                c = attach_reconnect(sid)
+                if c is None:
+                    break
+                pos = attach_draw(c, sid)
+                reason = "detached"
             if winch[0]:
                 winch[0] = False
                 cols, rows = term_size()
-                c.send({"op": "resize", "sid": sid, "cols": cols, "rows": rows})
+                try:
+                    c.send({"op": "resize", "sid": sid, "cols": cols, "rows": rows})
+                except OSError:
+                    reason = "daemon closed"
+                    continue
             try:
                 rr, _, _ = select.select([c.s, fd], [], [], 0.5)
             except InterruptedError:
@@ -3861,13 +3971,17 @@ def attach(sid=None):
                 if not d or DETACH_KEY in d:
                     break
                 cols, rows = term_size()
-                c.send({"op": "in", "sid": sid, "d": b64e(d), "cols": cols, "rows": rows})
+                try:
+                    c.send({"op": "in", "sid": sid, "d": b64e(d), "cols": cols, "rows": rows})
+                except OSError:
+                    reason = "daemon closed"
+                    continue
             if c.s in rr or b"\n" in c.buf:
                 try:
                     m = c.recv(timeout=0)
-                except EOFError:
+                except (EOFError, OSError):
                     reason = "daemon closed"
-                    break
+                    continue                # reconnect at the top of the loop
                 while m is not None:
                     if m.get("t") == "out" and m.get("sid") == sid:
                         data = base64.b64decode(m["d"])
@@ -4143,7 +4257,7 @@ def main(argv=None):
             pass
         Daemon(addr, sdir).run()
     elif cmd == "bridge":
-        cmd_bridge()
+        cmd_bridge(argv[1:])
     elif cmd == "hook":
         cmd_hook()
     elif cmd == "ls":

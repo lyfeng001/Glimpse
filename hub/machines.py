@@ -13,9 +13,18 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AGENT = os.path.join(ROOT, "agent", "glimpse_agent.py")
 # The agent source is sent zlib+base64 on the first stdin line and exec'd in memory:
 # nothing is installed on the remote machine. `or b"\n"` stops the read loop on EOF.
-REMOTE_CMD = ("python3 -u -c 'import os,sys,zlib,base64;sys.argv=[\"glimpse\",\"bridge\"];"
+# The bridge gets the source's code id (it has no file to hash) and, for an update, --replace.
+REMOTE_CMD = ("python3 -u -c 'import os,sys,zlib,base64;sys.argv=[\"glimpse\",\"bridge\"%s];"
               "exec(compile(zlib.decompress(base64.b64decode(b\"\".join(iter(lambda:os.read(0,1) or b\"\\n\",b\"\\n\")))),"
               "\"glimpse_agent\",\"exec\"))'")
+
+
+def agent_source():
+    """(source bytes, code id) of the agent as it is on disk now; the same hash the agent computes."""
+    import hashlib
+    with open(AGENT, "rb") as f:
+        src = f.read()
+    return src, hashlib.sha256(src).hexdigest()[:12]
 SSH_OPTS = ["-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
             "-o", "ConnectTimeout=15"]
 STATS_EVERY = 5.0
@@ -48,21 +57,31 @@ class Machine:
         self.netinfo = None            # {ip, city, region, country, org, ts} of the machine's internet exit
         self.speed = None              # last speed test {down_bps, ttfb_ms, ts} or {error, ts}
         self.speed_task = None         # the running speed test (requests from several devices share it)
+        self.outdated = False          # the daemon runs older agent code (it had live sessions, so it was kept)
+        self.replace_next = False      # next connection replaces an outdated daemon even with sessions (update)
         self.waiters = {}
         self.wake = asyncio.Event()
 
     def info(self, presets_view):
         return {"id": self.id, "name": self.name, "type": self.cfg.get("type"), "online": self.online,
-                "error": self.error, "version": self.version, "host": self.host, "stats": self.stats,
+                "error": self.error, "version": self.version, "outdated": self.outdated, "host": self.host, "stats": self.stats,
                 "usage_today": self.usage_today, "memory": self.memory, "netinfo": self.netinfo, "speed": self.speed, "ssh_host": self.cfg.get("host"), "port": self.cfg.get("port"),
                 "presets": presets_view, "default_cwd": self.cfg.get("default_cwd"),
                 "sessions": [self.sessions[k] for k in self.order if k in self.sessions]}
 
-    def argv(self):
+    def argv(self, code="", replace=False):
+        extra = ["--replace"] if replace else []
         if self.cfg.get("type") == "ssh":
             port = ["-p", str(self.cfg["port"])] if self.cfg.get("port") else []
-            return ["ssh"] + SSH_OPTS + port + list(self.cfg.get("ssh_opts") or []) + [self.cfg["host"], REMOTE_CMD]
-        return [sys.executable, AGENT, "bridge"]
+            args = "".join(',"%s"' % a for a in (["--code", code] if code else []) + extra)   # hex / fixed flags only
+            return ["ssh"] + SSH_OPTS + port + list(self.cfg.get("ssh_opts") or []) + [self.cfg["host"], REMOTE_CMD % args]
+        return [sys.executable, AGENT, "bridge"] + extra       # the local bridge hashes its own file
+
+    def update_agent(self):
+        """Replace an outdated daemon now, even with sessions running: they are restarted and resumed
+        (same session ids) by the new daemon."""
+        self.replace_next = True
+        self.reconnect_fresh()
 
     def start(self):
         self.task = asyncio.ensure_future(self.run())
@@ -139,8 +158,10 @@ class Machine:
             self.on_state(self)
 
     async def session_once(self):
+        src, code = agent_source()
+        replace, self.replace_next = self.replace_next, False
         self.proc = await asyncio.create_subprocess_exec(
-            *self.argv(), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            *self.argv(code, replace), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, limit=64 * 1024 * 1024, start_new_session=True)
         errbuf = []
 
@@ -157,8 +178,6 @@ class Machine:
         statst = None
         try:
             if self.cfg.get("type") == "ssh":
-                with open(AGENT, "rb") as f:
-                    src = f.read()
                 self.proc.stdin.write(base64.b64encode(zlib.compress(src, 9)) + b"\n")
             self.write({"op": "hello", "client": "hub"})
             hello = False
@@ -178,9 +197,17 @@ class Machine:
                     hello = True
                     self.online, self.error = True, None
                     self.version, self.host = m.get("version"), m.get("host")
+                    # the bridge replaces an outdated daemon unless sessions run there; then it is kept and flagged
+                    self.outdated = m.get("code") != code
+                    # errors from the previous daemon (e.g. "agent too old") do not apply to this one
+                    if self.netinfo and self.netinfo.get("error"):
+                        self.netinfo = None
+                    if self.speed and self.speed.get("error"):
+                        self.speed = None
                     self.sessions = {s["sid"]: s for s in m.get("sessions", [])}
                     self.order = [s["sid"] for s in m.get("sessions", [])]
-                    log.info("%s online (%s, %d sessions)", self.id, self.host, len(self.order))
+                    log.info("%s online (%s, %d sessions%s)", self.id, self.host, len(self.order),
+                             ", agent outdated" if self.outdated else "")
                     self.on_state(self)
                     statst = asyncio.ensure_future(self.stats_loop())
                     await self.on_msg(self, {"t": "resync"})

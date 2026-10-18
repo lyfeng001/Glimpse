@@ -313,18 +313,20 @@ const WIDGETS = [
       for (const mc of ctx.scope === 'session' ? [ctx.mc].filter(Boolean) : S.machines) netinfoSoon(mc);
       const speed = (mc) => {
         const sp = mc.speed;
+        if (mc.outdated) return '<span style="color:var(--c-wait)">agent 需要更新才能测速</span>';
         if (NETI.testing[mc.id]) return '<span class="spinner" aria-hidden="true"></span> 测速中…';
         if (!sp) return '';
         if (sp.error) return '<span style="color:var(--c-err)">' + esc(sp.error) + '</span>';
         const mbps = (sp.down_bps || 0) / 1e6;   // speed tests are quoted in Mbps, like broadband plans
         return '↓ ' + (mbps >= 10 ? Math.round(mbps) : mbps.toFixed(1)) + ' Mbps · 延迟 ' + Math.round(sp.ttfb_ms) + ' ms';
       };
-      const btn = (mc) => '<button type="button" class="btn sm" data-speed="' + esc(mc.id) + '"' + (NETI.testing[mc.id] || !mc.online ? ' disabled' : '') + '>测速</button>';
+      const btn = (mc) => mc.outdated ? '<button type="button" class="btn sm" data-au="' + esc(mc.id) + '"' + (AU[mc.id] ? ' disabled' : '') + ' aria-label="更新 ' + esc(mc.id) + ' 的 agent">' + (AU[mc.id] ? '更新中' : '更新') + '</button>' :
+        '<button type="button" class="btn sm" data-speed="' + esc(mc.id) + '"' + (NETI.testing[mc.id] || !mc.online ? ' disabled' : '') + '>测速</button>';
       if (ctx.scope === 'session') {
         const mc = ctx.mc; if (!mc) return null;
         const n = mc.netinfo;
         return '<div class="w-col" style="min-width:200px"><div class="w-sub">' + esc(mc.id) + ' 公网出口</div><div class="w-big" style="font-size:15px">' +
-          (n && n.ip ? esc(n.ip) : n && n.error ? '<span style="color:var(--c-err)">查询失败</span>' : '—') + '</div><div class="w-sub">' +
+          (n && n.ip ? esc(n.ip) : n && n.error && !mc.outdated ? '<span style="color:var(--c-err)">查询失败</span>' : '—') + '</div><div class="w-sub">' +
           (n && n.ip ? esc(loc(n) || n.org || '') : '') + '</div><div class="w-sub" style="display:flex;align-items:center;gap:6px">' + speed(mc) + btn(mc) + '</div></div>';
       }
       // one line each for IP, location and speed: a widget is too narrow to put two of them side by side
@@ -332,9 +334,9 @@ const WIDGETS = [
       const rows = S.machines.map((mc) => {
         const n = mc.netinfo;
         let body;
-        if (!mc.online) body = line('<span style="color:var(--c-err)">离线</span>');
+        if (!mc.online) body = line(AU[mc.id] ? '<span class="spinner" aria-hidden="true"></span> 正在更新 agent…' : '<span style="color:var(--c-err)">离线</span>');
         else if (n && n.ip) body = line(esc(n.ip), 'ni-ip') + (loc(n) ? line(esc(loc(n))) : '');
-        else body = line(n && n.error ? '<span style="color:var(--c-err)">查询失败</span>' : '…');
+        else body = line(mc.outdated ? '—' : n && n.error ? '<span style="color:var(--c-err)">查询失败</span>' : '…');
         const sp = mc.online ? speed(mc) : '';
         return '<div class="w-row" style="align-items:flex-start"><b style="min-width:22px">' + esc(mc.id) + '</b><span class="grow ni">' + body +
           (sp ? line(sp) : '') + '</span>' + (mc.online ? btn(mc) : '') + '</div>';
@@ -357,7 +359,7 @@ const WIDGETS = [
 ];
 function netinfoSoon(mc) {
   // ask the machine for its public IP when we have none, it is over 10 min old, or the last lookup failed 5 min ago
-  if (!mc.online) return;
+  if (!mc.online || mc.outdated) return;               // an outdated agent cannot answer it
   const t = Date.now() / 1000; const n = mc.netinfo;
   if (n && n.ts && t - n.ts < (n.error ? 300 : 600)) return;
   if (t - (NETI.asked[mc.id] || 0) < 60) return;        // a lookup is in flight (or just failed to send)
@@ -637,6 +639,7 @@ function onMsg(m) {
       S.machines = m.machines || []; S.byId = {};
       for (const mc of S.machines) {
         S.byId[mc.id] = mc;
+        agentUpdated(mc);
         if (mc.stats) {
           const h = S.mhist[mc.id] || (S.mhist[mc.id] = { rtt: [], rx: [], ts: 0 });
           if (mc.stats.ts !== h.ts) { h.ts = mc.stats.ts; pushHist(h.rtt, mc.stats.rtt_ms || 0); pushHist(h.rx, mc.stats.rx_bps || 0); }
@@ -1170,6 +1173,8 @@ for (const host of [$('#home-widgets'), $('#v-widgets')]) {
       }
       return;
     }
+    const au = e.target.closest('[data-au]');
+    if (au) { updateAgent(au.dataset.au); return; }
     const speed = e.target.closest('[data-speed]');
     if (speed) {
       const mid = speed.dataset.speed;
@@ -2253,15 +2258,40 @@ $('#key-add').onclick = () => {
 };
 $('#key-reset').onclick = () => { LS.removeItem('glimpse.keybar'); renderKeybar(); renderSettingsKeys(); };
 
+// ---- agent update: the daemon on a machine outlives code updates; when it still runs older code (it had
+// sessions running, so the hub did not replace it), restart it on the current code. Sessions come back resumed.
+const AU = {};    // machine id -> true while its update runs
+async function updateAgent(mid) {
+  const mc = S.byId[mid]; if (!mc || AU[mid]) return;
+  const live = mc.sessions.filter((s) => s.pid && s.exit_code == null && s.status !== 'exited');
+  // only Claude / Codex sessions with a conversation id are restored; shells and the like just end
+  const back = live.filter((s) => (s.kind === 'claude' || s.kind === 'codex') && s.agent_session_id).length;
+  const lost = live.length - back;
+  const msg = !live.length ? '这台机器上没有正在运行的会话。' :
+    (back ? back + ' 个 Claude / Codex 会话会重启并自动恢复对话（同一个会话，接着原来的上下文），正在生成的回复会中断，电脑上连着的终端会自动重连。' : '') +
+    (lost ? lost + ' 个其他会话（如 Shell）会结束，无法恢复。' : '');
+  const ok = await confirmSheet('更新 ' + mid + ' 的 agent？', msg, '更新');
+  if (!ok) return;
+  if (!send({ op: 'agent_update', m: mid })) { toast('未连接', '稍后再试', null, 'error'); return; }
+  AU[mid] = true; renderSettingsMachines(); renderHomeWidgets();
+  setTimeout(() => { if (AU[mid]) { delete AU[mid]; renderSettingsMachines(); renderHomeWidgets(); } }, 60000);
+}
+function agentUpdated(mc) {
+  // a fresh connection without the outdated flag ends a running update
+  if (AU[mc.id] && mc.online && !mc.outdated) { delete AU[mc.id]; toast(mc.id + ' 的 agent 已更新', '', null, 'done'); }
+}
 function renderSettingsMachines() {
   const host = $('#set-machines');
   setHTML(host, S.machines.map((m) => '<div class="cell"><span class="cell-ic" aria-hidden="true">' + ic(m.type === 'ssh' ? 'server' : 'laptop') + '</span>' +
     '<span class="grow"><b>' + esc(m.id) + '</b> ' + esc(m.name) + '<div class="sub">' + (m.online ? '在线' + (m.version ? ' · agent ' + esc(m.version) : '') +
-      (m.stats ? ' · ' + fmtMs(m.stats.rtt_ms) : '') : '<span style="color:var(--c-err)">' + esc(m.error || '离线') + '</span>') + '</div></span>' +
+      (m.outdated ? ' · <span style="color:var(--c-wait)">' + (AU[m.id] ? '正在更新…' : '需要更新') + '</span>' : '') +
+      (m.stats ? ' · ' + fmtMs(m.stats.rtt_ms) : '') : '<span style="color:var(--c-err)">' + esc(AU[m.id] ? '正在更新…' : m.error || '离线') + '</span>') + '</div></span>' +
+    (m.online && m.outdated && !AU[m.id] ? '<button type="button" class="btn sm" data-au="' + esc(m.id) + '">更新</button>' : '') +
     (m.online ? '' : '<button type="button" class="btn sm" data-rc="' + esc(m.id) + '">重连</button>') +
     (m.type === 'ssh' ? '<button type="button" class="icon-btn plain" data-ed="' + esc(m.id) + '" aria-label="编辑 ' + esc(m.name) + '">' + ic('pencil', 'sm') + '</button>' : '') +
     '</div>').join('') || '<div class="cell"><span class="grow sub">没有机器</span></div>');
   for (const b of $$('[data-rc]', host)) b.onclick = () => { send({ op: 'reconnect', m: b.dataset.rc }); toast('正在重连', b.dataset.rc); };
+  for (const b of $$('[data-au]', host)) b.onclick = () => updateAgent(b.dataset.au);
   for (const b of $$('[data-ed]', host)) b.onclick = () => openMachine(b.dataset.ed);
   const n = allSessions().filter(([, x]) => x.status === 'exited' || x.status === 'error').length;
   $('#btn-clean').disabled = !n;

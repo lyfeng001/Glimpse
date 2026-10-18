@@ -602,6 +602,57 @@ def test_speed_test_measures_download(monkeypatch):
         A.fetch_netinfo()
 
 
+def test_upgrade_daemon_replaces_only_outdated_idle_daemons(monkeypatch):
+    killed, alive = [], [True]
+    monkeypatch.setattr(A, "CODE_ID", "new")
+    monkeypatch.setattr(A, "daemon_addr", lambda: ("x.sock", None))
+    monkeypatch.setattr(A.os, "kill", lambda pid, sig: killed.append((pid, sig)) or alive.__setitem__(0, False))
+
+    class S:
+        def close(self):
+            pass
+
+    def conn(addr, timeout=None):
+        if alive[0]:
+            return S()
+        raise OSError("gone")
+    monkeypatch.setattr(A, "connect", conn)
+    live = {"sid": "a", "pid": 7, "exit_code": None, "status": "idle"}
+    done = {"sid": "b", "pid": 8, "exit_code": 0, "status": "exited"}
+
+    def hello(code, sessions):
+        monkeypatch.setattr(A, "daemon_hello", lambda addr: {"t": "hello", "code": code, "pid": 4242, "sessions": sessions})
+        alive[0] = True
+    hello("new", [])
+    assert A.upgrade_daemon() is None and killed == []                      # current code
+    hello(None, [live])                                                      # old daemon without a code id
+    assert A.upgrade_daemon() == "outdated" and killed == []                # sessions running: kept
+    hello("old", [done])
+    assert A.upgrade_daemon() == "replaced" and killed == [(4242, A.signal.SIGTERM)]
+    killed.clear()
+    hello("old", [live])
+    assert A.upgrade_daemon(force=True) == "replaced" and killed == [(4242, A.signal.SIGTERM)]
+    killed.clear()
+    monkeypatch.setattr(A, "daemon_hello", lambda addr: None)               # no daemon yet
+    assert A.upgrade_daemon() is None
+    monkeypatch.setattr(A, "CODE_ID", "")                                    # unknown own code: never replace
+    hello("old", [])
+    assert A.upgrade_daemon() is None and killed == []
+    # the hello reply carries the code id
+    assert A.code_id(b"abc") == A.hashlib.sha256(b"abc").hexdigest()[:12]
+
+
+def test_hello_reports_code_id(tmp_path):
+    d = _daemon(tmp_path)
+    sent = []
+    d.send = lambda c, obj: sent.append(obj)
+
+    class C:
+        kind = None
+    d.handle(C(), {"op": "hello", "client": "probe"})
+    assert sent[-1]["t"] == "hello" and sent[-1]["code"] == A.CODE_ID and len(A.CODE_ID) == 12
+
+
 def test_delete_sequencing(tmp_path, monkeypatch):
     d = _daemon(tmp_path)
     monkeypatch.setattr(A.Session, "spawn", lambda self, resume=False: setattr(self, "fd", 99) or

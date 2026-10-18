@@ -23,6 +23,7 @@ from auth import PAIR_TTL, Auth  # noqa: E402
 import keybalance as KB  # noqa: E402
 import webpush  # noqa: E402
 from machines import Machine  # noqa: E402
+import machines as M  # noqa: E402
 
 ROOT = C.ROOT
 WEB = os.path.join(ROOT, "web")
@@ -31,6 +32,7 @@ VERSION = "0.4.0"
 log = logging.getLogger("glimpse.hub")
 PHONE_QUEUE_MAX = 4000       # messages; a phone that falls this far behind is disconnected
 VISIBLE_FRESH = 15           # s; a "visible" phone that has been silent longer is treated as gone (push again)
+CODE_CHECK_EVERY = 10        # s; how often the agent source on disk is checked against what the machines run
 CERT_RETRY = 600             # s between certificate attempts while serving without one
 CERT_RENEW = 12 * 3600
 HOST_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
@@ -269,9 +271,14 @@ class Hub:
     def _save_push(self):
         C.write_secret(self.push_path, json.dumps(self.push_subs))
 
-    async def push_all(self, payload):
-        if not self.push_subs:
-            return
+    async def push_all(self, payload, skip=None):
+        """Push to every subscription except those of the devices in `skip` (they have the app on screen).
+        A subscription saved before devices were recorded is skipped while any device is on screen (the old
+        rule) until its device registers it again. Returns the number of subscriptions pushed to."""
+        skip = skip or set()
+        subs = [s for s in self.push_subs if not skip or (s.get("device") and s["device"] not in skip)]
+        if not subs:
+            return 0
         gone = []
 
         async def one(sub):
@@ -283,10 +290,11 @@ class Hub:
                     log.warning("push %s -> %s %s", sub["endpoint"][:40], status, text)
             except Exception as e:
                 log.warning("push error: %s", e)
-        await asyncio.gather(*(one(s) for s in list(self.push_subs)))
+        await asyncio.gather(*(one(s) for s in subs))
         if gone:
             self.push_subs = [s for s in self.push_subs if s["endpoint"] not in gone]
             self._save_push()
+        return len(subs) - len(gone)
 
     # --- presets / keys (secrets never leave the hub)
     def preset(self, m, kind):
@@ -427,6 +435,15 @@ class Hub:
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as e:
                 return {"ts": time.time(), "error": "查询失败：%s" % (str(e) or type(e).__name__)[:80]}
         return out
+
+    async def code_watch_loop(self):
+        """The agent source changed on disk (git pull): machines running the old code are flagged 需要更新
+        within seconds, idle ones are updated right away, without restarting the hub."""
+        while True:
+            await asyncio.sleep(CODE_CHECK_EVERY)
+            code = M.agent_code()
+            if any([M.check_code(m, code) for m in self.machines.values()]):
+                self.state_dirty.set()
 
     async def config_watch_loop(self):
         """config.json edited by hand: reload the keys (names, values, usage_url) and memory settings without a
@@ -577,12 +594,14 @@ class Hub:
         self.recent_push[k] = t
         for p in list(self.phones):
             p.send({"t": "event", "m": m.id, "sid": sid, "ev": ev, "title": title})
-        if any(p.on_screen() for p in self.phones):
-            return                   # the app is open on screen: in-app banner only
-        await self.push_all({"title": title, "body": body[:300] or ev.get("title", ""),
-                             "subtitle": "%s %s" % (m.id, m.name),
-                             "tag": "%s:%s" % (m.id, sid), "url": "/#%s/%s" % (m.id, sid),
-                             "kind": ev.get("kind")})
+        # a device that has the app open on screen gets the in-app banner instead of a push; every other device
+        # is still notified (an open desktop window must not silence the phone)
+        on = {p.device for p in self.phones if p.device and p.on_screen()}
+        sent = await self.push_all({"title": title, "body": body[:300] or ev.get("title", ""),
+                                    "subtitle": "%s %s" % (m.id, m.name),
+                                    "tag": "%s:%s" % (m.id, sid), "url": "/#%s/%s" % (m.id, sid),
+                                    "kind": ev.get("kind")}, skip=on)
+        log.info("event %s %s/%s: push to %d device(s), %d on screen", ev.get("kind"), m.id, sid, sent, len(on))
 
     # --- phone side
     def _sub(self, m, sid):
@@ -1119,8 +1138,13 @@ class Hub:
         if not str(sub.get("endpoint", "")).startswith("https://") or not keys.get("p256dh") or not keys.get("auth"):
             raise web.HTTPBadRequest(text="invalid subscription")
         sub = {"endpoint": sub["endpoint"], "keys": {"p256dh": keys["p256dh"], "auth": keys["auth"]}}
+        dev = self.auth.device_for(self.request_token(request))
+        if dev:
+            sub["device"] = dev["id"]          # so this device is only skipped while it has the app on screen
+        old = next((s for s in self.push_subs if s["endpoint"] == sub["endpoint"]), None)
         self.push_subs = [s for s in self.push_subs if s["endpoint"] != sub["endpoint"]] + [sub]
-        self._save_push()
+        if old != sub:
+            self._save_push()
         return web.json_response({"ok": True, "count": len(self.push_subs)})
 
     async def push_unsubscribe(self, request):
@@ -1185,7 +1209,8 @@ class Hub:
 
     async def startup(self, app):
         self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
-        self.bg = [asyncio.ensure_future(self.state_loop()), asyncio.ensure_future(self.config_watch_loop())]
+        self.bg = [asyncio.ensure_future(self.state_loop()), asyncio.ensure_future(self.config_watch_loop()),
+                   asyncio.ensure_future(self.code_watch_loop())]
         if self.cfg["keys"].get("usage_url"):
             t = asyncio.ensure_future(self.key_usage_loop())
             t._kul = True

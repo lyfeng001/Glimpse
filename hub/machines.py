@@ -25,6 +25,40 @@ def agent_source():
     with open(AGENT, "rb") as f:
         src = f.read()
     return src, hashlib.sha256(src).hexdigest()[:12]
+
+
+_code_cache = [None, None]
+
+
+def agent_code():
+    """Code id of the agent on disk (hashed again only when the file changed)."""
+    try:
+        st = os.stat(AGENT)
+    except OSError:
+        return None
+    key = (st.st_mtime_ns, st.st_size)
+    if _code_cache[0] != key:
+        _code_cache[:] = [key, agent_source()[1]]
+    return _code_cache[1]
+
+
+def live_sessions(m):
+    return [s for s in m.sessions.values() if s.get("pid") and s.get("exit_code") is None and s.get("status") != "exited"]
+
+
+def check_code(m, code):
+    """After the agent on disk changed (git pull): flag the machine outdated, and reconnect one without running
+    sessions so its bridge replaces the daemon right away (once per code id). Returns True when the flag changed."""
+    if not m.online or not code or m.code is None and not m.outdated:
+        return False
+    out = m.code != code
+    changed = out != m.outdated
+    m.outdated = out
+    if out and not live_sessions(m) and m.refreshed_for != code:
+        m.refreshed_for = code
+        log.info("%s: agent code changed, reconnecting to update the idle daemon", m.id)
+        m.reconnect_fresh()
+    return changed
 SSH_OPTS = ["-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
             "-o", "ConnectTimeout=15"]
 STATS_EVERY = 5.0
@@ -58,7 +92,9 @@ class Machine:
         self.speed = None              # last speed test {down_bps, ttfb_ms, ts} or {error, ts}
         self.speed_task = None         # the running speed test (requests from several devices share it)
         self.outdated = False          # the daemon runs older agent code (it had live sessions, so it was kept)
+        self.code = None               # code id the daemon reported
         self.replace_next = False      # next connection replaces an outdated daemon even with sessions (update)
+        self.refreshed_for = None      # agent code id an automatic reconnect was already tried for
         self.waiters = {}
         self.wake = asyncio.Event()
 
@@ -198,7 +234,8 @@ class Machine:
                     self.online, self.error = True, None
                     self.version, self.host = m.get("version"), m.get("host")
                     # the bridge replaces an outdated daemon unless sessions run there; then it is kept and flagged
-                    self.outdated = m.get("code") != code
+                    self.code = m.get("code")
+                    self.outdated = self.code != code
                     # errors from the previous daemon (e.g. "agent too old") do not apply to this one
                     if self.netinfo and self.netinfo.get("error"):
                         self.netinfo = None

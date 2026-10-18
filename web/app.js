@@ -580,7 +580,7 @@ function connect() {
     if (S.ws !== ws) return;
     S.wsOk = true; S.backoff = 500; S.lastPong = performance.now(); setConn('ok', '已连接');
     flushOutbox();
-    send({ op: 'visible', v: document.visibilityState === 'visible' });
+    send({ op: 'visible', v: onScreen() });
     ping();
     if (S.view) subscribe();
   };
@@ -615,6 +615,10 @@ function ping() {
   send({ op: 'ping', ts: S.lastPing });
   if (!S.pongTimer) S.pongTimer = setTimeout(() => { S.pongTimer = null; setConn('bad', '无响应'); S.backoff = 500; connect(); }, 10000);
 }
+// "on screen" for the hub (it holds this device's push notifications back meanwhile): visible, and on a
+// desktop also the focused window — a Glimpse window left open behind other apps still gets notifications
+const DESKTOP = !matchMedia('(pointer: coarse)').matches;
+function onScreen() { return document.visibilityState === 'visible' && (!DESKTOP || document.hasFocus()); }
 // iOS suspends pages in the background: reconnect immediately when we come back
 document.addEventListener('visibilitychange', () => {
   const vis = document.visibilityState === 'visible';
@@ -623,8 +627,9 @@ document.addEventListener('visibilitychange', () => {
     if (!S.ws || S.ws.readyState > 1 || (S.ws.readyState === 1 && performance.now() - S.lastPong > 10000)) { S.backoff = 500; connect(); } else ping();
     if (S.view) send({ op: 'ack', m: S.view.m, sid: S.view.sid });
   }
-  send({ op: 'visible', v: vis });
+  send({ op: 'visible', v: onScreen() });
 });
+for (const ev of ['focus', 'blur']) window.addEventListener(ev, () => send({ op: 'visible', v: onScreen() }));
 setInterval(() => { if (document.visibilityState === 'visible') ping(); }, 5000);
 // websocket download rate, sampled every second
 setInterval(() => {
@@ -2696,5 +2701,17 @@ $('#btn-logout').onclick = async () => {
 };
 
 $('#term-size-btn').onclick = () => openSizeSheet();
+
+// an existing push subscription is registered again on every start: the hub then knows which device it
+// belongs to (and only holds that device's notifications back while this device has the app on screen)
+async function pushRefresh() {
+  try {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window) || !window.Notification || Notification.permission !== 'granted') return;
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    if (sub) await api('/api/push/subscribe', sub.toJSON());
+  } catch (_) {}
+}
+setTimeout(pushRefresh, 3000);
 
 boot();

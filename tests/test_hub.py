@@ -505,6 +505,58 @@ def test_speedtest_shared_and_netinfo(hub_mod):
     asyncio.run(run())
 
 
+def test_push_only_skips_devices_with_the_app_on_screen(hub_mod, monkeypatch):
+    C, server = hub_mod
+
+    async def run():
+        hub = server.Hub(C.load())
+        m = FakeMachine()
+        hub.machines[m.id] = m
+        sent = []
+
+        async def fake_send(http, vapid, sub, payload, subject):
+            sent.append(sub["endpoint"])
+            return 201, ""
+        monkeypatch.setattr(server.webpush, "send", fake_send)
+        hub.push_subs = [{"endpoint": "https://p/phone", "keys": {}, "device": "phone"},
+                         {"endpoint": "https://p/desk", "keys": {}, "device": "desk"},
+                         {"endpoint": "https://p/old", "keys": {}}]          # saved before devices were recorded
+
+        def ph(dev, visible):
+            p = FakePhone()
+            p.device, p.visible, p.last_seen = dev, visible, server.time.time()
+            p.on_screen = lambda p=p: server.Phone.on_screen(p)
+            return p
+        # the desktop window is on screen: the phone is still notified, the desktop is not
+        hub.phones = {ph("desk", True), ph("phone", False), ph(None, True)}     # None = a local CLI client
+        await hub.on_event(m, "s1", {"kind": "done", "title": "已完成本轮", "body": "a"})
+        assert sent == ["https://p/phone"]
+        # nobody on screen: everyone, including the old subscription
+        sent.clear()
+        hub.phones = {ph("desk", False), ph(None, True)}
+        await hub.on_event(m, "s1", {"kind": "done", "title": "已完成本轮", "body": "b"})
+        assert sorted(sent) == ["https://p/desk", "https://p/old", "https://p/phone"]
+    asyncio.run(run())
+
+
+def test_new_agent_code_flags_and_updates_idle_machines(hub_mod):
+    import machines as M
+    m = M.Machine({"id": "M2", "type": "ssh", "host": "box"}, None, None)
+    reconnects = []
+    m.reconnect_fresh = lambda: reconnects.append(1)
+    m.online, m.code, m.outdated = True, "old", False
+    m.sessions = {"a": {"sid": "a", "pid": 5, "exit_code": None, "status": "idle"}}
+    assert M.check_code(m, "new") is True and m.outdated and reconnects == []          # busy: flag only
+    m.sessions = {}
+    assert M.check_code(m, "new") is False and reconnects == [1]                       # idle: reconnect once
+    assert M.check_code(m, "new") is False and reconnects == [1]
+    m.code = "new"
+    assert M.check_code(m, "new") is True and not m.outdated
+    m.online = False
+    assert M.check_code(m, "newer") is False                                            # offline: nothing
+    assert M.agent_code() == M.agent_source()[1]
+
+
 def test_bridge_argv_code_and_replace(hub_mod):
     import machines as M
     src, code = M.agent_source()

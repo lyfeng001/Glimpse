@@ -362,6 +362,72 @@ def _menu_str(s):
     return clip(s.strip(), MENU_MAX_STR)
 
 
+# claude's AskUserQuestion with several questions: a tab bar "←  ☐ A  ☒ B  ✔ Submit  →" above the current
+# question; after the last one a "Review your answers" page with "1. Submit answers / 2. Cancel"
+QTABS_RE = re.compile(r"^\s*←\s+(.*[☐☒].*?)\s+→\s*$")
+QREVIEW_RE = re.compile(r"review your answers", re.I)
+
+
+def ask_item(q):
+    """One AskUserQuestion question -> what the phone shows."""
+    return {"question": clip(q.get("question", ""), 600), "header": clip(q.get("header", ""), 60),
+            "options": [{"label": clip(o.get("label", ""), 120), "description": clip(o.get("description", ""), 300)}
+                        for o in (q.get("options") or []) if isinstance(o, dict)][:9],
+            "multi": bool(q.get("multiSelect"))}
+
+
+def _norm(s):
+    return re.sub(r"\s+", "", s or "")
+
+
+def question_progress(lines, items):
+    """Where claude's multi-question picker is: {"qi", "answered", "review", "submit", "summary"}, or None when
+    the picker is not on the screen (keep the last known state)."""
+    bar = None
+    for i in range(len(lines) - 1, -1, -1):
+        m = QTABS_RE.match(lines[i])
+        if m:
+            bar = (i, [t for t in re.split(r"\s{2,}", m.group(1).strip()) if t])
+            break
+    if bar is None:
+        return None
+    i, tabs = bar
+    tabs = [t for t in tabs if t[:1] in ("☐", "☒")]
+    answered = [t.startswith("☒") for t in tabs][:len(items)]
+    answered += [False] * (len(items) - len(answered))
+    below = [ln for ln in lines[i + 1:i + 40]]
+    if any(QREVIEW_RE.search(ln) for ln in below[:4]):
+        menu = parse_menu(lines)
+        submit = [{"n": o["i"] + 1, "label": o["label"]} for o in (menu or {}).get("options") or []] or \
+            [{"n": 1, "label": "Submit answers"}, {"n": 2, "label": "Cancel"}]
+        # the answers as listed ("● question" / "→ answer"); the list is redrawn in parts, so it is matched
+        # back to the known questions and an answer that is not on the screen stays ""
+        got, cur = {}, None
+        for ln in below:
+            t = ln.strip()
+            if MENU_OPT_RE.match(ln) or MENU_FOOTER_RE.search(ln):
+                break
+            if t.startswith("●"):
+                cur = _norm(t.lstrip("● "))
+            elif t.startswith("→") and cur is not None:
+                got[cur] = clip(t.lstrip("→ ").strip(), 300)
+        summary = [{"q": it["question"], "a": got.get(_norm(it["question"]), "")} for it in items]
+        return {"qi": len(items) - 1, "answered": answered, "review": True, "submit": submit[:4], "summary": summary}
+    # the current question: its text is the first non-empty line under the bar (long ones wrap)
+    head = next((_norm(ln) for ln in below if ln.strip()), "")
+    best, best_n = None, 0
+    for k, it in enumerate(items):
+        q = _norm(it["question"])
+        n = 0
+        while n < min(len(q), len(head)) and q[n] == head[n]:
+            n += 1
+        if n > best_n:
+            best, best_n = k, n
+    if best is None or best_n < min(6, len(head)):
+        best = next((k for k, a in enumerate(answered) if not a), len(items) - 1)
+    return {"qi": best, "answered": answered, "review": False}
+
+
 def parse_menu(lines):
     """Screen text -> {"kind": "list"|"slider", "title", "options", "cursor", "hint"} or None (no / unsure)."""
     foot = None
@@ -468,7 +534,8 @@ def summarize_tool(name, inp):
     if name == "AskUserQuestion":
         qs = inp.get("questions") or []
         if qs and isinstance(qs[0], dict):
-            return "Question: " + clip(qs[0].get("question", ""), 300)
+            more = " (+%d 个问题)" % (len(qs) - 1) if len(qs) > 1 else ""
+            return "Question: " + clip(qs[0].get("question", ""), 300) + more
     return name
 
 
@@ -1679,6 +1746,21 @@ class Session:
         if m != self.menu:
             self.menu = m
             self.touch()
+        q = self.question
+        if q and q.get("questions"):
+            try:
+                p = question_progress(self.screen.lines(), q["questions"])
+            except Exception:
+                p = None
+            if p:
+                nq = dict(q, **p)
+                if not p["review"]:
+                    nq.pop("submit", None)
+                    nq.pop("summary", None)
+                    nq.update(q["questions"][p["qi"]])           # top-level fields = the question shown now
+                if nq != q:
+                    self.question = nq
+                    self.touch()
 
     def run_init_cmds(self):
         """Type the create's init_cmds (e.g. "/effort ultracode") once claude is up."""
@@ -1954,13 +2036,12 @@ class Session:
             tool = ev.get("tool_name") or ""
             if name == "PreToolUse" and tool == "AskUserQuestion":
                 inp = ev.get("tool_input") or {}
-                qs = inp.get("questions") or []
-                q0 = qs[0] if qs and isinstance(qs[0], dict) else {}
-                self.question = {"question": clip(q0.get("question", ""), 600), "header": q0.get("header", ""),
-                                 "options": [{"label": clip(o.get("label", ""), 120),
-                                              "description": clip(o.get("description", ""), 300)}
-                                             for o in (q0.get("options") or []) if isinstance(o, dict)][:9],
-                                 "multi": bool(q0.get("multiSelect"))}
+                items = [ask_item(q) for q in (inp.get("questions") or []) if isinstance(q, dict)][:6] or [ask_item({})]
+                # the top-level fields are the question shown now (what older phones read); with several
+                # questions check_menu() follows claude's picker and moves qi on as they are answered
+                self.question = dict(items[0], qi=0)
+                if len(items) > 1:
+                    self.question.update(questions=items, answered=[False] * len(items), review=False)
                 q = summarize_tool(tool, inp)
                 self.set_status("waiting", clip(q, 200), "question")
                 self.event("question", "有问题需要回答", q)

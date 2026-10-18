@@ -387,6 +387,16 @@ code, pre, kbd { font-family: var(--mono); }
   display: inline-flex; align-items: center; justify-content: center; flex: none; }
 .opt .ol { font-weight: 600; font-size: 15px; } .opt .od { font-size: 12.5px; color: var(--text-2); margin-top: 1px; }
 .opt.other .n { background: var(--fill-2); color: var(--text-2); }
+/* AskUserQuestion with several questions: steps, the submit page's summary, prev / next */
+.q-steps { display: flex; gap: 6px; margin-top: var(--s3); overflow-x: auto; scrollbar-width: none; }
+.q-steps span { flex: none; padding: 3px 9px; border-radius: var(--r-full); font-size: 12px; font-weight: 600; background: var(--fill-2); color: var(--text-2); }
+.q-steps span.done { color: var(--c-ok); background: color-mix(in srgb, var(--c-ok) 14%, transparent); }
+.q-steps span.done::before { content: "✓ "; }
+.q-steps span.cur { color: var(--accent-text); background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent-text); }
+.q-sums { display: flex; flex-direction: column; gap: var(--s2); margin-top: var(--s3); }
+.q-sum { padding: var(--s2) var(--s3); border-radius: var(--r-md); background: var(--fill-2); }
+.q-sum .od { font-size: 12.5px; color: var(--text-2); } .q-sum .ol { font-weight: 600; font-size: 15px; margin-top: 1px; word-break: break-word; }
+.acard .q-nav .btn { min-height: 40px; }
 .keys { display: flex; gap: 6px; overflow-x: auto; padding: var(--s2) var(--s3) 2px; scrollbar-width: none; }
 .key { flex: none; min-width: 44px; height: 36px; padding: 0 10px; border-radius: 9px; background: var(--surface); box-shadow: var(--shadow-1);
   font: 600 13px var(--mono); color: var(--text); display: inline-flex; align-items: center; justify-content: center; transition: background-color .1s, transform .1s; }

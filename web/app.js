@@ -729,7 +729,8 @@ function machineStats(mc) {
 function cardHTML(mc, s) {
   let flag = '';
   if (s.pending) flag = '<div class="c-flag question">' + ic('shield', 'sm') + '<span class="grow">待授权：' + esc(s.pending.tool) + ' · ' + esc(s.pending.summary || '') + '</span></div>';
-  else if (s.question) flag = '<div class="c-flag question">' + ic('help', 'sm') + '<span class="grow">提问：' + esc(s.question.question) + '</span></div>';
+  else if (s.question) flag = '<div class="c-flag question">' + ic('help', 'sm') + '<span class="grow">提问' +
+    (s.question.questions ? '（' + (s.question.review ? '待提交' : ((s.question.qi || 0) + 1) + '/' + s.question.questions.length) + '）' : '') + '：' + esc(s.question.question) + '</span></div>';
   else if (s.attention === 'error') flag = '<div class="c-flag error">' + ic('alert', 'sm') + '<span class="grow">' + esc(s.detail || '出错') + '</span></div>';
   else if (s.attention === 'done') flag = '<div class="c-flag done">' + ic('check-c', 'sm') + '<span class="grow">已完成</span></div>';
   else if (s.attention === 'question') flag = '<div class="c-flag question">' + ic('help', 'sm') + '<span class="grow">需要你回复</span></div>';
@@ -1386,15 +1387,35 @@ function renderCard() {
       (p.can_always ? '<button type="button" class="btn" data-a="always"' + dis + '>' + busy('always') + '总是允许</button>' : '') +
       '<button type="button" class="btn ghost' + (p.can_always ? '' : ' wide') + '" data-a="terminal"' + dis + '>在终端处理</button>' +
       '</div></section>';
-  } else if (s && s.question && s.question.options && s.question.options.length) {
-    const q = s.question; sig = 'q:' + q.question;
-    html = '<section class="acard q" role="group" aria-labelledby="q-s">' +
-      '<div class="a-h"><span class="a-ic">' + ic('help') + '</span><div class="a-t"><div class="a-k">' + esc(q.header || '提问') + (q.multi ? ' · 可多选' : '') + '</div>' +
-      '<div class="a-s" id="q-s">' + esc(q.question) + '</div></div></div><div class="opts">' +
-      q.options.map((o, i) => '<button type="button" class="opt" data-q="' + (i + 1) + '"><span class="n">' + (i + 1) + '</span><span class="grow"><div class="ol">' +
-        esc(o.label) + '</div>' + (o.description ? '<div class="od">' + esc(o.description) + '</div>' : '') + '</span></button>').join('') +
-      '<button type="button" class="opt other" data-q="other"><span class="n">…</span><span class="grow"><div class="ol">其他</div><div class="od">在下方输入框回复</div></span></button>' +
-      '</div></section>';
+  } else if (s && s.question && ((s.question.options && s.question.options.length) || s.question.review)) {
+    // AskUserQuestion. With several questions the agent follows claude's picker: qi = the question shown,
+    // answered[], and review = the final "Submit answers" page
+    const q = s.question; const qs = q.questions || null; const n = qs ? qs.length : 1; const qi = q.qi || 0;
+    sig = 'q:' + q.question + ':' + qi + ':' + (q.review ? 'r' : '') + ':' + (q.answered || []).join(',');
+    if (v && v.qFor !== (qs ? qs[0].question : q.question)) { v.qFor = qs ? qs[0].question : q.question; v.qAns = {}; }
+    const steps = qs ? '<div class="q-steps" aria-hidden="true">' + qs.map((x, i) => '<span class="' + (q.review ? 'done' : i === qi ? 'cur' : (q.answered || [])[i] ? 'done' : '') +
+      '">' + esc(x.header || String(i + 1)) + '</span>').join('') + '<span class="' + (q.review ? 'cur' : '') + '">提交</span></div>' : '';
+    const kicker = qs ? (q.review ? '确认答案 · ' + n + ' 个问题' : '问题 ' + (qi + 1) + ' / ' + n + (q.header ? ' · ' + q.header : '')) : (q.header || '提问');
+    if (q.review) {
+      const sum = (q.summary || qs.map((x) => ({ q: x.question, a: '' }))).map((r, i) => '<div class="q-sum"><div class="od">' + esc(r.q) + '</div><div class="ol">' +
+        esc(r.a || (v && v.qAns && v.qAns[i]) || '—') + '</div></div>').join('');
+      const sub = (q.submit || [{ n: 1, label: 'Submit answers' }, { n: 2, label: 'Cancel' }]);
+      html = '<section class="acard q" role="group" aria-labelledby="q-s">' +
+        '<div class="a-h"><span class="a-ic">' + ic('help') + '</span><div class="a-t"><div class="a-k">' + esc(kicker) + '</div>' +
+        '<div class="a-s" id="q-s">确认后提交给 ' + esc(KIND[s.kind] || s.kind) + '</div></div></div>' + steps + '<div class="q-sums">' + sum + '</div><div class="a-btns">' +
+        sub.map((o) => { const cancel = /cancel/i.test(o.label); return '<button type="button" class="btn ' + (cancel ? 'ghost' : 'primary') + '" data-q="' + esc(o.n) + '">' +
+          (cancel ? '取消' : /submit/i.test(o.label) ? ic('check') + '提交答案' : esc(o.label)) + '</button>'; }).join('') +
+        '<button type="button" class="btn wide" data-qk="left">' + ic('back') + '返回修改</button></div></section>';
+    } else {
+      html = '<section class="acard q" role="group" aria-labelledby="q-s">' +
+        '<div class="a-h"><span class="a-ic">' + ic('help') + '</span><div class="a-t"><div class="a-k">' + esc(kicker) + (q.multi ? ' · 可多选' : '') + '</div>' +
+        '<div class="a-s" id="q-s">' + esc(q.question) + '</div></div></div>' + steps + '<div class="opts">' +
+        q.options.map((o, i) => '<button type="button" class="opt" data-q="' + (i + 1) + '" data-ql="' + esc(o.label) + '"><span class="n">' + (i + 1) + '</span><span class="grow"><div class="ol">' +
+          esc(o.label) + '</div>' + (o.description ? '<div class="od">' + esc(o.description) + '</div>' : '') + '</span></button>').join('') +
+        '<button type="button" class="opt other" data-q="other"><span class="n">…</span><span class="grow"><div class="ol">其他</div><div class="od">在下方输入框回复</div></span></button>' +
+        '</div>' + (qs ? '<div class="a-btns q-nav"><button type="button" class="btn" data-qk="left"' + (qi === 0 ? ' disabled' : '') + '>' + ic('back') + '上一题</button>' +
+          '<button type="button" class="btn" data-qk="right">' + (q.multi ? '选好了 · ' : '') + '下一题' + ic('chev') + '</button></div>' : '') + '</section>';
+    }
   } else if (s && s.menu && S.mode === 'chat' && Array.isArray(s.menu.options) && s.menu.options.length) {
     // interactive TUI menu (claude /model, /effort slider, codex /model) detected by the agent from the screen
     const mn = s.menu; sig = 'm:' + JSON.stringify(mn) + ':' + (v.menuBusy == null ? '' : v.menuBusy);
@@ -1429,10 +1450,15 @@ function renderCard() {
   for (const b of $$('[data-q]', host)) b.onclick = () => {
     if (b.dataset.q === 'other') { $('#input').focus(); return; }
     sendBytes(enc.encode(b.dataset.q));
-    if (!s.question.multi) { v.cardSig = null; host.innerHTML = ''; }
+    if (b.dataset.ql && v.qAns && !s.question.multi) v.qAns[s.question.qi || 0] = b.dataset.ql;   // for the summary
+    // single choice / submit: the card goes away; with more questions the next one (or the submit page)
+    // comes back as soon as claude shows it
+    if (!s.question.multi || s.question.review) { v.cardSig = null; host.innerHTML = ''; }
   };
+  // ← / → move between the questions (claude: "Tab/Arrow keys to navigate")
+  for (const b of $$('[data-qk]', host)) b.onclick = () => { sendBytes(enc.encode(KEYS[b.dataset.qk])); v.cardSig = null; host.innerHTML = ''; };
   if (html && !had) {
-    announce(s.pending ? '需要授权：' + s.pending.summary : s.question ? '有问题需要回答：' + s.question.question : '终端菜单：' + (s.menu.title || ''));
+    announce(s.pending ? '需要授权：' + s.pending.summary : s.question ? (s.question.review ? '确认答案并提交' : '有问题需要回答：' + s.question.question) : '终端菜单：' + (s.menu.title || ''));
     if (navigator.vibrate) navigator.vibrate(30);
   }
 }

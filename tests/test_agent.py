@@ -602,6 +602,65 @@ def test_speed_test_measures_download(monkeypatch):
         A.fetch_netinfo()
 
 
+ASK3 = {"hook_event_name": "PreToolUse", "session_id": "abc", "tool_name": "AskUserQuestion", "tool_input": {"questions": [
+    {"question": "文件功能的范围？", "header": "范围", "multiSelect": False,
+     "options": [{"label": "只读浏览 + 改动列表 (Recommended)", "description": "目录树、文件预览"}, {"label": "只读浏览"}]},
+    {"question": "电脑宽屏上怎么摆？", "header": "桌面布局", "options": [{"label": "宽屏左右并排"}, {"label": "都用标签切换"}]},
+    {"question": "敏感文件（.env、私钥等）怎么处理？", "header": "敏感文件", "options": [{"label": "列出，点“显示”才读"}]}]}}
+# screens as claude draws its multi-question picker (taken from a real session, trimmed)
+SCR_Q2 = ["❯ 我想和对话还有终端并列搞一个文件预览目录，可行吗？", "─" * 60,
+          "←  ☒ 范围  ☐ 桌面布局  ☐ 敏感文件  ✔ Submit  →", "", "电脑宽屏上怎么摆？", "",
+          "❯ 1. 宽屏左右并排", "  2. 都用标签切换", "", "Enter to select · Tab/Arrow keys to navigate · Esc to cancel"]
+SCR_REVIEW = ["─" * 60, "←  ☒ 范围  ☒ 桌面布局  ☒ 敏感文件  ✔ Submit  →", "", "Review your answers", "",
+              " ● 文件功能的范围？", "   → 只读浏览 + 改动列表 (Recommended)", " ● 电脑宽屏上怎么摆？", "   → 宽屏左右并排", "",
+              "Ready to submit your answers?", "", "❯ 1. Submit answers", "  2. Cancel", "",
+              "Enter to select · Tab/Arrow keys to navigate · Esc to cancel"]
+
+
+def test_ask_user_question_keeps_every_question_and_follows_the_picker():
+    d, s = _session()
+    s.on_hook(dict(ASK3))
+    q = s.question
+    assert q["qi"] == 0 and len(q["questions"]) == 3 and q["answered"] == [False] * 3 and not q["review"]
+    assert q["question"] == "文件功能的范围？" and q["options"][0]["label"].startswith("只读浏览")   # = question 1
+    assert "(+2 个问题)" in s.detail
+    items = q["questions"]
+    p = A.question_progress(SCR_Q2, items)
+    assert p == {"qi": 1, "answered": [True, False, False], "review": False}
+    r = A.question_progress(SCR_REVIEW, items)
+    assert r["review"] and r["answered"] == [True] * 3 and r["submit"][0] == {"n": 1, "label": "Submit answers"}
+    assert [x["a"] for x in r["summary"]] == ["只读浏览 + 改动列表 (Recommended)", "宽屏左右并排", ""]
+    assert A.question_progress(["no picker here", "❯ 1. x"], items) is None
+    # a question whose text is not on the screen: the first unanswered one
+    odd = SCR_Q2[:4] + ["(garbled)"] + SCR_Q2[5:]
+    assert A.question_progress(odd, items)["qi"] == 1
+
+    # check_menu() follows the screen: top-level fields become question 2, then the submit page
+    class Scr:
+        def __init__(self, lines):
+            self.l = lines
+
+        def lines(self):
+            return self.l
+
+        def menu(self):
+            return A.parse_menu(self.l)
+    s.screen = Scr(SCR_Q2)
+    s.menu_dirty, s.activity = True, 0
+    s.check_menu(100)
+    assert s.question["qi"] == 1 and s.question["question"] == "电脑宽屏上怎么摆？" and s.question["header"] == "桌面布局"
+    s.screen = Scr(SCR_REVIEW)
+    s.menu_dirty = True
+    s.check_menu(200)
+    assert s.question["review"] and s.question["submit"] and len(s.question["summary"]) == 3
+    # answered (PostToolUse) clears it; a single question stays the old flat shape
+    s.on_hook({"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_input": ASK3["tool_input"]})
+    assert s.question is None
+    one = dict(ASK3, tool_input={"questions": ASK3["tool_input"]["questions"][:1]})
+    s.on_hook(one)
+    assert "questions" not in s.question and s.question["question"] == "文件功能的范围？"
+
+
 def test_upgrade_daemon_replaces_only_outdated_idle_daemons(monkeypatch):
     killed, alive = [], [True]
     monkeypatch.setattr(A, "CODE_ID", "new")

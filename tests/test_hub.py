@@ -792,6 +792,49 @@ def test_key_failure_after_a_live_swap_is_the_old_keys(hub_mod, monkeypatch):
     assert asyncio.run(run(h.balance_on_event(m, "s1", ev))) is None and len(m.calls) == n
 
 
+def test_key_switch_does_not_block_the_machine_read_loop(hub_mod, monkeypatch):
+    """The no-balance error arrives through the machine's read loop; the switch waits for the agent's
+    "restarted", which comes through that same loop. Handled inline it deadlocked until the 30 s timeout
+    ("切换到 B 失败", no 继续). Real Machine: messages are fed one at a time like session_once does."""
+    import asyncio
+    import machines as MM
+    C, server = hub_mod
+    cfg = C.load()
+    cfg["keys"]["profiles"] = [{"name": "A", "value": "a"}, {"name": "B", "value": "b"}]
+    cfg["keys"]["balance"] = {"mode": "on_exhausted", "exclude": []}
+    h = server.Hub(cfg)
+
+    async def run():
+        m = MM.Machine({"id": "M1", "type": "local"}, h.on_machine_msg, h.on_machine_state)
+        h.machines["M1"] = m
+        m.online = True
+        m.sessions = {"s1": {"sid": "s1", "kind": "claude", "key": "A", "status": "error", "hot_key": True}}
+        q, writes = asyncio.Queue(), []
+
+        def write(obj):
+            writes.append(obj)
+            if obj.get("op") == "restart":           # the agent answers once it restarted
+                q.put_nowait({"t": "restarted", "req": obj["req"], "sid": "s1", "hot": False})
+        m.write = write
+        real_sleep = asyncio.sleep
+        monkeypatch.setattr(server.asyncio, "sleep", lambda t: real_sleep(0))
+        q.put_nowait({"t": "event", "sid": "s1", "ev": {"kind": "error", "title": "出错停止", "body": "API Error: 500 Key余额不足"}})
+
+        async def read_loop():                        # session_once: one message at a time
+            while True:
+                await m.handle(await q.get())
+        loop = asyncio.ensure_future(read_loop())
+        t0 = asyncio.get_running_loop().time()
+        while not any(w.get("op") == "text" for w in writes) and asyncio.get_running_loop().time() - t0 < 5:
+            await real_sleep(0.01)
+        loop.cancel()
+        return writes, asyncio.get_running_loop().time() - t0
+    writes, secs = asyncio.run(run())
+    restart = [w for w in writes if w.get("op") == "restart"]
+    assert restart and restart[0]["key"] == "B" and restart[0]["cold"] is True
+    assert {"op": "text", "sid": "s1", "text": "继续"} in writes and secs < 3      # not after a 30 s timeout
+
+
 def test_manual_key_change_restarts_a_failed_session(hub_mod):
     import asyncio
     C, server = hub_mod

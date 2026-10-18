@@ -344,6 +344,18 @@ class Hub:
         return KB.pick_key(KB.pool(self.cfg), self.key_usage, self.key_exhausted, self.keys_in_use(), avoid,
                            rates=self.key_rates.rate, any_window=any_window)
 
+    def balance_applies(self, m, sid, ev):
+        """Quick check (no I/O): will balance_on_event act on this error? Same conditions as its early returns."""
+        s = m.sessions.get(sid) or {}
+        cur = s.get("key")
+        if ev.get("kind") != "error" or s.get("kind") not in ("claude", "codex") or not cur \
+                or not KB.is_key_fatal("%s %s" % (ev.get("title"), ev.get("body"))):
+            return False
+        prev = self.hot_swapped.get((m.id, sid))
+        if prev is not None and prev != cur:
+            return True
+        return KB.mode_of(self.cfg) != "off" and cur in KB.pool(self.cfg)
+
     async def balance_on_event(self, m, sid, ev):
         """An error event: when the session's key ran out / was rejected, switch it to another key (restart +
         resume: claude keeps a message's key for all its retries, so a live swap would only help the message after
@@ -613,11 +625,26 @@ class Hub:
             p.send(out)
 
     async def on_event(self, m, sid, ev):
-        if ev.get("kind") == "error":
-            ev = await self.balance_on_event(m, sid, ev) or ev
-        elif ev.get("kind") == "done":
+        """Runs inside the machine's read loop: must never wait for that machine's replies (a key swap waits
+        for the agent's "restarted", which arrives through this same loop), so the swap runs as a task."""
+        if ev.get("kind") == "error" and self.balance_applies(m, sid, ev):
+            asyncio.ensure_future(self.balance_then_emit(m, sid, ev))
+            return
+        if ev.get("kind") == "done":
             self.hot_swapped.pop((m.id, sid), None)          # a message went through on the swapped key
             asyncio.ensure_future(self.balance_on_done(m, sid))
+        await self.emit(m, sid, ev)
+
+    async def balance_then_emit(self, m, sid, ev):
+        out = None
+        try:
+            out = await self.balance_on_event(m, sid, ev)
+        except Exception:
+            log.exception("%s/%s: key switch failed", m.id, sid)
+        await self.emit(m, sid, out or ev)
+
+    async def emit(self, m, sid, ev):
+        """An event to every phone (banner) and as a push to devices that don't have the app on screen."""
         s = m.sessions.get(sid) or {}
         name = s.get("name") or sid
         title = "%s · %s" % (name, ev.get("title", ""))

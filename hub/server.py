@@ -27,7 +27,7 @@ from machines import Machine  # noqa: E402
 ROOT = C.ROOT
 WEB = os.path.join(ROOT, "web")
 DATA = C.DATA
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 log = logging.getLogger("glimpse.hub")
 PHONE_QUEUE_MAX = 4000       # messages; a phone that falls this far behind is disconnected
 VISIBLE_FRESH = 15           # s; a "visible" phone that has been silent longer is treated as gone (push again)

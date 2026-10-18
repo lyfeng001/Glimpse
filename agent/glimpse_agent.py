@@ -32,7 +32,7 @@ import sys
 import termios
 import time
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 
 def code_id(src):

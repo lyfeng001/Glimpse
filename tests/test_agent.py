@@ -1596,6 +1596,23 @@ trust_level = "trusted"
     assert A.codex_hot_provider(["codex", "-c", 'model_provider="x"'], "V_API_KEY") is None
 
 
+def test_cold_restart_does_not_swap_live(tmp_path, monkeypatch):
+    # after a key that failed, claude would keep the old key for the next message: cold restarts the process
+    d = _daemon(tmp_path)
+    s = A.Session(d, "s1", "claude", "n", str(tmp_path), ["claude"], 80, 24)
+    s.fd, s.key_file, s.env = 7, str(tmp_path / "key-s1"), {"ANTHROPIC_AUTH_TOKEN": "old"}
+    (tmp_path / "key-s1").write_text("old")
+    killed, done = [], []
+    monkeypatch.setattr(d, "kill", lambda ss: killed.append(ss.sid))
+    s.restart({"ANTHROPIC_AUTH_TOKEN": "new"}, "k2", True, lambda e: done.append(e), cold=True)
+    assert killed == ["s1"] and s.restart_req is not None and s.env == {"ANTHROPIC_AUTH_TOKEN": "new"} and s.key == "k2"
+    assert done == []                                       # answered once the new process runs
+    killed.clear()
+    s.restart_req = None
+    s.restart({"ANTHROPIC_AUTH_TOKEN": "newer"}, "k3", True, lambda e: done.append(e))
+    assert killed == [] and done == [None] and (tmp_path / "key-s1").read_text() == "newer"     # live swap
+
+
 def test_hot_key_claude_settings_and_swap(tmp_path):
     src = tmp_path / "s.json"
     src.write_text(json.dumps({"env": {"ANTHROPIC_AUTH_TOKEN": "placeholder-old", "ANTHROPIC_BASE_URL": "https://relay"}}))

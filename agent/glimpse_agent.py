@@ -1325,7 +1325,6 @@ class Session:
         self.menu = None               # interactive picker visible on the screen (parse_menu)
         self.init_cmds = []            # slash commands typed once after the first SessionStart (claude)
         self.delete_req = None         # callback(ok) while a delete waits for the process to exit
-        self.config_file = None        # codex config.toml, claude settings.json (hot swap: touch it to flush cache)
 
     # --- info
     @property
@@ -1430,12 +1429,6 @@ class Session:
         except OSError:
             return False
         self.env, self.key = dict(env), key
-        # claude/codex watch the config file; touching it forces a reload + helper cache clear
-        if self.config_file:
-            try:
-                os.utime(self.config_file, None)
-            except OSError:
-                pass
         it = self.add_chat("system", "—— 已切换到 %s（无需重启）——" % (key or "新 key"))
         if it:
             self.d.send_subs(self, {"t": "chat", "sid": self.sid, "items": [it]})
@@ -1466,10 +1459,6 @@ class Session:
             argv, self.settings_file = prepare_claude_argv(argv, self.sid, self.d.sdir, None if hot else self.env,
                                                            self.d.approval_wait, self.d.memory.claude_allow(self),
                                                            key_file=self.key_file if hot else None)
-            self.config_file = self.settings_file
-        elif self.kind == "codex":
-            home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
-            self.config_file = os.path.join(home, "config.toml")
         shell = env.get("SHELL")
         if not shell:
             try:
@@ -1643,10 +1632,12 @@ class Session:
                 return True
         return False
 
-    def restart(self, env, key, resume, done):
+    def restart(self, env, key, resume, done, cold=False):
         """Kill the process, swap env (API key), start again (optionally resuming the conversation).
-        A key change on a session that reads its key from a file is applied live instead (no restart)."""
-        if env is not None and resume and self.swap_key(env, key):
+        A key change on a session that reads its key from a file is applied live instead (no restart), unless
+        `cold`: claude keeps the key it had when a message started for all of that message's retries, so after a
+        key that ran out the next message would still fail; a new process uses the new key at once."""
+        if env is not None and resume and not cold and self.swap_key(env, key):
             done(None)
             return
         if env is not None:
@@ -3789,7 +3780,7 @@ class Daemon:
                     # hot: the key was swapped in the running process (no restart happened)
                     self.send(c, {"t": "error", "req": req, "sid": sid, "msg": err} if err else
                               {"t": "restarted", "req": req, "sid": sid, "hot": s.restarts == n0})
-                s.restart(env, m.get("key"), bool(m.get("resume", True)), done)
+                s.restart(env, m.get("key"), bool(m.get("resume", True)), done, cold=bool(m.get("cold")))
             else:
                 self.send(c, {"t": "error", "req": req, "msg": "unknown op %r" % op})
         except Exception as e:

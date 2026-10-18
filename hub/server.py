@@ -245,6 +245,7 @@ class Hub:
         self.key_usage = {}        # key name -> {limits, today_tokens, ...} from keys.usage_url
         self.key_usage_wake = asyncio.Event()
         self.key_exhausted = {}    # key name -> time it ran out / was rejected (balancing skips it a while)
+        self.hot_swapped = {}      # (machine, sid) -> the key before a live swap, until a message goes through
         self.key_swaps = {}        # (machine, sid) -> times of automatic swaps (loop guard)
         self.key_rates = KB.RateTracker()   # measured 7-day spend rate per key (from successive usage polls)
         self.key_moved = {}        # (machine, sid) -> last balancing move
@@ -344,12 +345,28 @@ class Hub:
                            rates=self.key_rates.rate, any_window=any_window)
 
     async def balance_on_event(self, m, sid, ev):
-        """An error event: when the session's key ran out / was rejected, switch it to another key (live when
-        the agent can, else restart + resume) and type 继续. Returns the event to show instead, or None."""
+        """An error event: when the session's key ran out / was rejected, switch it to another key (restart +
+        resume: claude keeps a message's key for all its retries, so a live swap would only help the message after
+        the next one) and type 继续. Returns the event to show instead, or None."""
         s = m.sessions.get(sid) or {}
         cur = s.get("key")
-        if KB.mode_of(self.cfg) == "off" or ev.get("kind") != "error" or s.get("kind") not in ("claude", "codex") \
-                or not cur or cur not in KB.pool(self.cfg) or not KB.is_key_fatal("%s %s" % (ev.get("title"), ev.get("body"))):
+        if ev.get("kind") != "error" or s.get("kind") not in ("claude", "codex") or not cur \
+                or not KB.is_key_fatal("%s %s" % (ev.get("title"), ev.get("body"))):
+            return None
+        prev = self.hot_swapped.pop((m.id, sid), None)
+        if prev is not None and prev != cur:
+            # swapped live and no message has gone through since: this failure is the old key's (still used for
+            # this message), not the new one's. Restart on the new key and go on.
+            if prev in KB.pool(self.cfg):
+                self.key_exhausted[prev] = time.time()
+                self.state_dirty.set()
+            hot = await self.switch_key(m, sid, s.get("kind"), cur, cold=True)
+            if hot is None:
+                return None
+            asyncio.ensure_future(self.continue_after_swap(m, sid, hot))
+            return {"kind": "keyswap", "title": "%s 不可用，已用 %s 重启并继续" % (prev, cur), "body": ev.get("body") or "",
+                    "ts": ev.get("ts")}
+        if KB.mode_of(self.cfg) == "off" or cur not in KB.pool(self.cfg):
             return None
         self.key_exhausted[cur] = time.time()
         self.state_dirty.set()
@@ -361,25 +378,38 @@ class Hub:
         if not new:
             return dict(ev, title="%s 不可用，没有其他可用的 Key" % cur)
         self.key_swaps[(m.id, sid)] = recent + [t]
-        hot = await self.switch_key(m, sid, s.get("kind"), new)
+        hot = await self.switch_key(m, sid, s.get("kind"), new, cold=True)
         if hot is None:
             return dict(ev, title="%s 不可用，切换到 %s 失败" % (cur, new))
         asyncio.ensure_future(self.continue_after_swap(m, sid, hot))
         return {"kind": "keyswap", "title": "%s 不可用，已切换到 %s 并继续" % (cur, new), "body": ev.get("body") or "",
                 "ts": ev.get("ts")}
 
-    async def switch_key(self, m, sid, kind, name):
-        """Give the session another key. True = swapped live, False = restarted + resumed, None = failed."""
+    async def switch_key(self, m, sid, kind, name, cold=False):
+        """Give the session another key. True = swapped live, False = restarted + resumed, None = failed.
+        cold: always restart (after a key that failed)."""
+        old = (m.sessions.get(sid) or {}).get("key")
         try:
-            r = await m.call({"op": "restart", "sid": sid, "env": self.env_for(kind, name), "key": name, "resume": True},
-                             timeout=30)
+            r = await m.call({"op": "restart", "sid": sid, "env": self.env_for(kind, name), "key": name, "resume": True,
+                              "cold": cold}, timeout=30)
         except (ConnectionError, asyncio.TimeoutError, ValueError):
             return None
-        return bool(r.get("hot")) if r.get("t") == "restarted" else None
+        if r.get("t") != "restarted":
+            return None
+        self.note_swap(m, sid, old, bool(r.get("hot")))
+        return bool(r.get("hot"))
+
+    def note_swap(self, m, sid, old, hot):
+        # a live swap reaches claude only with the message after next; until one goes through, a key failure
+        # is the old key's (balance_on_event)
+        if hot:
+            self.hot_swapped[(m.id, sid)] = old
+        else:
+            self.hot_swapped.pop((m.id, sid), None)
 
     async def continue_after_swap(self, m, sid, hot):
-        # the agent touches the config file to flush the helper cache; give it a beat for the reload, then wait for idle
-        await asyncio.sleep(1.5 if hot else 3)
+        # a restart needs the TUI ready; a live swap waits until claude re-read the key file
+        await asyncio.sleep(5 if hot else 3)
         for _ in range(40):
             s = m.sessions.get(sid) or {}
             if s.get("status") in ("idle", "error") and not s.get("menu"):
@@ -586,6 +616,7 @@ class Hub:
         if ev.get("kind") == "error":
             ev = await self.balance_on_event(m, sid, ev) or ev
         elif ev.get("kind") == "done":
+            self.hot_swapped.pop((m.id, sid), None)          # a message went through on the swapped key
             asyncio.ensure_future(self.balance_on_done(m, sid))
         s = m.sessions.get(sid) or {}
         name = s.get("name") or sid
@@ -891,9 +922,13 @@ class Hub:
         elif msg.get("key"):
             key = msg["key"]
             env = self.env_for(kind, key)
+        # after a failure (usually the key): restart, a live swap would only take effect after the next message
+        cold = env is not None and s.get("status") == "error"
         r = await m.call({"op": "restart", "sid": sid, "env": env, "key": key,
-                          "resume": bool(msg.get("resume", True))}, timeout=30)
+                          "resume": bool(msg.get("resume", True)), "cold": cold}, timeout=30)
         if r.get("t") == "restarted":
+            if env is not None:
+                self.note_swap(m, sid, s.get("key"), bool(r.get("hot")))
             p.send({"t": "restarted", "m": m.id, "sid": sid, "hot": bool(r.get("hot")), "key": key})
         else:
             p.send({"t": "error", "m": m.id, "sid": sid, "msg": r.get("msg") or "重启失败"})

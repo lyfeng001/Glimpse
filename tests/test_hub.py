@@ -746,10 +746,67 @@ class _M:
 
     async def call(self, obj, timeout=20):
         self.calls.append(obj)
-        return {"t": "restarted", "hot": self.hot}
+        return {"t": "restarted", "hot": self.hot and not obj.get("cold")}
 
     def write(self, obj):
         self.writes.append(obj)
+
+
+def test_key_failure_after_a_live_swap_is_the_old_keys(hub_mod, monkeypatch):
+    """claude keeps a message's key for all its retries: after a live swap k1 -> k2 the next message still runs
+    on k1. Its failure must not burn k2 (and so on through every key): restart on k2, mark k1."""
+    import asyncio
+    C, server = hub_mod
+    cfg = C.load()
+    cfg["keys"]["profiles"] = [{"name": "k1", "value": "v1"}, {"name": "k2", "value": "v2"}, {"name": "k3", "value": "v3"}]
+    h = server.Hub(cfg)
+    m = _M()
+    m.sessions["s1"].update(kind="claude", status="idle")
+    sleeps = []
+
+    async def no_sleep(t):
+        sleeps.append(t)
+    monkeypatch.setattr(server.asyncio, "sleep", no_sleep)
+    ev = {"kind": "error", "title": "出错停止", "body": "API Error: 500 Key余额不足"}
+
+    async def run(coro):
+        out = await coro
+        await asyncio.gather(*[t for t in asyncio.all_tasks() if t is not asyncio.current_task()])
+        return out
+    # a live swap k1 -> k2 (balancing, or from the phone while the session was fine)
+    assert asyncio.run(run(h.switch_key(m, "s1", "claude", "k2"))) is True
+    m.sessions["s1"]["key"] = "k2"
+    # the next message fails with k1's no-balance: works even with balancing off
+    out = asyncio.run(run(h.balance_on_event(m, "s1", ev)))
+    assert out["kind"] == "keyswap" and "k1" in out["title"] and "k2" in out["title"]
+    assert m.calls[-1]["op"] == "restart" and m.calls[-1]["key"] == "k2" and m.calls[-1]["cold"] is True
+    assert "k1" in h.key_exhausted and "k2" not in h.key_exhausted
+    assert m.writes[-1] == {"op": "text", "sid": "s1", "text": "继续"}
+    # a second failure right after that restart is k2's own (balancing off: shown as it is)
+    assert asyncio.run(run(h.balance_on_event(m, "s1", ev))) is None and "k2" not in h.key_exhausted
+    # a message that went through clears it: a later failure is the current key's
+    asyncio.run(run(h.switch_key(m, "s1", "claude", "k3")))
+    m.sessions["s1"]["key"] = "k3"
+    asyncio.run(run(h.on_event(m, "s1", {"kind": "done", "title": "已完成本轮", "body": "x"})))
+    n = len(m.calls)
+    assert asyncio.run(run(h.balance_on_event(m, "s1", ev))) is None and len(m.calls) == n
+
+
+def test_manual_key_change_restarts_a_failed_session(hub_mod):
+    import asyncio
+    C, server = hub_mod
+    cfg = C.load()
+    cfg["keys"]["profiles"] = [{"name": "k1", "value": "v1"}, {"name": "k2", "value": "v2"}]
+    h = server.Hub(cfg)
+    m = _M()
+    m.sessions["s1"].update(kind="claude")
+    p = FakePhone()
+    for status, cold in (("error", True), ("idle", False)):
+        m.sessions["s1"]["status"] = status
+        asyncio.run(h.restart(p, m, {"sid": "s1", "key": "k2"}))
+        assert m.calls[-1]["cold"] is cold and p.sent[-1]["t"] == "restarted" and p.sent[-1]["hot"] is (not cold)
+    asyncio.run(h.restart(p, m, {"sid": "s1"}))                          # plain restart, no key change
+    assert m.calls[-1]["cold"] is False and m.calls[-1]["env"] is None
 
 
 def test_balance_swaps_key_on_no_balance(hub_mod, monkeypatch):
@@ -779,7 +836,8 @@ def test_balance_swaps_key_on_no_balance(hub_mod, monkeypatch):
     out = asyncio.run(run2())
     assert out["kind"] == "keyswap" and "k1" in out["title"] and "k3" in out["title"]      # k2 excluded
     assert m.calls[-1]["op"] == "restart" and m.calls[-1]["key"] == "k3" and m.calls[-1]["env"] == {"V_API_KEY": "v3"}
-    assert m.writes[-1] == {"op": "text", "sid": "s1", "text": "继续"} and sleeps[0] == 5      # hot swap: wait for claude
+    assert m.calls[-1]["cold"] is True                                  # a failed key: restart, not a live swap
+    assert m.writes[-1] == {"op": "text", "sid": "s1", "text": "继续"} and sleeps[0] == 3      # restarted: wait for the TUI
     assert "k1" in h.key_exhausted and any(k.get("exhausted") for k in h.keys_view() if k["name"] == "k1")
     # a transient error is not the key's fault
     n = len(m.calls)

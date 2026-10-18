@@ -687,6 +687,10 @@ class Hub:
                 await self.models(p, m, msg)
             elif op == "memory":
                 await self.memory(p, m, msg)
+            elif op == "netinfo":
+                asyncio.ensure_future(self.machine_netinfo(m, bool(msg.get("refresh"))))
+            elif op == "speedtest":
+                asyncio.ensure_future(self.machine_speedtest(p, m))
             elif op == "delete":
                 self.forward(p, m, {"op": "delete", "sid": sid})
             elif op == "clean_exited":
@@ -734,6 +738,43 @@ class Hub:
         p.send({"t": "memory", "m": m.id, "action": action, "project": msg.get("project"), "data": r.get("data")})
         if action in ("budget", "compact"):
             self.state_dirty.set()
+
+    async def machine_netinfo(self, m, refresh=False):
+        """Public IP / location of a machine (the agent caches it 10 minutes); shown by the network widget."""
+        try:
+            r = await m.call({"op": "netinfo", "refresh": refresh}, timeout=20)
+        except (ConnectionError, asyncio.TimeoutError):
+            return
+        if r.get("t") == "netinfo":
+            m.netinfo = {k: r.get(k) for k in ("ip", "city", "region", "country", "org", "timezone", "ts")}
+        else:
+            m.netinfo = {"error": r.get("msg") or "查询失败", "ts": time.time()}
+        self.state_dirty.set()
+
+    async def machine_speedtest(self, p, m):
+        """Download speed of a machine's internet connection (10 MB from a public speed-test server).
+        A second request while one runs joins it instead of failing with "already running"."""
+        if m.speed_task is None or m.speed_task.done():
+            m.speed_task = asyncio.ensure_future(self._speedtest(m))
+        try:
+            await asyncio.shield(m.speed_task)
+        except Exception:
+            pass
+        p.send({"t": "speedtest_done", "m": m.id, "speed": m.speed})
+
+    async def _speedtest(self, m):
+        try:
+            r = await m.call({"op": "speedtest"}, timeout=40)
+        except ConnectionError:
+            r = {"t": "error", "msg": "机器离线"}
+        except asyncio.TimeoutError:
+            r = {"t": "error", "msg": "测速超时"}
+        if r.get("t") == "speedtest":
+            m.speed = {k: r.get(k) for k in ("down_bps", "ttfb_ms", "bytes", "secs")}
+        else:
+            m.speed = {"error": r.get("msg") or "测速失败"}
+        m.speed["ts"] = time.time()
+        self.state_dirty.set()
 
     async def create(self, p, m, msg):
         kind = msg.get("kind") if msg.get("kind") in ("claude", "codex", "shell") else "claude"

@@ -40,6 +40,7 @@ const S = {
   net: { rtt: [], rx: [], rxBytes: 0, rxT: performance.now() },
   mhist: {},            // machine id -> {rtt:[], rx:[], tx:[], ts}
 };
+const NETI = { testing: {}, asked: {} };  // testing: machine id -> timer while its speed test runs; asked: last lookup request
 
 // ------------------------------------------------------------------ helpers
 function b64ToBytes(b64) {
@@ -241,6 +242,107 @@ const WIDGETS = [
     },
   },
   {
+    // 7-day quota of every key from keys.usage_url; in a session: the session's own key
+    id: 'keys', title: 'Key 用量', icon: 'key', scope: 'both',
+    render(ctx) {
+      const keys = (S.keys || []).filter((k) => k.usage);
+      if (!keys.length) return null;                    // no usage_url configured: nothing to show
+      const week = (u) => { const ws = (u && u.windows) || []; return ws.reduce((a, w) => (!a || (w.window_sec || 0) > (a.window_sec || 0) ? w : a), null); };
+      const short = (u) => { const ws = (u && u.windows) || []; return ws.reduce((a, w) => (!a || (w.window_sec || 0) < (a.window_sec || 0) ? w : a), null); };
+      const pctTxt = (w) => (w && w.percent != null ? Math.round(w.percent) + '%' : '—');
+      if (ctx.scope === 'session') {
+        const k = ctx.s && ctx.s.key && keys.find((x) => x.name === ctx.s.key); if (!k) return null;
+        if (k.usage.error) return '<div class="w-col"><div class="w-sub">Key ' + esc(k.name) + '</div><div class="w-big" style="font-size:15px;color:var(--c-err)">不可用</div><div class="w-sub">' + esc(k.usage.error) + '</div></div>';
+        const w = week(k.usage), s5 = short(k.usage);
+        return '<div class="w-col"><div class="w-sub">Key ' + esc(k.name) + (k.exhausted ? ' · 已用完' : '') + '</div><div class="w-big">' + pctTxt(w) +
+          '<small>7 天</small></div><div class="w-sub">5 小时 ' + pctTxt(s5) + (k.usage.today_cost != null ? ' · 今日 $' + k.usage.today_cost : '') + '</div></div>';
+      }
+      const rows = keys.slice().sort((a, b) => ((week(b.usage) || {}).percent || 0) - ((week(a.usage) || {}).percent || 0)).slice(0, 4).map((k) => {
+        if (k.usage.error) return '<div class="w-row"><span class="grow">' + esc(k.name) + '</span><span style="color:var(--c-err)">不可用</span></div>';
+        const w = week(k.usage);
+        return '<div class="w-row"><span class="grow">' + esc(k.name) + '</span>' + meter(w ? w.percent : 0) + '<b style="min-width:34px;text-align:right">' + pctTxt(w) + '</b></div>';
+      }).join('');
+      const b = S.balance || {};
+      const mode = { off: '', on_exhausted: ' · 自动换', least_used: ' · 按用量分配' }[b.mode] || '';
+      return wHead(this) + '<div class="w-sub" style="margin-bottom:4px">7 天额度' + mode + '</div><div class="w-rows" style="gap:9px">' + rows + '</div>';
+    },
+  },
+  {
+    // AMem memory: storage of each machine's vault; in a session: the project it reads / writes
+    id: 'memory', title: '记忆', icon: 'sparkle', scope: 'both',
+    render(ctx) {
+      const ms = S.machines.filter((mc) => mc.memory && mc.memory.enabled);
+      if (!ms.length) return null;
+      if (ctx.scope === 'session') {
+        const s = ctx.s; if (!s || !s.memory || !ctx.mc || !ctx.mc.memory || !ctx.mc.memory.enabled) return null;
+        memOverviewSoon(ctx.mc);
+        const ov = MEM.data[ctx.mc.id + ':overview'];
+        const p = ov && ov.projects.find((x) => x.project === s.memory);
+        return '<button type="button" class="w-tap" data-act="mem" data-m="' + esc(ctx.mc.id) + '" data-proj="' + esc(s.memory) + '" aria-label="记忆：项目 ' + esc(s.memory) +
+          '，点按查看"><span class="w-col"><span class="w-sub">记忆 ' + ic('chev', 'xs') + '</span><span class="w-big" style="font-size:15px">' + esc(s.memory) +
+          '</span><span class="w-sub">' + (p ? p.memories + ' 条记忆 · ' + fmtNum(p.records) + ' 条记录' : '已接入') + '</span></span></button>';
+      }
+      // one tappable row per machine (each opens that machine's vault)
+      const rows = ms.map((mc) => {
+        memOverviewSoon(mc);
+        const ov = MEM.data[mc.id + ':overview'];
+        const head = '<b style="min-width:22px">' + esc(mc.id) + '</b>';
+        let body;
+        if (!mc.online) body = '<span class="grow" style="color:var(--c-err)">离线</span>';
+        else if (!mc.memory.available) body = '<span class="grow" style="color:var(--c-err)">不可用</span>';
+        else if (!ov) body = '<span class="grow">读取中…</span>';
+        else {
+          // two lines: size + meter, then the counts (one line is too narrow for both)
+          const pct = ov.budget ? 100 * ov.size.total / ov.budget.max_bytes : 0;
+          return '<button type="button" class="w-row-tap stack" data-act="mem" data-m="' + esc(mc.id) + '" aria-label="打开 ' + esc(mc.id) + ' 的记忆，已用 ' +
+            fmtBytes(ov.size.total) + (ov.budget ? ' / 上限 ' + fmtBytes(ov.budget.max_bytes) : '') + '">' +
+            '<span class="w-row">' + head + meter(pct) + '<b style="min-width:52px;text-align:right">' + fmtBytes(ov.size.total) + '</b></span>' +
+            '<span class="w-sub">' + ov.projects.length + ' 个项目 · ' + ov.projects.reduce((a, p) => a + p.memories, 0) + ' 条记忆</span></button>';
+        }
+        return '<button type="button" class="w-row w-row-tap" data-act="mem" data-m="' + esc(mc.id) + '" aria-label="打开 ' + esc(mc.id) + ' 的记忆">' + head + body + '</button>';
+      }).join('');
+      return wHead(this) + '<div class="w-rows" style="gap:6px">' + rows + '</div>';
+    },
+  },
+  {
+    // the machine's internet connection: public IP + location, and an on-demand download speed test.
+    // The IP lookup (ipinfo.io, from the machine) only happens while this widget is shown.
+    id: 'netinfo', title: '机器网络', icon: 'globe', scope: 'both',
+    render(ctx) {
+      const loc = (n) => [n.city, n.region !== n.city ? n.region : '', n.country].filter(Boolean).join(', ');
+      for (const mc of ctx.scope === 'session' ? [ctx.mc].filter(Boolean) : S.machines) netinfoSoon(mc);
+      const speed = (mc) => {
+        const sp = mc.speed;
+        if (NETI.testing[mc.id]) return '<span class="spinner" aria-hidden="true"></span> 测速中…';
+        if (!sp) return '';
+        if (sp.error) return '<span style="color:var(--c-err)">' + esc(sp.error) + '</span>';
+        const mbps = (sp.down_bps || 0) / 1e6;   // speed tests are quoted in Mbps, like broadband plans
+        return '↓ ' + (mbps >= 10 ? Math.round(mbps) : mbps.toFixed(1)) + ' Mbps · 延迟 ' + Math.round(sp.ttfb_ms) + ' ms';
+      };
+      const btn = (mc) => '<button type="button" class="btn sm" data-speed="' + esc(mc.id) + '"' + (NETI.testing[mc.id] || !mc.online ? ' disabled' : '') + '>测速</button>';
+      if (ctx.scope === 'session') {
+        const mc = ctx.mc; if (!mc) return null;
+        const n = mc.netinfo;
+        return '<div class="w-col" style="min-width:200px"><div class="w-sub">' + esc(mc.id) + ' 公网出口</div><div class="w-big" style="font-size:15px">' +
+          (n && n.ip ? esc(n.ip) : n && n.error ? '<span style="color:var(--c-err)">查询失败</span>' : '—') + '</div><div class="w-sub">' +
+          (n && n.ip ? esc(loc(n) || n.org || '') : '') + '</div><div class="w-sub" style="display:flex;align-items:center;gap:6px">' + speed(mc) + btn(mc) + '</div></div>';
+      }
+      // one line each for IP, location and speed: a widget is too narrow to put two of them side by side
+      const line = (h, cls) => '<span class="ni-l' + (cls ? ' ' + cls : '') + '">' + h + '</span>';
+      const rows = S.machines.map((mc) => {
+        const n = mc.netinfo;
+        let body;
+        if (!mc.online) body = line('<span style="color:var(--c-err)">离线</span>');
+        else if (n && n.ip) body = line(esc(n.ip), 'ni-ip') + (loc(n) ? line(esc(loc(n))) : '');
+        else body = line(n && n.error ? '<span style="color:var(--c-err)">查询失败</span>' : '…');
+        const sp = mc.online ? speed(mc) : '';
+        return '<div class="w-row" style="align-items:flex-start"><b style="min-width:22px">' + esc(mc.id) + '</b><span class="grow ni">' + body +
+          (sp ? line(sp) : '') + '</span>' + (mc.online ? btn(mc) : '') + '</div>';
+      }).join('');
+      return wHead(this) + '<div class="w-rows" style="gap:9px">' + rows + '</div>';
+    },
+  },
+  {
     id: 'activity', title: '活跃会话', icon: 'pulse', scope: 'home',
     render() {
       const c = { running: 0, waiting: 0, idle: 0, error: 0 };
@@ -253,14 +355,22 @@ const WIDGETS = [
     },
   },
 ];
+function netinfoSoon(mc) {
+  // ask the machine for its public IP when we have none, it is over 10 min old, or the last lookup failed 5 min ago
+  if (!mc.online) return;
+  const t = Date.now() / 1000; const n = mc.netinfo;
+  if (n && n.ts && t - n.ts < (n.error ? 300 : 600)) return;
+  if (t - (NETI.asked[mc.id] || 0) < 60) return;        // a lookup is in flight (or just failed to send)
+  if (send({ op: 'netinfo', m: mc.id })) NETI.asked[mc.id] = t;
+}
 const WIDGET_BY_ID = Object.fromEntries(WIDGETS.map((w) => [w.id, w]));
-const DEFAULT_WIDGETS = ['controls', 'net', 'tokens', 'context', 'machines'];
+const DEFAULT_WIDGETS = ['controls', 'net', 'tokens', 'context', 'machines', 'keys', 'memory', 'netinfo'];
 function widgetPrefs() {
   // {order:[id...], on:{id:bool}}
   let p = null; try { p = JSON.parse(LS.getItem('glimpse.widgets') || 'null'); } catch (_) { p = null; }
   if (!p || !Array.isArray(p.order)) p = { order: ['controls'].concat(WIDGETS.map((w) => w.id).filter((id) => id !== 'controls')), on: Object.fromEntries(WIDGETS.map((w) => [w.id, DEFAULT_WIDGETS.includes(w.id)])) };
-  // widgets added in a later version: default-on ones go first (e.g. "controls"), the rest at the end
-  for (const w of WIDGETS) if (!p.order.includes(w.id)) { const on = DEFAULT_WIDGETS.includes(w.id); if (on) p.order.unshift(w.id); else p.order.push(w.id); p.on[w.id] = on; }
+  // widgets added in a later version: "controls" goes first, the rest at the end (on if they are default-on)
+  for (const w of WIDGETS) if (!p.order.includes(w.id)) { const on = DEFAULT_WIDGETS.includes(w.id); if (w.id === 'controls') p.order.unshift(w.id); else p.order.push(w.id); p.on[w.id] = on; }
   p.order = p.order.filter((id) => WIDGET_BY_ID[id]);
   return p;
 }
@@ -563,6 +673,12 @@ function onMsg(m) {
     case 'history': onHistory(m); break;
     case 'models': onModels(m, false); break;
     case 'memory': onMemory(m); break;
+    case 'speedtest_done': {
+      clearTimeout(NETI.testing[m.m]); delete NETI.testing[m.m];
+      const mc = S.byId[m.m]; if (mc && m.speed) mc.speed = m.speed;   // show it now; the state broadcast follows
+      renderHomeWidgets(); if (S.view) renderViewWidgets();
+      break;
+    }
     case 'menu_ok': if (isView(m)) menuDone(); break;
     case 'control_ok': ctlDone(m); break;
     case 'delete_ok': onDeleted(m); break;
@@ -931,14 +1047,24 @@ function openSession(m, sid, fromRoute) {
   ensureTerm(); term.reset();
   const mode = (s && s.kind === 'shell') ? 'term' : (LS.getItem('glimpse.mode.' + m + '/' + sid) || LS.getItem('glimpse.mode') || 'chat');
   setMode(mode, true);
-  $('#input').value = ''; autoGrow(); slashOpen(false);
+  $('#input').value = draftGet(m, sid); autoGrow(); slashOpen(false);
   renderView();
   renderOutbox();
   subscribe();
   send({ op: 'ack', m, sid });
 }
+// ---- unsent text per session: kept while you leave the session (and across reloads), cleared once sent
+function draftKey(m, sid) { return 'glimpse.draft.' + m + '/' + sid; }
+function draftGet(m, sid) { return LS.getItem(draftKey(m, sid)) || ''; }
+function draftSave() {
+  const v = S.view; if (!v) return;
+  const t = $('#input').value;
+  if (t.trim()) LS.setItem(draftKey(v.m, v.sid), t.slice(0, 20000)); else LS.removeItem(draftKey(v.m, v.sid));
+}
+$('#input').addEventListener('input', draftSave);
 function closeSession(keepScreen) {
   const v = S.view; if (!v) return;
+  draftSave();
   send({ op: 'unsub', m: v.m, sid: v.sid });
   S.view = null;
   if (!keepScreen) { show('home', 'back'); renderHome(); }
@@ -1028,8 +1154,31 @@ function renderViewWidgets() {
   t.setAttribute('aria-label', S.stripOpen ? '收起会话插件' : '展开会话插件');
   t.querySelector('.xs use').setAttribute('href', S.stripOpen ? '#i-up' : '#i-down');
 }
-$('#v-widgets').addEventListener('click', (e) => { if (e.target.closest('[data-act="ctl"]')) openCtl(); });
 $('#btn-wstrip').onclick = () => { S.stripOpen = !S.stripOpen; LS.setItem('glimpse.strip', S.stripOpen ? '1' : '0'); renderViewWidgets(); };
+// widget delegates (home and session strips): data-act="ctl" opens the model/mode picker; data-act="mem" opens the memory sheet; data-speed triggers a speed test
+for (const host of [$('#home-widgets'), $('#v-widgets')]) {
+  host.addEventListener('click', (e) => {
+    const act = e.target.closest('[data-act]');
+    if (act) {
+      if (act.dataset.act === 'ctl') openCtl();
+      else if (act.dataset.act === 'mem') {
+        const mid = act.dataset.m;
+        if (mid) {
+          openMemory(mid);
+          if (act.dataset.proj) memOpenProject(act.dataset.proj);    // a session's widget opens its own project
+        }
+      }
+      return;
+    }
+    const speed = e.target.closest('[data-speed]');
+    if (speed) {
+      const mid = speed.dataset.speed;
+      if (NETI.testing[mid] || !send({ op: 'speedtest', m: mid })) return;
+      NETI.testing[mid] = setTimeout(() => { delete NETI.testing[mid]; renderHomeWidgets(); if (S.view) renderViewWidgets(); }, 45000);
+      renderHomeWidgets(); if (S.view) renderViewWidgets();
+    }
+  });
+}
 
 function setMode(mode, initial) {
   const v = S.view;
@@ -1430,7 +1579,7 @@ $('#composer').addEventListener('submit', (e) => {
     S.outbox.push(o); renderOutbox();
     if (!S.ws || S.ws.readyState > 1) { S.backoff = 500; connect(); } else ping();
   }
-  input.value = ''; autoGrow();
+  input.value = ''; autoGrow(); draftSave();
   const c = $('#chat'); c.scrollTop = c.scrollHeight;
 });
 function renderOutbox() {
@@ -2309,7 +2458,7 @@ function fmtBytes(b) {
   while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
   return (i ? b.toFixed(b < 10 ? 2 : b < 100 ? 1 : 0) : String(Math.round(b))) + ' ' + u[i];
 }
-const MEM = { m: null, view: 'home', project: null, data: {}, busy: false, q: '' };
+const MEM = { m: null, view: 'home', project: null, data: {}, busy: false, q: '', asked: {} };
 function memMachines() { return S.machines.filter((mc) => mc.memory && mc.memory.enabled); }
 function renderSettingsMemory() {
   const list = memMachines();
@@ -2330,6 +2479,14 @@ function memMeter(ov) {
   if (!ov.budget) return '';
   const pct = Math.min(100, (ov.size.total / ov.budget.max_bytes) * 100);
   return '<div class="kbars"><span class="kbar"><span class="kb-l">存储</span>' + meter(pct) + '<span class="kb-r">' + (pct < 1 ? '<1' : Math.round(pct)) + '%</span></span></div>';
+}
+function memOverviewSoon(mc) {
+  // lazy: the widget will fetch the overview on first render, and refresh it every 5 min
+  if (!mc.online || !mc.memory || !mc.memory.available) return;
+  const key = mc.id + ':overview';
+  const age = Date.now() / 1000 - (MEM.asked[key] || 0);
+  if (age < (MEM.data[key] ? 300 : 30)) return;          // fresh, or a request is in flight
+  if (send({ op: 'memory', m: mc.id, action: 'overview' })) MEM.asked[key] = Date.now() / 1000;
 }
 function memAsk(m, action, extra) {
   send(Object.assign({ op: 'memory', m, action }, extra || {}));

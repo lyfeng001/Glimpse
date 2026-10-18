@@ -2505,6 +2505,44 @@ def peer_ok(sock):
     return uid == os.getuid()
 
 
+NETINFO_URL = "https://ipinfo.io/json"   # public IP + approximate location of this machine's internet exit
+NETINFO_TTL = 600
+SPEED_URL = "https://speed.cloudflare.com/__down?bytes=%d"   # public speed-test endpoint, no account
+SPEED_BYTES = 10 * 1024 * 1024
+SPEED_TIMEOUT = 25
+
+
+def speed_test(nbytes=SPEED_BYTES, timeout=SPEED_TIMEOUT):
+    """Download speed of this machine's internet connection: time to first byte (latency) and bits/s over a
+    fixed-size download (stops early at the timeout and reports what it measured)."""
+    import urllib.request
+    t0 = time.time()
+    req = urllib.request.Request(SPEED_URL % nbytes, headers={"User-Agent": "glimpse"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        first = r.read(1)
+        t1 = time.time()
+        got = len(first)
+        while got < nbytes and time.time() - t0 < timeout:
+            chunk = r.read(256 * 1024)
+            if not chunk:
+                break
+            got += len(chunk)
+    t2 = time.time()
+    secs = max(t2 - t1, 1e-3)
+    return {"down_bps": round(got * 8 / secs), "bytes": got, "secs": round(t2 - t0, 2), "ttfb_ms": round((t1 - t0) * 1000, 1)}
+
+
+def fetch_netinfo(timeout=8):
+    """{ip, city, region, country, org} of the address this machine reaches the internet from."""
+    import urllib.request
+    req = urllib.request.Request(NETINFO_URL, headers={"Accept": "application/json", "User-Agent": "glimpse"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        d = json.loads(r.read(65536).decode("utf-8", "replace"))
+    if not isinstance(d, dict) or not d.get("ip"):
+        raise RuntimeError("no address in the reply")
+    return {k: clip(str(d.get(k) or ""), 80) for k in ("ip", "city", "region", "country", "org", "timezone")}
+
+
 def sys_stats(prev):
     """load, cpu count, memory %, NIC byte rates. Returns (stats, state)."""
     st = {"load": list(os.getloadavg()) if hasattr(os, "getloadavg") else None, "ncpu": os.cpu_count() or 1,
@@ -3167,6 +3205,33 @@ class Daemon:
             self.bg_done.append((finished, res, err))
         self.background(work)
 
+    def netinfo(self, refresh, done):
+        """Public IP / location (cached NETINFO_TTL, looked up in a worker thread; callers share one lookup)."""
+        hit = getattr(self, "_netinfo", None)
+        if hit and not refresh and now() - hit[0] < NETINFO_TTL:
+            done(dict(hit[1], ts=hit[0]), None)
+            return
+        waiting = getattr(self, "_netinfo_wait", None)
+        if waiting is not None:
+            waiting.append(done)
+            return
+        self._netinfo_wait = [done]
+
+        def finished(res, err):
+            if err is None:
+                self._netinfo = (now(), res)
+            for cb in self._netinfo_wait or []:
+                cb(dict(res, ts=now()) if res else None, err)
+            self._netinfo_wait = None
+
+        def work():
+            try:
+                res, err = fetch_netinfo(), None
+            except Exception as e:
+                res, err = None, "查询公网 IP 失败: %s" % clip(str(e) or type(e).__name__, 120)
+            self.bg_done.append((finished, res, err))
+        self.background(work)
+
     def background(self, fn):
         import threading
         threading.Thread(target=fn, daemon=True).start()
@@ -3267,6 +3332,26 @@ class Daemon:
             elif op == "stats":
                 st, self.net_prev = sys_stats(self.net_prev)
                 self.send(c, {"t": "stats", "req": req, "stats": st})
+            elif op == "netinfo":
+                def got(res, err, c=c, req=req):
+                    self.send(c, {"t": "error", "req": req, "msg": err} if err else dict(res, t="netinfo", req=req))
+                self.netinfo(bool(m.get("refresh")), got)
+            elif op == "speedtest":
+                if getattr(self, "_speed_busy", False):
+                    raise RuntimeError("测速正在进行")
+                self._speed_busy = True
+
+                def tested(res, err, c=c, req=req):
+                    self._speed_busy = False
+                    self.send(c, {"t": "error", "req": req, "msg": err} if err else dict(res, t="speedtest", req=req))
+
+                def work():
+                    try:
+                        res, err = speed_test(), None
+                    except Exception as e:
+                        res, err = None, "测速失败: %s" % clip(str(e) or type(e).__name__, 120)
+                    self.bg_done.append((tested, res, err))
+                self.background(work)
             elif s is None:
                 if op in ("sub", "unsub", "in", "text", "resize", "kill", "forget", "rename", "ack", "replay", "auto_continue",
                           "approve", "restart", "control", "delete", "menu"):

@@ -440,6 +440,62 @@ def test_models_forwarding_and_cache(hub_mod, monkeypatch):
     asyncio.run(run())
 
 
+class NetMachine(FakeMachine):
+    def __init__(self):
+        FakeMachine.__init__(self)
+        self.netinfo = self.speed = self.speed_task = None
+        self.calls = []
+        self.replies = {"speedtest": {"t": "speedtest", "down_bps": 80_000_000, "ttfb_ms": 40.0, "bytes": 10, "secs": 1.0},
+                        "netinfo": {"t": "netinfo", "ip": "203.0.113.9", "city": "Shanghai", "region": "Shanghai",
+                                    "country": "CN", "org": "AS1", "timezone": "Asia/Shanghai", "ts": 1.0}}
+
+    async def call(self, obj, timeout=20):
+        self.calls.append(obj)
+        await asyncio.sleep(0.05)
+        r = self.replies[obj["op"]]
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+
+def test_speedtest_shared_and_netinfo(hub_mod):
+    C, server = hub_mod
+
+    async def run():
+        hub = server.Hub(C.load())
+        m = NetMachine()
+        hub.machines[m.id] = m
+        hub.order.append(m.id)
+        p, q = FakePhone(), FakePhone()
+        hub.phones.update([p, q])
+        # two devices at once -> one test on the machine; both get the result
+        await hub.phone_op(p, {"op": "speedtest", "m": "M1"})
+        await hub.phone_op(q, {"op": "speedtest", "m": "M1"})
+        await asyncio.sleep(0.15)
+        assert [c["op"] for c in m.calls] == ["speedtest"]
+        assert m.speed["down_bps"] == 80_000_000 and m.speed["ts"] > 0
+        for ph in (p, q):
+            assert ph.sent[-1]["t"] == "speedtest_done" and ph.sent[-1]["speed"]["down_bps"] == 80_000_000
+        # agent errors and timeouts become a speed {error}
+        m.replies["speedtest"] = {"t": "error", "msg": "测速失败: boom"}
+        await hub.phone_op(p, {"op": "speedtest", "m": "M1"})
+        await asyncio.sleep(0.1)
+        assert m.speed["error"] == "测速失败: boom" and p.sent[-1]["speed"]["error"]
+        m.replies["speedtest"] = asyncio.TimeoutError()
+        await hub.phone_op(p, {"op": "speedtest", "m": "M1"})
+        await asyncio.sleep(0.1)
+        assert m.speed["error"] == "测速超时"
+        # netinfo is stored on the machine and published with the state
+        await hub.phone_op(p, {"op": "netinfo", "m": "M1", "refresh": True})
+        await asyncio.sleep(0.1)
+        assert m.calls[-1] == {"op": "netinfo", "refresh": True}
+        assert m.netinfo["ip"] == "203.0.113.9" and m.netinfo["city"] == "Shanghai"
+        m.replies["netinfo"] = {"t": "error", "msg": "查询公网 IP 失败: x"}
+        await hub.machine_netinfo(m)
+        assert m.netinfo["error"].startswith("查询公网 IP 失败")
+    asyncio.run(run())
+
+
 def test_login_pairing_password_devices(hub_mod, tmp_path):
     from aiohttp.test_utils import TestClient, TestServer
     C, server = hub_mod

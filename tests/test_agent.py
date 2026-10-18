@@ -529,6 +529,79 @@ def _daemon(tmp_path):
     return d
 
 
+def _drain(d):
+    """run worker-thread results the way tick() does (the stubbed workers below run inline)"""
+    while d.bg_done:
+        cb, res, err = d.bg_done.pop(0)
+        cb(res, err)
+
+
+def test_netinfo_and_speedtest_ops(tmp_path, monkeypatch):
+    d = _daemon(tmp_path)
+    d.background = lambda fn: fn()
+    sent = []
+    d.send = lambda c, obj: sent.append(obj)
+    looks = []
+    monkeypatch.setattr(A, "fetch_netinfo", lambda: looks.append(1) or {"ip": "203.0.113.9", "city": "Shanghai"})
+    d.handle(None, {"op": "netinfo", "req": 1})
+    _drain(d)
+    assert sent[-1]["t"] == "netinfo" and sent[-1]["req"] == 1 and sent[-1]["ip"] == "203.0.113.9" and sent[-1]["ts"]
+    d.handle(None, {"op": "netinfo", "req": 2})                     # cached
+    assert sent[-1]["req"] == 2 and len(looks) == 1
+    d.handle(None, {"op": "netinfo", "req": 3, "refresh": True})    # refresh looks it up again
+    _drain(d)
+    assert sent[-1]["req"] == 3 and len(looks) == 2
+
+    def down():
+        raise OSError("no route")
+    monkeypatch.setattr(A, "fetch_netinfo", down)
+    d.handle(None, {"op": "netinfo", "req": 4, "refresh": True})
+    _drain(d)
+    assert sent[-1]["t"] == "error" and "no route" in sent[-1]["msg"]
+    # speed test: one at a time; the busy flag clears on success and on failure
+    monkeypatch.setattr(A, "speed_test", lambda: {"down_bps": 1000, "bytes": 10, "secs": 1.0, "ttfb_ms": 5.0})
+    d.background = lambda fn: None                                   # keep it running
+    d.handle(None, {"op": "speedtest", "req": 5})
+    d.handle(None, {"op": "speedtest", "req": 6})
+    assert sent[-1]["t"] == "error" and sent[-1]["req"] == 6
+    d._speed_busy = False
+    d.background = lambda fn: fn()
+    d.handle(None, {"op": "speedtest", "req": 7})
+    _drain(d)
+    assert sent[-1] == {"t": "speedtest", "req": 7, "down_bps": 1000, "bytes": 10, "secs": 1.0, "ttfb_ms": 5.0}
+
+    def slow():
+        raise TimeoutError("timed out")
+    monkeypatch.setattr(A, "speed_test", slow)
+    d.handle(None, {"op": "speedtest", "req": 8})
+    _drain(d)
+    assert sent[-1]["t"] == "error" and "timed out" in sent[-1]["msg"] and not d._speed_busy
+
+
+def test_speed_test_measures_download(monkeypatch):
+    import io
+    import urllib.request
+
+    class Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+    seen = []
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: seen.append(req.full_url) or Resp(b"x" * 3000))
+    r = A.speed_test(nbytes=3000, timeout=5)
+    assert seen == [A.SPEED_URL % 3000] and r["bytes"] == 3000 and r["down_bps"] > 0 and r["ttfb_ms"] >= 0
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: Resp(json.dumps(
+        {"ip": "198.51.100.7", "city": "Hangzhou", "region": "Zhejiang", "country": "CN", "org": "AS1", "extra": 1}).encode()))
+    assert A.fetch_netinfo() == {"ip": "198.51.100.7", "city": "Hangzhou", "region": "Zhejiang", "country": "CN",
+                                 "org": "AS1", "timezone": ""}
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: Resp(b'{"bogon": true}'))
+    import pytest
+    with pytest.raises(RuntimeError):
+        A.fetch_netinfo()
+
+
 def test_delete_sequencing(tmp_path, monkeypatch):
     d = _daemon(tmp_path)
     monkeypatch.setattr(A.Session, "spawn", lambda self, resume=False: setattr(self, "fd", 99) or

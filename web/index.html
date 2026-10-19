@@ -561,6 +561,10 @@
         <div class="tseg" id="opt-theme" role="radiogroup" aria-labelledby="theme-lbl">
           <button type="button" role="radio" data-theme-v="auto">跟随系统</button><button type="button" role="radio" data-theme-v="light"><svg class="ic sm" aria-hidden="true"><use href="#i-sun"/></svg>浅色</button><button type="button" role="radio" data-theme-v="dark"><svg class="ic sm" aria-hidden="true"><use href="#i-moon"/></svg>深色</button><button type="button" role="radio" data-theme-v="solarized" aria-label="Solarized（Warp 配色）"><span class="sw-sol" aria-hidden="true"></span>Solarized</button>
         </div></div>
+      <div class="cell stack"><span class="lbl" id="lang-lbl">语言</span>
+        <div class="tseg" id="opt-lang" role="radiogroup" aria-labelledby="lang-lbl">
+          <button type="button" role="radio" data-lang-v="auto">跟随系统</button><button type="button" role="radio" data-lang-v="zh" lang="zh-CN">中文</button><button type="button" role="radio" data-lang-v="en" lang="en">English</button>
+        </div><span class="sub" id="lang-sub">通知和系统提示用最后手动选的语言</span></div>
       <div class="cell"><span class="grow" id="font-lbl">终端字号</span>
         <span class="stepper" role="group" aria-labelledby="font-lbl">
           <button type="button" id="font-dec" aria-label="减小字号"><svg class="ic sm"><use href="#i-minus"/></svg></button>
@@ -624,6 +628,7 @@
 <div id="sr-live" class="sr" aria-live="assertive"></div>
 <script src="/static/vendor/xterm.js"></script>
 <script src="/static/vendor/addon-fit.js"></script>
+<script src="/static/i18n.js"></script>
 <script src="/static/hl.js"></script>
 <script src="/static/app.js"></script>
 </body>

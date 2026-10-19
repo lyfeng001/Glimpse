@@ -58,6 +58,21 @@ CODEX_FLAGS = ["-c", "tui.notifications=true", "-c", 'tui.notification_method="o
                "-c", 'tui.notification_condition="always"']
 DEFAULT_PRESETS = {"claude": {"argv": ["claude"]}, "codex": {"argv": ["codex"]}, "shell": {"argv": []}}
 DETACH_KEY = b"\x1d"              # Ctrl-]
+# Language of what the daemon writes for people: system lines in chat, statuses, notification titles and errors.
+# The hub sends it (op "lang") after connecting and when it changes; kept across daemon restarts in sessions.json.
+LANG = "zh"
+EN = {}                           # filled below: zh text -> en text
+
+
+def tr(zh, *args):
+    """The text in the daemon's language; args fill %s / %d like zh % args (the en text has the same ones)."""
+    s = EN.get(zh, zh) if LANG == "en" else zh
+    return s % args if args else s
+
+
+class SessionStateError(str):
+    """An error text that is about the session itself (exited, busy), not about what was asked: callers report
+    it instead of trying another way (e.g. a restart). Tells them apart in any language."""
 HISTORY_ACTIVE = 120              # a transcript written this recently is probably still open elsewhere
 HISTORY_DAYS = 14                 # codex rollouts older than this are not offered for adoption
 RESUME_IMPORT = 200               # chat items imported from a resumed codex rollout
@@ -534,7 +549,7 @@ def summarize_tool(name, inp):
     if name == "AskUserQuestion":
         qs = inp.get("questions") or []
         if qs and isinstance(qs[0], dict):
-            more = " (+%d 个问题)" % (len(qs) - 1) if len(qs) > 1 else ""
+            more = tr(" (+%d 个问题)", len(qs) - 1) if len(qs) > 1 else ""
             return "Question: " + clip(qs[0].get("question", ""), 300) + more
     return name
 
@@ -1429,7 +1444,7 @@ class Session:
         except OSError:
             return False
         self.env, self.key = dict(env), key
-        it = self.add_chat("system", "—— 已切换到 %s（无需重启）——" % (key or "新 key"))
+        it = self.add_chat("system", tr("—— 已切换到 %s（无需重启）——", key or tr("新 key")))
         if it:
             self.d.send_subs(self, {"t": "chat", "sid": self.sid, "items": [it]})
         self.touch()
@@ -1585,7 +1600,7 @@ class Session:
              "can_always": bool(sugg), "ts": now(), "suggestions": sugg, "waiter": waiter, "match": match}
         self.pendings[pid] = p
         self.set_status("waiting", clip(self.pending["summary"], 200), "question")
-        self.event("question", "需要你确认", p["summary"])
+        self.event("question", tr("需要你确认"), p["summary"])
         if waiter is not None:
             self.d.later(self.d.approval_wait, lambda: pid in self.pendings and self.resolve_pending(None, pid=pid))
 
@@ -1609,7 +1624,7 @@ class Session:
             out = {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": dec}}
         elif decision == "deny":
             out = {"hookSpecificOutput": {"hookEventName": "PermissionRequest",
-                                          "decision": {"behavior": "deny", "message": message or "用户在手机上拒绝了"}}}
+                                          "decision": {"behavior": "deny", "message": message or tr("用户在手机上拒绝了")}}}
         self.pendings.pop(p["id"], None)
         w = p["waiter"]
         if w is not None and notify:
@@ -1656,7 +1671,7 @@ class Session:
         self.restarts += 1
         self.release_pendings()
         self.question = None
-        it = self.add_chat("system", "—— 进程已重启%s ——" % ("，恢复原对话" if resume and self.agent_session_id else ""))
+        it = self.add_chat("system", tr("—— 进程已重启%s ——", tr("，恢复原对话") if resume and self.agent_session_id else ""))
         if it:
             self.d.send_subs(self, {"t": "chat", "sid": self.sid, "items": [it]})
         try:
@@ -1664,7 +1679,7 @@ class Session:
             self.d.sel.register(self.fd, selectors.EVENT_READ, ("pty", self))
             done(None)
         except Exception as e:
-            self.set_status("error", "重启失败: %s" % e, "error")
+            self.set_status("error", tr("重启失败: %s", e), "error")
             done(str(e))
 
     def on_output(self, data):
@@ -1715,10 +1730,10 @@ class Session:
         low = text.lower()
         if "approval" in low or "question" in low or "plan mode" in low or "wants to" in low:
             self.set_status("waiting", clip(text, 200), "question")
-            self.event("question", "需要你确认", text)
+            self.event("question", tr("需要你确认"), text)
         elif self.kind != "codex" or self.tail is None:
             self.set_status("idle", "", "done")
-            self.event("done", "已完成本轮", text)
+            self.event("done", tr("已完成本轮"), text)
 
     def check_mode(self):
         """Re-read claude's permission mode from the footer after an output burst."""
@@ -1800,7 +1815,7 @@ class Session:
         if self.resumed_at and code not in (0, None) and not self.killed and now() - self.resumed_at < 20:
             # `--resume` / `codex resume` failed right away (conversation not found, ...): start fresh instead
             self.resumed_at = None
-            it = self.add_chat("system", "—— 无法恢复原对话，已开始新对话 ——")
+            it = self.add_chat("system", tr("—— 无法恢复原对话，已开始新对话 ——"))
             if it:
                 self.d.send_subs(self, {"t": "chat", "sid": self.sid, "items": [it]})
             self.agent_session_id = None
@@ -1814,7 +1829,7 @@ class Session:
             cb, self.delete_req = self.delete_req, None
             cb(self.d.forget(self.sid))
             return
-        self.event("error" if bad else "exit", "进程异常退出 (code %s)" % code if bad else "进程已退出",
+        self.event("error" if bad else "exit", tr("进程异常退出 (code %s)", code) if bad else tr("进程已退出"),
                    self.preview or self.name)
         # attached terminals learn about the exit right away (they are not hub clients)
         self.d.send_subs(self, {"t": "session", "s": self.info()})
@@ -1841,15 +1856,15 @@ class Session:
             return False
         if not is_transient_error(err) or self.ac_count >= AUTO_CONTINUE_MAX:
             if self.ac_count >= AUTO_CONTINUE_MAX:
-                self.event("error", "自动发了 %d 次“继续”都还是出错，已停下，请看一下" % AUTO_CONTINUE_MAX, err)
+                self.event("error", tr("自动发了 %d 次“继续”都还是出错，已停下，请看一下", AUTO_CONTINUE_MAX), err)
             return False
         delay = AUTO_CONTINUE_DELAYS[min(self.ac_count, len(AUTO_CONTINUE_DELAYS) - 1)]
         self.ac_count += 1
         self.ac_pending = True
         n = self.ac_count
-        self.set_status("waiting", "临时错误，%d 秒后自动继续（第 %d/%d 次）" % (delay, n, AUTO_CONTINUE_MAX), None)
-        it = self.add_chat("system", "—— %s：%d 秒后自动发送“%s”（已连着出错 %d 次，到 %d 次就停下通知你；AI 正常回复完一次后从 0 算起）——"
-                           % (clip(err, 120), delay, AUTO_CONTINUE_TEXT, n, AUTO_CONTINUE_MAX))
+        self.set_status("waiting", tr("临时错误，%d 秒后自动继续（第 %d/%d 次）", delay, n, AUTO_CONTINUE_MAX), None)
+        it = self.add_chat("system", tr("—— %s：%d 秒后自动发送“%s”（已连着出错 %d 次，到 %d 次就停下通知你；AI 正常回复完一次后从 0 算起）——",
+                                        clip(err, 120), delay, continue_text(), n, AUTO_CONTINUE_MAX))
         if it:
             self.d.send_subs(self, {"t": "chat", "sid": self.sid, "items": [it]})
 
@@ -1857,7 +1872,7 @@ class Session:
             self.ac_pending = False
             if self.fd is None or not self.auto_continue or self.status == "running":
                 return              # process gone, switched off, or someone already continued it
-            self.d.type_text(self, AUTO_CONTINUE_TEXT)
+            self.d.type_text(self, continue_text())
             self.set_status("running", "", None)
         self.d.later(delay, fire)
         return True
@@ -1993,13 +2008,13 @@ class Session:
                     self.ac_count = 0
                     self.d.memory.capture(self)
                     self.set_status("idle", "", "done")
-                    self.event("done", "已完成本轮", text or self.preview)
+                    self.event("done", tr("已完成本轮"), text or self.preview)
                 elif role == "@error":
                     if not self.maybe_auto_continue(text):
                         self.set_status("error", clip(text, 200), "error")
-                        self.event("error", "出错停止", text)
+                        self.event("error", tr("出错停止"), text)
                 elif role == "@aborted":
-                    self.set_status("idle", "已中断")
+                    self.set_status("idle", tr("已中断"))
                 else:
                     it = self.add_chat(role, text, extra)
                     if it:
@@ -2012,7 +2027,7 @@ class Session:
         if not path or path == self.transcript:
             return
         if self.transcript:
-            it = self.add_chat("system", "—— 新对话 ——")
+            it = self.add_chat("system", tr("—— 新对话 ——"))
             if it:
                 self.d.send_subs(self, {"t": "chat", "sid": self.sid, "items": [it]})
         self.transcript = path
@@ -2048,7 +2063,7 @@ class Session:
                     self.question.update(questions=items, answered=[False] * len(items), review=False)
                 q = summarize_tool(tool, inp)
                 self.set_status("waiting", clip(q, 200), "question")
-                self.event("question", "有问题需要回答", q)
+                self.event("question", tr("有问题需要回答"), q)
             else:
                 if name == "PostToolUse" and tool == "AskUserQuestion":
                     self.question = None
@@ -2071,7 +2086,7 @@ class Session:
             if nt in ("permission_prompt", "elicitation_dialog"):
                 if self.status != "waiting":
                     self.set_status("waiting", clip(msg, 200), "question")
-                    self.event("question", "需要你确认", msg)
+                    self.event("question", tr("需要你确认"), msg)
         elif name == "Stop":
             self.release_pendings()
             self.question = None
@@ -2082,7 +2097,7 @@ class Session:
             self.ac_count = 0
             self.d.memory.capture(self)
             self.set_status("idle", "", "done")
-            self.event("done", "已完成本轮", msg)
+            self.event("done", tr("已完成本轮"), msg)
         elif name == "StopFailure":
             err = ev.get("error") or "unknown"
             det = ev.get("error_details") or ""
@@ -2097,7 +2112,7 @@ class Session:
             full = " ".join(x for x in (err, det, last, self.preview if not last else "") if x)
             if not self.maybe_auto_continue(full):
                 self.set_status("error", clip("%s %s" % (err, det), 200), "error")
-                self.event("error", "出错停止: %s" % err, det or ev.get("last_assistant_message") or "")
+                self.event("error", tr("出错停止: %s", err), det or ev.get("last_assistant_message") or "")
         self.poll_tail()
         return wait
 
@@ -2190,7 +2205,89 @@ TRANSIENT_ERR_RE = re.compile(
 FATAL_ERR_RE = re.compile(
     r"余额不足|额度|insufficient|balance|quota|billing|credit|权限验证失败|unauthori[sz]ed|invalid.{0,10}key|"
     r"authentication|\b401\b|\b403\b|forbidden|context.{0,20}(length|window)|prompt is too long", re.I)
-AUTO_CONTINUE_TEXT = "继续"
+EN.update({
+    " (+%d 个问题)": " (+%d more questions)",
+    "—— 已切换到 %s（无需重启）——": "—— Switched to %s (no restart needed) ——",
+    "新 key": "the new key",
+    "需要你确认": "Needs your confirmation",
+    "用户在手机上拒绝了": "The user denied it on the phone",
+    "—— 进程已重启%s ——": "—— The process restarted%s ——",
+    "，恢复原对话": ", conversation resumed",
+    "重启失败: %s": "Restart failed: %s",
+    "已完成本轮": "Turn done",
+    "—— 无法恢复原对话，已开始新对话 ——": "—— Couldn't resume the conversation; a new one started ——",
+    "进程异常退出 (code %s)": "The process exited abnormally (code %s)",
+    "进程已退出": "The process exited",
+    "自动发了 %d 次“继续”都还是出错，已停下，请看一下":
+        "Sent “continue” %d times and it still fails; stopped, please take a look",
+    "临时错误，%d 秒后自动继续（第 %d/%d 次）": "Temporary error, continuing in %d s (%d/%d)",
+    "—— %s：%d 秒后自动发送“%s”（已连着出错 %d 次，到 %d 次就停下通知你；AI 正常回复完一次后从 0 算起）——":
+        "—— %s: in %d s it sends “%s” (%d errors in a row; it stops and notifies you at %d; back to 0 after the AI "
+        "finishes a reply) ——",
+    "出错停止": "Stopped with an error",
+    "已中断": "Interrupted",
+    "—— 新对话 ——": "—— New conversation ——",
+    "有问题需要回答": "Has a question for you",
+    "出错停止: %s": "Stopped with an error: %s",
+    "AMem 不可用（需要 Python 3.11+ 且安装 agent-memory-local[mcp]）":
+        "AMem unavailable (needs Python 3.11+ and agent-memory-local[mcp])",
+    "记忆采集失败: %s": "Memory capture failed: %s",
+    "记忆功能未开启（config.json 里的 memory.enabled）": "Memory is off (memory.enabled in config.json)",
+    "AMem 还没准备好": "AMem isn't ready yet",
+    "无效的项目": "Invalid project",
+    "无效的上限（例如 20G）": "Invalid limit (e.g. 20G)",
+    "无效的记忆操作": "Invalid memory operation",
+    "无效的 init_cmds": "Invalid init_cmds",
+    "无效的路径": "Invalid path",
+    "路径不在会话目录内": "The path is outside the session folder",
+    "不是普通文件": "Not a regular file",
+    "Glimpse 自己的数据，不能在这里修改": "Glimpse's own data can't be changed here",
+    "不能修改 .git 里的文件": "Files in .git can't be changed",
+    "无效的内容": "Invalid content",
+    "文件太大，不能在这里编辑": "The file is too large to edit here",
+    "文件编码无法识别，不能保存": "Unknown file encoding; can't save",
+    "内容太大": "Content too large",
+    "名称无效": "Invalid name",
+    "已经存在同名的文件或文件夹": "A file or folder with that name already exists",
+    "上级路径不是文件夹": "The parent path is not a folder",
+    "—— Glimpse 守护进程已重启，已自动恢复这个对话 ——":
+        "—— Glimpse's daemon restarted; this conversation was resumed ——",
+    "无效的对话 id": "Invalid conversation id",
+    "这个对话已经在会话 %s 中运行": "This conversation is already running in session %s",
+    "目录不存在: %s": "No such folder: %s",
+    "会话没有在运行": "The session isn't running",
+    "未知模式 %s": "Unknown mode %s",
+    "无效的模型名": "Invalid model name",
+    "无效的推理强度 %s": "Invalid effort %s",
+    "未知操作 %s": "Unknown operation %s",
+    "无效的值": "Invalid value",
+    "只有 Claude / Codex 会话支持": "Only Claude / Codex sessions support this",
+    "会话已退出": "The session exited",
+    "Codex 还停在菜单“%s”，已取消": "Codex was still in the menu “%s”; cancelled",
+    "Codex 没有弹出预期的菜单（%s）": "Codex didn't show the expected menu (%s)",
+    "无菜单": "no menu",
+    "菜单里没有这个选项（%s）": "The menu has no such option (%s)",
+    "会话正忙，等这一轮结束再改": "The session is busy; change it after this turn",
+    "当前没有菜单": "No menu right now",
+    "无效的按键": "Invalid key",
+    "无效的选项": "Invalid option",
+    "无效的类型 %r": "Invalid type %r",
+    "codex debug models 超时": "codex debug models timed out",
+    "codex debug models 失败: %s": "codex debug models failed: %s",
+    "查询公网 IP 失败: %s": "Public IP lookup failed: %s",
+    "没能切换到 %s（当前 %s），请在终端里按 Shift+Tab": "Couldn't switch to %s (now %s); press Shift+Tab in the terminal",
+    "未知": "unknown",
+    "测速正在进行": "A speed test is running",
+    "测速失败: %s": "Speed test failed: %s",
+    "删除失败": "Delete failed",
+    "这个授权请求已经处理过了": "This approval request was already handled",
+    "只有 Claude / Codex 会话可以更换 Key 重启": "Only Claude / Codex sessions can restart with another key",
+})
+AUTO_CONTINUE_TEXT = {"zh": "继续", "en": "continue"}   # what auto-continue types, in the daemon's language
+
+
+def continue_text():
+    return AUTO_CONTINUE_TEXT.get(LANG, AUTO_CONTINUE_TEXT["zh"])
 AUTO_CONTINUE_MAX = 5            # consecutive retries per session before giving up and notifying
 AUTO_CONTINUE_DELAYS = (15, 30, 60, 120, 240)   # seconds before each retry
 
@@ -2311,7 +2408,7 @@ class Memory:
             if done:
                 done()
         self.probing = True
-        self.exec_py(["-c", MEMORY_PROBE, self.store()], probed, "AMem 不可用（需要 Python 3.11+ 且安装 agent-memory-local[mcp]）")
+        self.exec_py(["-c", MEMORY_PROBE, self.store()], probed, tr("AMem 不可用（需要 Python 3.11+ 且安装 agent-memory-local[mcp]）"))
 
     def configure_now(self, cfg):
         """Blocking variant of configure() (daemon start, before any session is restored)."""
@@ -2418,7 +2515,7 @@ class Memory:
         def finished(_res, err):
             self.running.discard(project)
             if err:
-                self.error = "记忆采集失败: %s" % err
+                self.error = tr("记忆采集失败: %s", err)
             if project in self.again:
                 self.again.discard(project)
                 self.capture(s)
@@ -2437,14 +2534,14 @@ class Memory:
     # --- op "memory" (phone)
     def query(self, m, done):
         if not self.cfg.get("enabled"):
-            done(None, "记忆功能未开启（config.json 里的 memory.enabled）")
+            done(None, tr("记忆功能未开启（config.json 里的 memory.enabled）"))
             return
         if not self.version:
-            done(None, self.error or "AMem 还没准备好")
+            done(None, self.error or tr("AMem 还没准备好"))
             return
         action, project = m.get("action"), m.get("project")
         if project is not None and (not isinstance(project, str) or not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$", project)):
-            done(None, "无效的项目")
+            done(None, tr("无效的项目"))
             return
         q = m.get("q")
         if action == "overview":
@@ -2462,11 +2559,11 @@ class Memory:
         elif action == "budget":
             b = m.get("budget")
             if not isinstance(b, str) or not re.match(r"^(0|\d+(\.\d+)?\s*[KMGT]i?B?)$", b.strip(), re.I):
-                done(None, "无效的上限（例如 20G）")
+                done(None, tr("无效的上限（例如 20G）"))
                 return
             args = ["budget", "--max-bytes", b.strip(), "--keep-days", str(int(self.cfg.get("keep_days") or 30))]
         else:
-            done(None, "无效的记忆操作")
+            done(None, tr("无效的记忆操作"))
             return
         if action == "search":
             # results can be long tool outputs: the phone only needs a preview
@@ -2489,7 +2586,7 @@ def check_init_cmds(cmds):
     if not isinstance(cmds, list) or len(cmds) > INIT_CMDS_MAX or not all(
             isinstance(x, str) and x.startswith("/") and len(x) <= 200 and not re.search(r"[\x00-\x1f\x7f]", x)
             for x in cmds):
-        raise RuntimeError("无效的 init_cmds")
+        raise RuntimeError(tr("无效的 init_cmds"))
     return list(cmds)
 
 
@@ -2693,11 +2790,11 @@ def fs_sensitive(name, real=None):
 def fs_resolve(root, rel):
     """(real root, real path) for `rel` inside the session directory `root`; ValueError when it leaves it."""
     if not isinstance(rel, str) or len(rel) > 4096 or "\0" in rel:
-        raise ValueError("无效的路径")
+        raise ValueError(tr("无效的路径"))
     base = os.path.realpath(root)
     p = os.path.realpath(os.path.join(base, rel.lstrip("/")))
     if p != base and not p.startswith(base.rstrip(os.sep) + os.sep):
-        raise ValueError("路径不在会话目录内")
+        raise ValueError(tr("路径不在会话目录内"))
     return base, p
 
 
@@ -2753,7 +2850,7 @@ def fs_read(root, rel, force=False):
     st = os.stat(p)
     import stat as _stat
     if not _stat.S_ISREG(st.st_mode):
-        raise ValueError("不是普通文件")
+        raise ValueError(tr("不是普通文件"))
     name = os.path.basename(p)
     r = {"path": fs_rel(base, p), "size": st.st_size, "mtime": int(st.st_mtime)}
     if fs_sensitive(name, p) and not force:
@@ -2793,9 +2890,9 @@ def fs_sig(data):
 def fs_writable_why(base, p):
     """None if `p` (a real path inside `base`) may be written, else the reason."""
     if any(p == q or p.startswith(q.rstrip(os.sep) + os.sep) for q in FS_PRIVATE):
-        return "Glimpse 自己的数据，不能在这里修改"
+        return tr("Glimpse 自己的数据，不能在这里修改")
     if ".git" in fs_rel(base, p).split("/"):
-        return "不能修改 .git 里的文件"
+        return tr("不能修改 .git 里的文件")
     return None
 
 
@@ -2824,16 +2921,16 @@ def fs_write(root, rel, text, sig, force=False):
     conflict unless `force`. Keeps the file's encoding and CRLF line ends (a browser textarea gives LF)."""
     import stat as _stat
     if not isinstance(text, str):
-        raise ValueError("无效的内容")
+        raise ValueError(tr("无效的内容"))
     base, p = fs_resolve(root, rel)
     why = fs_writable_why(base, p)
     if why:
         raise ValueError(why)
     st = os.stat(p)
     if not _stat.S_ISREG(st.st_mode):
-        raise ValueError("不是普通文件")
+        raise ValueError(tr("不是普通文件"))
     if st.st_size > FS_TEXT_MAX:
-        raise ValueError("文件太大，不能在这里编辑")
+        raise ValueError(tr("文件太大，不能在这里编辑"))
     with open(p, "rb") as f:
         old = f.read()
     cur = fs_sig(old)
@@ -2841,12 +2938,12 @@ def fs_write(root, rel, text, sig, force=False):
         return {"conflict": True, "sig": cur}
     _, enc = fs_decode(old)
     if enc not in ("utf-8", "gb18030"):
-        raise ValueError("文件编码无法识别，不能保存")
+        raise ValueError(tr("文件编码无法识别，不能保存"))
     if b"\r\n" in old and "\r\n" not in text:
         text = text.replace("\n", "\r\n")
     data = text.encode(enc)
     if len(data) > FS_WRITE_MAX:
-        raise ValueError("内容太大")
+        raise ValueError(tr("内容太大"))
     fs_atomic_write(p, data, _stat.S_IMODE(st.st_mode))
     return {"saved": True, "sig": fs_sig(data), "size": len(data), "mtime": int(os.stat(p).st_mtime)}
 
@@ -2854,20 +2951,20 @@ def fs_write(root, rel, text, sig, force=False):
 def fs_new_path(root, rel):
     """(real root, real path) for a file / folder that does not exist yet; parents are created by the caller."""
     if not isinstance(rel, str) or len(rel) > 1024:
-        raise ValueError("无效的路径")
+        raise ValueError(tr("无效的路径"))
     parts = [x for x in rel.strip().strip("/").split("/") if x not in ("", ".")]
     if not parts or any(x == ".." or not FS_NAME_RE.match(x) for x in parts):
-        raise ValueError("名称无效")
+        raise ValueError(tr("名称无效"))
     base, p = fs_resolve(root, "/".join(parts))
     why = fs_writable_why(base, p)
     if why:
         raise ValueError(why)
     if os.path.lexists(p):
-        raise ValueError("已经存在同名的文件或文件夹")
+        raise ValueError(tr("已经存在同名的文件或文件夹"))
     parent = os.path.dirname(p)
     _, rp = fs_resolve(root, fs_rel(base, parent))        # an existing parent may be a symlink: still inside
     if os.path.exists(rp) and not os.path.isdir(rp):
-        raise ValueError("上级路径不是文件夹")
+        raise ValueError(tr("上级路径不是文件夹"))
     return base, p
 
 
@@ -2875,7 +2972,7 @@ def fs_create(root, rel, text=""):
     base, p = fs_new_path(root, rel)
     data = (text or "").encode("utf-8")
     if len(data) > FS_WRITE_MAX:
-        raise ValueError("内容太大")
+        raise ValueError(tr("内容太大"))
     os.makedirs(os.path.dirname(p), exist_ok=True)
     fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     with os.fdopen(fd, "wb") as f:
@@ -3185,7 +3282,7 @@ class Daemon:
                 rows.append({"sid": s.sid, "kind": s.kind, "cwd": s.cwd, "name": s.name, "argv": list(s.argv),
                              "key": s.key, "conv": s.agent_session_id, "auto_continue": s.auto_continue,
                              "overrides": dict(s.overrides), "cols": s.cols, "rows": s.rows})
-        data = json.dumps({"v": 1, "sessions": rows, "memory": self.memory.cfg}, ensure_ascii=False)
+        data = json.dumps({"v": 1, "sessions": rows, "memory": self.memory.cfg, "lang": LANG}, ensure_ascii=False)
         if data == getattr(self, "_saved", None):
             return
         tmp = path + ".tmp"
@@ -3209,6 +3306,9 @@ class Daemon:
             rows = saved.get("sessions") or []
         except (OSError, ValueError):
             return
+        global LANG
+        if saved.get("lang") in ("zh", "en"):
+            LANG = saved["lang"]               # before the restored sessions write their first line
         mcfg = saved.get("memory") if isinstance(saved.get("memory"), dict) else local_memory_config()
         if mcfg and mcfg.get("enabled") and rows:
             # the hub sends the memory settings only after it connected: restored sessions need them at spawn
@@ -3227,7 +3327,7 @@ class Daemon:
                                 r.get("cols"), r.get("rows"), env, key if env else None, r.get("conv"),
                                 sid=r.get("sid"), overrides=r.get("overrides"))
                 s.auto_continue = bool(r.get("auto_continue"))
-                it = s.add_chat("system", "—— Glimpse 守护进程已重启，已自动恢复这个对话 ——")
+                it = s.add_chat("system", tr("—— Glimpse 守护进程已重启，已自动恢复这个对话 ——"))
                 if it:
                     self.send_subs(s, {"t": "chat", "sid": s.sid, "items": [it]})
                 sys.stderr.write("glimpse: restored %s (%s %s)\n" % (s.sid, s.kind, s.agent_session_id))
@@ -3245,17 +3345,17 @@ class Daemon:
         cmds = check_init_cmds(init_cmds) if kind == "claude" else []
         if resume_id is not None:
             if kind not in ("claude", "codex") or not isinstance(resume_id, str) or not ID_RE.match(resume_id):
-                raise RuntimeError("无效的对话 id")
+                raise RuntimeError(tr("无效的对话 id"))
             for o in self.sessions.values():
                 if o.agent_session_id == resume_id and o.fd is not None:
-                    raise RuntimeError("这个对话已经在会话 %s 中运行" % o.sid)
+                    raise RuntimeError(tr("这个对话已经在会话 %s 中运行", o.sid))
         argv = list(args) if args else list(DEFAULT_PRESETS[kind]["argv"])
         argv = [os.path.expanduser(a) if a.startswith("~/") else a for a in argv]
         if args and kind != "shell" and argv[0] != kind and not os.path.isabs(argv[0]):
             argv = DEFAULT_PRESETS[kind]["argv"] + argv   # args given without the program name
         cwd = os.path.abspath(os.path.expanduser(cwd or "~"))
         if not os.path.isdir(cwd):
-            raise RuntimeError("目录不存在: %s" % cwd)
+            raise RuntimeError(tr("目录不存在: %s", cwd))
         if not (isinstance(sid, str) and re.match(r"^[0-9a-f]{6}$", sid) and sid not in self.sessions):
             sid = os.urandom(3).hex()
             while sid in self.sessions:
@@ -3373,26 +3473,26 @@ class Daemon:
         value = value.strip()
         if s.kind == "claude":
             if s.fd is None:
-                raise RuntimeError("会话没有在运行")
+                raise RuntimeError(tr("会话没有在运行"))
             if action == "mode":
                 target = CLAUDE_MODE_ALIAS.get(value, value)
                 if target not in CLAUDE_MODES:
-                    raise RuntimeError("未知模式 %s" % value)
+                    raise RuntimeError(tr("未知模式 %s", value))
                 self.cycle_mode(s, target, done)
                 return
             if action == "model":
                 if not VALUE_RE.match(value):
-                    raise RuntimeError("无效的模型名")
+                    raise RuntimeError(tr("无效的模型名"))
                 cmd = "/model " + value
             elif action == "effort":
                 if value not in CLAUDE_EFFORTS:
-                    raise RuntimeError("无效的推理强度 %s" % value)
+                    raise RuntimeError(tr("无效的推理强度 %s", value))
                 cmd = "/effort " + value
             elif action == "goal":
                 goal = clip(re.sub(r"[\x00-\x1f\x7f]+", " ", value).strip(), 2000)
                 cmd = "/goal " + (goal or "clear")
             else:
-                raise RuntimeError("未知操作 %s" % action)
+                raise RuntimeError(tr("未知操作 %s", action))
             # one slash command at a time: the next one waits until the previous Enter was sent
             t = now()
             wait = max(0.0, getattr(s, "type_busy", 0) - t)
@@ -3404,9 +3504,9 @@ class Daemon:
             done(None)
         elif s.kind == "codex":
             if action not in CODEX_OVERRIDES:
-                raise RuntimeError("未知操作 %s" % action)
+                raise RuntimeError(tr("未知操作 %s", action))
             if value and not VALUE_RE.match(value):
-                raise RuntimeError("无效的值")
+                raise RuntimeError(tr("无效的值"))
             def keep(err=None):
                 # remember the choice: a later restart (key swap, daemon restart) launches with it
                 if err is None:
@@ -3426,7 +3526,7 @@ class Daemon:
                 s.restart(None, None, True, done)   # not settable in the running session: restart and resume
 
             def walked(err):
-                if err is None or err.startswith("会话"):
+                if err is None or isinstance(err, SessionStateError):
                     keep(err)                  # done, or busy / exited: report it, no restart behind the user's back
                 else:
                     sys.stderr.write("glimpse: codex %s=%s needs a restart: %s\n" % (action, value, err))
@@ -3440,7 +3540,7 @@ class Daemon:
             else:
                 self.codex_set_permissions(s, action, value, walked)
         else:
-            raise RuntimeError("只有 Claude / Codex 会话支持")
+            raise RuntimeError(tr("只有 Claude / Codex 会话支持"))
 
     # --- codex: change model / effort / permissions inside the running session (its own pickers)
     def walk_menus(self, s, cmd, steps, done, timeout=6.0):
@@ -3451,7 +3551,7 @@ class Daemon:
 
         def step(i, deadline):
             if s.fd is None:
-                done("会话已退出")
+                done(SessionStateError(tr("会话已退出")))
                 return
             s.check_menu(now() + MENU_SETTLE)
             mn = s.menu
@@ -3460,7 +3560,7 @@ class Daemon:
                     done(None)
                 elif now() > deadline:
                     s.write(b"\x1b")
-                    done("Codex 还停在菜单“%s”，已取消" % mn.get("title"))
+                    done(tr("Codex 还停在菜单“%s”，已取消", mn.get("title")))
                 else:
                     self.later(0.2, lambda: step(i, deadline))
                 return
@@ -3469,7 +3569,7 @@ class Daemon:
                 if now() > deadline:
                     if mn:
                         s.write(b"\x1b")
-                    done("Codex 没有弹出预期的菜单（%s）" % (mn.get("title") if mn else "无菜单"))
+                    done(tr("Codex 没有弹出预期的菜单（%s）", mn.get("title") if mn else tr("无菜单")))
                 else:
                     self.later(0.2, lambda: step(i, deadline))
                 return
@@ -3477,7 +3577,7 @@ class Daemon:
             if choice is None:
                 s.write(b"\x1b")
                 self.later(0.2, lambda: s.write(b"\x1b"))
-                done("菜单里没有这个选项（%s）" % ", ".join(label(o) for o in mn["options"]))
+                done(tr("菜单里没有这个选项（%s）", ", ".join(label(o) for o in mn["options"])))
                 return
             idx, key = choice
             n = idx - mn["cursor"]
@@ -3488,7 +3588,7 @@ class Daemon:
             self.later(0.04 * len(keys) + 0.3, lambda: step(i + 1, now() + timeout))
 
         if s.status not in ("idle", "starting") or s.menu:
-            done("会话正忙，等这一轮结束再改")
+            done(SessionStateError(tr("会话正忙，等这一轮结束再改")))
             return
         self.type_text(s, cmd)
         self.later(0.4, lambda: step(0, now() + timeout))
@@ -3565,18 +3665,18 @@ class Daemon:
     def menu_op(self, s, index=None, key=None, gap=0.04):
         """Operate the picker on screen: move the cursor to index with arrow keys, then Enter; or Esc / "s"."""
         if s.fd is None:
-            raise RuntimeError("会话没有在运行")
+            raise RuntimeError(tr("会话没有在运行"))
         s.check_menu(now() + MENU_SETTLE)        # use the latest screen, even mid-burst
         mn = s.menu
         if not mn:
-            raise RuntimeError("当前没有菜单")
+            raise RuntimeError(tr("当前没有菜单"))
         if key is not None:
             if key not in MENU_KEYS:
-                raise RuntimeError("无效的按键")
+                raise RuntimeError(tr("无效的按键"))
             keys = [MENU_KEYS[key]]
         else:
             if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(mn["options"]):
-                raise RuntimeError("无效的选项")
+                raise RuntimeError(tr("无效的选项"))
             fwd, back = (b"\x1b[C", b"\x1b[D") if mn["kind"] == "slider" else (b"\x1b[B", b"\x1b[A")
             n = index - mn["cursor"]
             keys = [fwd if n > 0 else back] * abs(n) + [b"\r"]
@@ -3600,7 +3700,7 @@ class Daemon:
             done(claude_models([str(a) for a in argv], cur[-1].usage["model"] if cur else None), None)
             return
         if kind != "codex":
-            raise RuntimeError("无效的类型 %r" % kind)
+            raise RuntimeError(tr("无效的类型 %r", kind))
         argv = [os.path.expanduser(str(a)) if str(a).startswith("~/") else str(a)
                 for a in (argv if isinstance(argv, list) and argv else DEFAULT_PRESETS["codex"]["argv"])]
         cmd = tuple(codex_models_cmd(argv))
@@ -3625,8 +3725,8 @@ class Daemon:
             except Exception as e:
                 import subprocess
                 res = None
-                err = "codex debug models 超时" if isinstance(e, subprocess.TimeoutExpired) else \
-                    "codex debug models 失败: %s" % clip(str(e), 300)
+                err = tr("codex debug models 超时") if isinstance(e, subprocess.TimeoutExpired) else \
+                    tr("codex debug models 失败: %s", clip(str(e), 300))
             self.bg_done.append((finished, res, err))
         self.background(work)
 
@@ -3653,7 +3753,7 @@ class Daemon:
             try:
                 res, err = fetch_netinfo(), None
             except Exception as e:
-                res, err = None, "查询公网 IP 失败: %s" % clip(str(e) or type(e).__name__, 120)
+                res, err = None, tr("查询公网 IP 失败: %s", clip(str(e) or type(e).__name__, 120))
             self.bg_done.append((finished, res, err))
         self.background(work)
 
@@ -3700,11 +3800,11 @@ class Daemon:
         def step(left):
             s.check_mode()
             if s.fd is None:
-                done("会话已退出")
+                done(tr("会话已退出"))
             elif (s.cmode or "default") == target:
                 done(None)
             elif left <= 0:
-                done("没能切换到 %s（当前 %s），请在终端里按 Shift+Tab" % (target, s.cmode or "未知"))
+                done(tr("没能切换到 %s（当前 %s），请在终端里按 Shift+Tab", target, s.cmode or tr("未知")))
             else:
                 s.write(SHIFT_TAB)
                 self.later(gap, lambda: step(left - 1))
@@ -3746,6 +3846,11 @@ class Daemon:
                 kind = m.get("kind") if m.get("kind") in ("claude", "codex") else None
                 owned = [o.agent_session_id for o in self.sessions.values() if o.agent_session_id and o.fd is not None]
                 self.send(c, {"t": "history", "req": req, "items": list_history(kind, m.get("limit") or 30, owned)})
+            elif op == "lang":
+                global LANG
+                if m.get("lang") in ("zh", "en") and m["lang"] != LANG:
+                    LANG = m["lang"]
+                    self.save_state()
             elif op == "memory_config":
                 self.memory.configure(m.get("cfg") or {},
                                       lambda c=c, req=req: self.send(c, dict(self.memory.status(), t="memory_status", req=req)))
@@ -3797,7 +3902,7 @@ class Daemon:
                 self.netinfo(bool(m.get("refresh")), got)
             elif op == "speedtest":
                 if getattr(self, "_speed_busy", False):
-                    raise RuntimeError("测速正在进行")
+                    raise RuntimeError(tr("测速正在进行"))
                 self._speed_busy = True
 
                 def tested(res, err, c=c, req=req):
@@ -3808,7 +3913,7 @@ class Daemon:
                     try:
                         res, err = speed_test(), None
                     except Exception as e:
-                        res, err = None, "测速失败: %s" % clip(str(e) or type(e).__name__, 120)
+                        res, err = None, tr("测速失败: %s", clip(str(e) or type(e).__name__, 120))
                     self.bg_done.append((tested, res, err))
                 self.background(work)
             elif s is None:
@@ -3850,7 +3955,7 @@ class Daemon:
             elif op == "delete":
                 def deleted(ok, c=c, req=req, sid=sid):
                     self.send(c, {"t": "ok", "req": req, "sid": sid} if ok else
-                              {"t": "error", "req": req, "sid": sid, "msg": "删除失败"})
+                              {"t": "error", "req": req, "sid": sid, "msg": tr("删除失败")})
                 self.delete(s, deleted)
             elif op == "control":
                 def controlled(err, c=c, req=req, sid=sid):
@@ -3878,7 +3983,7 @@ class Daemon:
                 dec = m.get("decision")
                 pid = m.get("id") if isinstance(m.get("id"), str) else (s.pending or {}).get("id")
                 if not pid or pid not in s.pendings:
-                    self.send(c, {"t": "error", "req": req, "sid": sid, "msg": "这个授权请求已经处理过了"})
+                    self.send(c, {"t": "error", "req": req, "sid": sid, "msg": tr("这个授权请求已经处理过了")})
                 elif dec == "terminal":
                     s.resolve_pending(None, pid=pid)
                     self.send(c, {"t": "ok", "req": req})
@@ -3889,7 +3994,7 @@ class Daemon:
                     self.send(c, {"t": "error", "req": req, "msg": "bad decision"})
             elif op == "restart":
                 if s.kind not in ("claude", "codex"):
-                    raise RuntimeError("只有 Claude / Codex 会话可以更换 Key 重启")
+                    raise RuntimeError(tr("只有 Claude / Codex 会话可以更换 Key 重启"))
                 env = m.get("env")
                 if env is not None and not isinstance(env, dict):
                     raise RuntimeError("bad env")

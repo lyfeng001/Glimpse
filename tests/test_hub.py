@@ -981,6 +981,46 @@ def test_login_again_keeps_the_device(hub_mod):
     asyncio.run(run())
 
 
+def test_hub_language(hub_mod):
+    """op lang: validated, saved in config.json, sent to the machines (now and on every reconnect), in state;
+    the hub's own messages follow it."""
+    C, server = hub_mod
+
+    class FakeMachine:
+        def __init__(self):
+            self.id, self.sent, self.online = "M1", [], True
+
+        def write(self, obj):
+            self.sent.append(obj)
+
+    class P:
+        sent = []
+
+        def send(self, o):
+            self.sent.append(o)
+
+    async def run():
+        hub = server.Hub(C.load())
+        assert hub.lang() == "zh" and hub.state()["hub"]["lang"] == "zh" and server.tr("机器离线") == "机器离线"
+        fm = FakeMachine()
+        hub.machines = {"M1": fm}
+        p = P()
+        for bad in ("fr", None, 3):
+            await hub.phone_op(p, {"op": "lang", "lang": bad})
+        assert hub.lang() == "zh" and not fm.sent
+        await hub.phone_op(p, {"op": "lang", "lang": "en"})
+        assert hub.lang() == "en" and json.load(open(C.CONFIG))["hub"]["language"] == "en"
+        assert fm.sent == [{"op": "lang", "lang": "en"}] and hub.state()["hub"]["lang"] == "en"
+        assert server.tr("机器离线") == "Machine offline" and server.tr("未知机器 %s", "M9") == "Unknown machine M9"
+        assert not [x for x in p.sent if x.get("t") == "error"]            # not mistaken for a machine op
+        await hub.on_machine_msg(fm, {"t": "resync"})                       # a reconnect gets it again
+        assert fm.sent[-1] == {"op": "lang", "lang": "en"}
+        await hub.phone_op(p, {"op": "lang", "lang": "zh"})
+        assert server.tr("机器离线") == "机器离线"
+    asyncio.run(run())
+    server.HUB_LANG[0] = "zh"
+
+
 def test_cli_token_only_from_localhost(hub_mod):
     C, server = hub_mod
     hub = server.Hub(C.load())

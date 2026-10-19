@@ -1354,6 +1354,61 @@ def test_shell_init_completion_only_in_glimpse_zsh(capsys, tmp_path):
         assert r.stdout.strip() == "ok 0" and r.stderr == "", r.stderr
 
 
+def test_language_of_daemon_texts():
+    """tr(): Chinese by default (byte-identical to the source strings), English after op lang; every key has an
+    English text with the same placeholders; "continue" is typed in the same language."""
+    import ast
+    import io
+    import re
+    import tokenize
+    spec = re.compile(r"%[-#0 +]*\d*(?:\.\d+)?[sdrfx%]")
+    src = open(A.__file__, encoding="utf-8").read()
+    toks = list(tokenize.generate_tokens(io.StringIO(src).readline))
+    used = {ast.literal_eval(toks[i + 2].string) for i, t in enumerate(toks)
+            if t.type == tokenize.NAME and t.string == "tr" and toks[i + 1].string == "(" and toks[i + 2].type == tokenize.STRING}
+    assert used and used <= set(A.EN), sorted(used - set(A.EN))
+    assert all(spec.findall(k) == spec.findall(v) for k, v in A.EN.items())
+    old = A.LANG
+    try:
+        A.LANG = "zh"
+        assert A.tr("已完成本轮") == "已完成本轮" and A.continue_text() == "继续"
+        assert A.tr("未知模式 %s", "x") == "未知模式 x"
+        A.LANG = "en"
+        assert A.tr("已完成本轮") == "Turn done" and A.continue_text() == "continue"
+        assert A.tr("这个对话已经在会话 %s 中运行", "ab12") == "This conversation is already running in session ab12"
+        assert A.tr("不在词典里") == "不在词典里"                      # unknown: the source text
+        # a session-state error is recognised whatever the language (not by a Chinese prefix any more)
+        e = A.SessionStateError(A.tr("会话已退出"))
+        assert isinstance(e, str) and e == "The session exited" and isinstance(e, A.SessionStateError)
+    finally:
+        A.LANG = old
+
+
+def test_daemon_language_op_and_persistence(tmp_path):
+    d = A.Daemon.__new__(A.Daemon)
+    d.sdir = str(tmp_path)
+    d.order, d.sessions = [], {}
+
+    class Mem:
+        cfg = None
+    d.memory = Mem()
+    sent = []
+    d.send = lambda c, m: sent.append(m)
+    old = A.LANG
+    try:
+        A.LANG = "zh"
+        d.handle(None, {"op": "lang", "lang": "en"})
+        assert A.LANG == "en" and not [m for m in sent if m.get("t") == "error"]
+        assert json.load(open(d.state_file()))["lang"] == "en"
+        d.handle(None, {"op": "lang", "lang": "xx"})
+        assert A.LANG == "en"
+        A.LANG = "zh"                                       # a new daemon starts in Chinese ...
+        d.restore_state()
+        assert A.LANG == "en"                               # ... and takes the saved language back
+    finally:
+        A.LANG = old
+
+
 def test_transient_error_classification():
     t = A.is_transient_error
     assert t("stream disconnected before completion: Our servers are currently overloaded. Please try again later.")

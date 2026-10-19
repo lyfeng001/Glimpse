@@ -101,12 +101,24 @@ Glimpse turns your phone into a remote control for those sessions. What you see 
 
 ### 1. Install
 
+One line, on the computer that will be the hub (no sudo; it clones into `~/Glimpse`, creates the Python environment and `config.json`, and puts `gli` on your PATH):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/lyfeng001/Glimpse/main/install.sh | sh
+```
+
+`GLIMPSE_REF=v0.4.2` pins a release, `GLIMPSE_DIR` picks another place. Running it again updates the checkout (it stops if you changed files there) and never touches `config.json` or `data/`. To read it before it runs: `curl -fsSLo glimpse-install.sh <same URL>`, look, then `sh glimpse-install.sh`.
+
+Or by hand:
+
 ```sh
 git clone https://github.com/lyfeng001/Glimpse.git
 cd Glimpse
 ./gli setup            # creates .venv, installs dependencies, creates config.json from config.example.json
 ./gli install          # optional: puts `gli` on your PATH (symlink in ~/.local/bin)
 ```
+
+Dev boxes the hub reaches over ssh need no install at all (see Requirements).
 
 ### 2. Configure
 

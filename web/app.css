@@ -398,7 +398,9 @@ button.f-row:active, button.f-row:hover { background: var(--fill); }
 .f-ed-main:focus-within { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent-text) 55%, transparent); }
 /* phones: 16 px so iOS does not zoom into the field; the dock steps aside while typing */
 @media (pointer: coarse) { .f-ed-gut, .f-ed-hl, .f-ed-ta { font-size: 16px; } }
-@media (max-width: 1199px) { #view.files-only.f-typing > .dock, #view.files-only.f-typing .wstrip { display: none; } }
+/* (the widgets stay away the whole edit, not just while typing: coming back on blur, they moved the toolbar under a
+   finger tapping 保存) */
+@media (max-width: 1199px) { #view.files-only.f-typing > .dock, #view.files-only.f-editing .wstrip { display: none; } }
 .f-lang { flex: none; align-self: center; margin-left: auto; padding-left: var(--s2); font-size: 12px; color: var(--text-3); white-space: nowrap; }
 
 /* syntax highlighting (web/hl.js): file previews follow the theme; code blocks in chat sit on the dark terminal
@@ -828,6 +830,7 @@ dialog.sheet.tall { min-height: min(560px, calc(var(--app-h) - var(--safe-t) - 1
 /* ------------------------------------------------------------ v4: manual theme, model pickers, TUI menu card, slash commands */
 .tseg { display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px; padding: 2px; margin-top: 6px; border-radius: 10px; background: var(--fill-2); }
 @media (max-width: 520px) { .tseg { grid-template-columns: repeat(2, 1fr); } }      /* 2 x 2 on a phone */
+#opt-lang { grid-template-columns: repeat(3, 1fr); }                                  /* three: one row everywhere */
 .tseg button { min-height: 34px; border-radius: 8px; font-size: 14px; font-weight: 600; color: var(--text-2); display: inline-flex; align-items: center;
   justify-content: center; gap: 5px; }
 .tseg button .ic { width: 15px; height: 15px; }

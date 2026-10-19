@@ -79,6 +79,66 @@ log = logging.getLogger("glimpse.hub")
 PHONE_QUEUE_MAX = 4000       # messages; a phone that falls this far behind is disconnected
 VISIBLE_FRESH = 15           # s; a "visible" phone that has been silent longer is treated as gone (push again)
 UI_HOLD = 60                 # s; `gli new` waits this long for a Glimpse window on this computer to come on screen
+LANGS = ("zh", "en")         # hub.language: what the hub and the machines write (notifications, system lines)
+HUB_LANG = ["zh"]            # the current hub.language (set by Hub from its config); tr() reads it
+EN = {
+    "这台机器的 agent 版本较旧，需要更新": "This machine's agent is too old for this; update it",
+    "无效的 %s: %s": "Invalid %s: %s",
+    "设备": "Device",
+    "主机格式不对：只能是 ~/.ssh/config 里的 Host 名或 user@host":
+        "Invalid host: use a Host name from ~/.ssh/config or user@host",
+    "端口必须是数字": "The port must be a number",
+    "端口超出范围": "Port out of range",
+    "名称不能为空（最多 40 个字符）": "The name can't be empty (at most 40 characters)",
+    "默认目录无效": "Invalid default folder",
+    "无法运行 ssh: %s": "Can't run ssh: %s",
+    "连接超时": "Connection timed out",
+    "ssh 退出码 %s": "ssh exited with code %s",
+    "没有找到 python3: %s": "python3 not found: %s",
+    "python3 版本太旧 (%s.%s)，需要 3.8+": "python3 is too old (%s.%s); 3.8+ is needed",
+    "连接成功，python %s.%s": "Connected, python %s.%s",
+    "%s 不可用，已用 %s 重启并继续": "%s is unusable; restarted with %s and continued",
+    "%s 不可用，已自动换过 %d 次，请手动处理": "%s is unusable; already switched %d times, please handle it yourself",
+    "%s 不可用，没有其他可用的 Key": "%s is unusable and no other key is available",
+    "%s 不可用，切换到 %s 失败": "%s is unusable; switching to %s failed",
+    "%s 不可用，已切换到 %s 并继续": "%s is unusable; switched to %s and continued",
+    "Key 无效或已停用": "Key invalid or disabled",
+    "查询失败": "Lookup failed",
+    "查询失败：%s": "Lookup failed: %s",
+    "没有名为 %s 的 Key": "No key named %s",
+    "读取失败": "Reading failed",
+    "无效的均衡设置": "Invalid balancing settings",
+    "未知机器 %s": "Unknown machine %s",
+    "无效的文件请求": "Invalid file request",
+    "无效的文件内容": "Invalid file content",
+    "无效的操作": "Invalid operation",
+    "无效的值: %s": "Invalid value: %s",
+    "会话不存在": "No such session",
+    "无效的选项": "Invalid option",
+    "无效的按键": "Invalid key",
+    "超时": "Timed out",
+    "无效的记忆操作": "Invalid memory operation",
+    "记忆查询失败": "Memory query failed",
+    "机器离线": "Machine offline",
+    "测速超时": "Speed test timed out",
+    "测速失败": "Speed test failed",
+    "无效的会话 id": "Invalid session id",
+    "创建失败": "Creating failed",
+    "无效的类型": "Invalid type",
+    "获取模型列表失败": "Couldn't get the model list",
+    "重启失败": "Restart failed",
+    "本机不能改成 ssh 主机": "This computer can't become an ssh host",
+    "本机不能删除": "This computer can't be deleted",
+    "当前密码不正确": "The current password is wrong",
+    "Glimpse 测试通知": "Glimpse test notification",
+    "通知已经可以正常工作": "Notifications work",
+}
+
+
+def tr(zh, *args):
+    """The text in hub.language; args fill %s / %d like zh % args (the en text has the same ones)."""
+    s = EN.get(zh, zh) if HUB_LANG[0] == "en" else zh
+    return s % args if args else s
 CODE_CHECK_EVERY = 10        # s; how often the agent source on disk is checked against what the machines run
 FS_ACTIONS = ("list", "read", "git", "diff", "write", "create", "mkdir")
 FS_TEXT_LIMIT = 2 * 1024 * 1024   # characters in a saved / new file (the agent checks the encoded size too)
@@ -97,7 +157,7 @@ RUNTIME = {}                 # resolved hub.listen / tailscale_hostname ("auto" 
 def agent_error(r, default):
     """Error text of an agent reply; an agent too old for the op says so instead of "unknown op"."""
     msg = r.get("msg") or default
-    return "这台机器的 agent 版本较旧，需要更新" if msg.startswith("unknown op") else msg
+    return tr("这台机器的 agent 版本较旧，需要更新") if msg.startswith("unknown op") else msg
 
 
 def build_argv(kind, base, msg):
@@ -113,7 +173,7 @@ def build_argv(kind, base, msg):
         if v is None or v == "":
             return None
         if not isinstance(v, str) or not ARG_RE.match(v):
-            raise ValueError("无效的 %s: %s" % (name, str(v)[:40]))
+            raise ValueError(tr("无效的 %s: %s", name, str(v)[:40]))
         return v
     if kind == "claude":
         if val("model"):
@@ -152,7 +212,7 @@ def device_name(request):
             name = v
             break
     else:
-        name = "设备"
+        name = tr("设备")
     for k, v in (("Edg/", "Edge"), ("CriOS", "Chrome"), ("Chrome/", "Chrome"), ("Firefox/", "Firefox"),
                  ("Safari/", "Safari")):
         if k in ua:
@@ -174,7 +234,7 @@ def origin_ok(request):
 def check_host(host):
     host = str(host or "").strip()
     if not HOST_RE.match(host) or host.startswith("-"):
-        raise ValueError("主机格式不对：只能是 ~/.ssh/config 里的 Host 名或 user@host")
+        raise ValueError(tr("主机格式不对：只能是 ~/.ssh/config 里的 Host 名或 user@host"))
     return host
 
 
@@ -184,23 +244,23 @@ def check_port(port):
     try:
         port = int(port)
     except (TypeError, ValueError):
-        raise ValueError("端口必须是数字")
+        raise ValueError(tr("端口必须是数字"))
     if not 0 < port < 65536:
-        raise ValueError("端口超出范围")
+        raise ValueError(tr("端口超出范围"))
     return port
 
 
 def check_name(name):
     name = str(name or "").strip()
     if not name or len(name) > 40:
-        raise ValueError("名称不能为空（最多 40 个字符）")
+        raise ValueError(tr("名称不能为空（最多 40 个字符）"))
     return name
 
 
 def check_cwd(cwd):
     cwd = str(cwd or "~").strip() or "~"
     if len(cwd) > 300 or "\n" in cwd or "\0" in cwd:
-        raise ValueError("默认目录无效")
+        raise ValueError(tr("默认目录无效"))
     return cwd
 
 
@@ -217,23 +277,23 @@ async def ssh_test(host, port=None):
         proc = await asyncio.create_subprocess_exec(*argv, stdin=asyncio.subprocess.DEVNULL,
                                                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     except OSError as e:
-        return False, "无法运行 ssh: %s" % e
+        return False, tr("无法运行 ssh: %s", e)
     try:
         out, err = await asyncio.wait_for(proc.communicate(), 20)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
-        return False, "连接超时"
+        return False, tr("连接超时")
     out = out.decode("utf-8", "replace").strip()
     err = "; ".join(ln for ln in err.decode("utf-8", "replace").strip().splitlines()[-3:] if ln)
     if proc.returncode != 0:
-        return False, err or "ssh 退出码 %s" % proc.returncode
+        return False, err or tr("ssh 退出码 %s", proc.returncode)
     m = re.search(r"\((\d+), (\d+)\)", out)
     if not m:
-        return False, "没有找到 python3: %s" % (out or err)[:200]
+        return False, tr("没有找到 python3: %s", out or err)[:200]
     if (int(m.group(1)), int(m.group(2))) < (3, 8):
-        return False, "python3 版本太旧 (%s.%s)，需要 3.8+" % m.groups()
-    return True, "连接成功，python %s.%s" % m.groups()
+        return False, tr("python3 版本太旧 (%s.%s)，需要 3.8+", *m.groups())
+    return True, tr("连接成功，python %s.%s", *m.groups())
 
 
 class Phone:
@@ -277,6 +337,7 @@ class Phone:
 class Hub:
     def __init__(self, cfg):
         self.cfg = cfg
+        HUB_LANG[0] = self.lang()
         self.token = C.token()       # local CLI token: only accepted from 127.0.0.1
         self.auth = Auth(os.path.join(DATA, "auth.json"), C.write_secret)
         self.vapid = webpush.Vapid(os.path.join(DATA, "vapid.json"))
@@ -427,7 +488,7 @@ class Hub:
             if hot is None:
                 return None
             asyncio.ensure_future(self.continue_after_swap(m, sid, hot))
-            return {"kind": "keyswap", "title": "%s 不可用，已用 %s 重启并继续" % (prev, cur), "body": ev.get("body") or "",
+            return {"kind": "keyswap", "title": tr("%s 不可用，已用 %s 重启并继续", prev, cur), "body": ev.get("body") or "",
                     "ts": ev.get("ts")}
         if KB.mode_of(self.cfg) == "off" or cur not in KB.pool(self.cfg):
             return None
@@ -436,16 +497,16 @@ class Hub:
         t = time.time()
         recent = [x for x in self.key_swaps.get((m.id, sid), []) if t - x < KB.SWAP_WINDOW]
         if len(recent) >= KB.SWAP_LIMIT:
-            return dict(ev, title="%s 不可用，已自动换过 %d 次，请手动处理" % (cur, len(recent)))
+            return dict(ev, title=tr("%s 不可用，已自动换过 %d 次，请手动处理", cur, len(recent)))
         new = self.best_key(avoid=(cur,), any_window=True)    # the replacement must work now, 5 h window included
         if not new:
-            return dict(ev, title="%s 不可用，没有其他可用的 Key" % cur)
+            return dict(ev, title=tr("%s 不可用，没有其他可用的 Key", cur))
         self.key_swaps[(m.id, sid)] = recent + [t]
         hot = await self.switch_key(m, sid, s.get("kind"), new, cold=True)
         if hot is None:
-            return dict(ev, title="%s 不可用，切换到 %s 失败" % (cur, new))
+            return dict(ev, title=tr("%s 不可用，切换到 %s 失败", cur, new))
         asyncio.ensure_future(self.continue_after_swap(m, sid, hot))
-        return {"kind": "keyswap", "title": "%s 不可用，已切换到 %s 并继续" % (cur, new), "body": ev.get("body") or "",
+        return {"kind": "keyswap", "title": tr("%s 不可用，已切换到 %s 并继续", cur, new), "body": ev.get("body") or "",
                 "ts": ev.get("ts")}
 
     async def switch_key(self, m, sid, kind, name, cold=False):
@@ -479,7 +540,7 @@ class Hub:
                 break
             await asyncio.sleep(1)
         try:
-            m.write({"op": "text", "sid": sid, "text": "继续"})
+            m.write({"op": "text", "sid": sid, "text": "continue" if HUB_LANG[0] == "en" else "继续"})
         except ConnectionError:
             pass
 
@@ -511,8 +572,8 @@ class Hub:
                     j = await r.json(content_type=None)
                 if not isinstance(j, dict) or j.get("code") != 200:
                     msg = (j.get("code_reason") or j.get("code_msg")) if isinstance(j, dict) else None
-                    msg = "Key 无效或已停用" if str(msg).strip().lower() == "no response" else msg
-                    return {"ts": time.time(), "error": str(msg or "查询失败")[:80]}
+                    msg = tr("Key 无效或已停用") if str(msg).strip().lower() == "no response" else msg
+                    return {"ts": time.time(), "error": str(msg or tr("查询失败"))[:80]}
                 d = j.get("resp_data") or {}
                 if ep == "limit":
                     out["windows"] = [{"limit": w.get("limit"), "used": round(float(w.get("used") or 0), 2),
@@ -526,7 +587,7 @@ class Hub:
                     out["today_requests"] = int(d.get("today_req_cnt") or 0)
                     out["total_cost"] = round(float(d.get("total_cost") or 0), 2)
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as e:
-                return {"ts": time.time(), "error": "查询失败：%s" % (str(e) or type(e).__name__)[:80]}
+                return {"ts": time.time(), "error": tr("查询失败：%s", str(e) or type(e).__name__)[:80]}
         return out
 
     async def code_watch_loop(self):
@@ -599,7 +660,7 @@ class Hub:
             return None
         p = C.profile(self.cfg, key_name)
         if not p:
-            raise ValueError("没有名为 %s 的 Key" % key_name)
+            raise ValueError(tr("没有名为 %s 的 Key", key_name))
         return C.key_env(self.cfg, kind, p.get("value"))
 
     # --- machine side
@@ -614,12 +675,24 @@ class Hub:
         return out
 
     def state(self):
-        return {"t": "state", "hub": {"version": VERSION, "web": WEB_BUILD}, "keys": self.keys_view(), "balance": self.balance_view(),
+        return {"t": "state", "hub": {"version": VERSION, "web": WEB_BUILD, "lang": self.lang()}, "keys": self.keys_view(), "balance": self.balance_view(),
                 "options": self.options(),
                 "machines": [self.machines[k].info(self.presets_view(self.machines[k])) for k in self.order]}
 
     def on_machine_state(self, m):
         self.state_dirty.set()
+
+    def lang(self):
+        v = self.cfg["hub"].get("language")
+        return v if v in LANGS else "zh"
+
+    def send_lang(self, m):
+        """The machine's daemon writes system lines, statuses and notification texts in this language (an older
+        agent ignores the op)."""
+        try:
+            m.write({"op": "lang", "lang": self.lang()})
+        except ConnectionError:
+            pass
 
     async def state_loop(self):
         while True:
@@ -640,6 +713,7 @@ class Hub:
             for p in list(self.phones):
                 p.send({"t": "resync", "m": m.id})
             asyncio.ensure_future(self.memory_config(m))
+            self.send_lang(m)
             return
         if t in ("out", "chat"):
             key = (m.id, msg.get("sid"))
@@ -668,7 +742,7 @@ class Hub:
             if info.get("op") == "fs" and t == "error":
                 # an agent without file browsing (older) or a session that is gone: shown in the files view
                 p.send({"t": "fs", "m": m.id, "sid": info.get("sid"), "action": info.get("action"), "path": info.get("path"),
-                        "error": agent_error(msg, "读取失败")})
+                        "error": agent_error(msg, tr("读取失败"))})
                 return
             out = dict(msg, m=m.id)
             if t == "error" and not out.get("sid") and info.get("sid"):
@@ -754,11 +828,23 @@ class Hub:
         if op == "key_usage":
             self.key_usage_wake.set()         # refresh now; the result arrives with the next state
             return
+        if op == "lang":
+            # the language picked by hand on a device: for what the hub and the machines write (notifications,
+            # system lines in chat, errors)
+            lang = msg.get("lang")
+            if lang in LANGS and lang != self.lang():
+                self.cfg["hub"]["language"] = lang
+                HUB_LANG[0] = lang
+                C.save(self.cfg)
+                for m in self.machines.values():
+                    self.send_lang(m)
+                self.state_dirty.set()
+            return
         if op == "key_balance":
             mode, ex = msg.get("mode"), msg.get("exclude")
             names = {x.get("name") for x in self.cfg["keys"].get("profiles") or []}
             if mode not in KB.MODES or not isinstance(ex, list) or any(not isinstance(x, str) or x not in names for x in ex):
-                p.send({"t": "error", "op": op, "msg": "无效的均衡设置"})
+                p.send({"t": "error", "op": op, "msg": tr("无效的均衡设置")})
                 return
             self.cfg["keys"]["balance"] = {"mode": mode, "exclude": sorted(set(ex))}
             C.save(self.cfg)
@@ -776,7 +862,7 @@ class Hub:
             return
         m = self.machines.get(msg.get("m")) if isinstance(msg.get("m"), str) else None
         if m is None:
-            p.send({"t": "error", "msg": "未知机器 %s" % msg.get("m")})
+            p.send({"t": "error", "msg": tr("未知机器 %s", msg.get("m"))})
             return
         sid = msg.get("sid")
         if sid is not None and not isinstance(sid, str):
@@ -809,34 +895,34 @@ class Hub:
                 # request to that directory and refuses Glimpse's own data and .git
                 action, path = msg.get("action"), msg.get("path") or ""
                 if not sid or action not in FS_ACTIONS or not isinstance(path, str) or len(path) > 4096:
-                    raise ValueError("无效的文件请求")
+                    raise ValueError(tr("无效的文件请求"))
                 out = {"op": "fs", "sid": sid, "action": action, "path": path, "force": bool(msg.get("force"))}
                 if action in ("write", "create"):
                     text, sig = msg.get("text"), msg.get("sig")
                     if not isinstance(text, str) or len(text) > FS_TEXT_LIMIT or (action == "write" and not
                                                                                    (isinstance(sig, str) and re.fullmatch(r"[0-9a-f]{16}", sig))):
-                        raise ValueError("无效的文件内容")
+                        raise ValueError(tr("无效的文件内容"))
                     out.update(text=text, sig=sig if action == "write" else None)
                 self.forward(p, m, out)
             elif op == "control":
                 action, value = msg.get("action"), msg.get("value")
                 if action not in CONTROL_ACTIONS or not isinstance(value, str) or len(value) > 500:
-                    raise ValueError("无效的操作")
+                    raise ValueError(tr("无效的操作"))
                 if action != "goal" and value and not ARG_RE.match(value):
-                    raise ValueError("无效的值: %s" % value[:40])
+                    raise ValueError(tr("无效的值: %s", value[:40]))
                 self.forward(p, m, {"op": "control", "sid": sid, "action": action, "value": value})
             elif op == "menu":
                 index, key = msg.get("index"), msg.get("key")
                 if not sid:
-                    raise ValueError("会话不存在")
+                    raise ValueError(tr("会话不存在"))
                 if index is not None:
                     if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index <= 30:
-                        raise ValueError("无效的选项")
+                        raise ValueError(tr("无效的选项"))
                     self.forward(p, m, {"op": "menu", "sid": sid, "index": index})
                 elif key in MENU_KEYS:
                     self.forward(p, m, {"op": "menu", "sid": sid, "key": key})
                 else:
-                    raise ValueError("无效的按键")
+                    raise ValueError(tr("无效的按键"))
             elif op == "models":
                 await self.models(p, m, msg)
             elif op == "memory":
@@ -865,7 +951,7 @@ class Hub:
             else:
                 p.send({"t": "error", "msg": "unknown op %s" % op})
         except (ConnectionError, asyncio.TimeoutError) as e:
-            p.send({"t": "error", "m": m.id, "sid": sid, "msg": "%s: %s" % (m.name, str(e) or "超时")})
+            p.send({"t": "error", "m": m.id, "sid": sid, "msg": "%s: %s" % (m.name, str(e) or tr("超时"))})
         except ValueError as e:
             p.send({"t": "error", "m": m.id, "sid": sid, "msg": str(e)})
 
@@ -887,11 +973,11 @@ class Hub:
     async def memory(self, p, m, msg):
         action = msg.get("action")
         if action not in MEMORY_ACTIONS:
-            raise ValueError("无效的记忆操作")
+            raise ValueError(tr("无效的记忆操作"))
         q = {k: msg.get(k) for k in ("project", "q", "budget", "dry_run") if msg.get(k) is not None}
         r = await m.call(dict(q, op="memory", action=action), timeout=900 if action == "compact" else 90)
         if r.get("t") != "memory":
-            raise ValueError(r.get("msg") or "记忆查询失败")
+            raise ValueError(r.get("msg") or tr("记忆查询失败"))
         st = r.get("status") or {}
         m.memory = {k: v for k, v in st.items() if k != "store"}
         p.send({"t": "memory", "m": m.id, "action": action, "project": msg.get("project"), "data": r.get("data")})
@@ -907,7 +993,7 @@ class Hub:
         if r.get("t") == "netinfo":
             m.netinfo = {k: r.get(k) for k in ("ip", "city", "region", "country", "org", "timezone", "ts")}
         else:
-            m.netinfo = {"error": agent_error(r, "查询失败"), "ts": time.time()}
+            m.netinfo = {"error": agent_error(r, tr("查询失败")), "ts": time.time()}
         self.state_dirty.set()
 
     async def machine_speedtest(self, p, m):
@@ -925,13 +1011,13 @@ class Hub:
         try:
             r = await m.call({"op": "speedtest"}, timeout=40)
         except ConnectionError:
-            r = {"t": "error", "msg": "机器离线"}
+            r = {"t": "error", "msg": tr("机器离线")}
         except asyncio.TimeoutError:
-            r = {"t": "error", "msg": "测速超时"}
+            r = {"t": "error", "msg": tr("测速超时")}
         if r.get("t") == "speedtest":
             m.speed = {k: r.get(k) for k in ("down_bps", "ttfb_ms", "bytes", "secs")}
         else:
-            m.speed = {"error": agent_error(r, "测速失败")}
+            m.speed = {"error": agent_error(r, tr("测速失败"))}
         m.speed["ts"] = time.time()
         self.state_dirty.set()
 
@@ -942,7 +1028,7 @@ class Hub:
         argv = build_argv(kind, base, msg)
         resume_id = msg.get("resume_id")
         if resume_id is not None and (kind == "shell" or not isinstance(resume_id, str) or not RESUME_RE.match(resume_id)):
-            raise ValueError("无效的会话 id")
+            raise ValueError(tr("无效的会话 id"))
         key = msg.get("key") or preset.get("key")
         if kind != "shell" and not msg.get("key") and KB.mode_of(self.cfg) == "least_used":
             key = self.best_key() or key       # "默认" = let the balancer choose
@@ -957,13 +1043,13 @@ class Hub:
                 out["existing"] = True       # the conversation already had a session: the phone just opens it
             p.send(out)
         else:
-            p.send({"t": "error", "m": m.id, "msg": r.get("msg") or "创建失败"})
+            p.send({"t": "error", "m": m.id, "msg": r.get("msg") or tr("创建失败")})
 
     async def models(self, p, m, msg):
         """Real model / effort / mode lists from the agent (codex asks its CLI), cached per (machine, kind)."""
         kind = msg.get("kind")
         if kind not in ("claude", "codex"):
-            raise ValueError("无效的类型")
+            raise ValueError(tr("无效的类型"))
         k = (m.id, kind)
         hit = self.models_cache.get(k)
         if hit is None or time.time() - hit[0] > MODELS_TTL:
@@ -977,10 +1063,10 @@ class Hub:
             try:
                 r = await asyncio.shield(fut)
             except (ConnectionError, asyncio.TimeoutError) as e:
-                r = {"t": "error", "msg": "%s: %s" % (m.name, str(e) or "超时")}
+                r = {"t": "error", "msg": "%s: %s" % (m.name, str(e) or tr("超时"))}
             if r.get("t") != "models":
                 p.send({"t": "error", "op": "models", "m": m.id, "kind": kind,
-                        "msg": r.get("msg") or "获取模型列表失败"})
+                        "msg": r.get("msg") or tr("获取模型列表失败")})
                 return
             hit = (time.time(), {x: r.get(x) or [] for x in ("models", "efforts", "modes")})
             self.models_cache[k] = hit
@@ -990,7 +1076,7 @@ class Hub:
         sid = msg.get("sid")
         s = m.sessions.get(sid)
         if not s:
-            raise ValueError("会话不存在")
+            raise ValueError(tr("会话不存在"))
         kind = s.get("kind")
         env, key = None, None
         nk = msg.get("new_key")
@@ -1003,7 +1089,7 @@ class Hub:
                 self.cfg["keys"]["profiles"] = profs
                 C.save(self.cfg)
                 self.state_dirty.set()
-            key = name or "自定义"
+            key = name or "自定义"                # (a name, not a message: the same in every language)
             env = C.key_env(self.cfg, kind, value)
         elif msg.get("key"):
             key = msg["key"]
@@ -1017,7 +1103,7 @@ class Hub:
                 self.note_swap(m, sid, s.get("key"), bool(r.get("hot")))
             p.send({"t": "restarted", "m": m.id, "sid": sid, "hot": bool(r.get("hot")), "key": key})
         else:
-            p.send({"t": "error", "m": m.id, "sid": sid, "msg": r.get("msg") or "重启失败"})
+            p.send({"t": "error", "m": m.id, "sid": sid, "msg": r.get("msg") or tr("重启失败")})
 
     # --- machines managed from the phone
     async def machine_op(self, p, op, msg):
@@ -1044,7 +1130,7 @@ class Hub:
             mid = msg.get("m")
             mc = next((x for x in mcs if x.get("id") == mid), None) if isinstance(mid, str) else None
             if mc is None:
-                raise ValueError("未知机器 %s" % mid)
+                raise ValueError(tr("未知机器 %s", mid))
             m = self.machines.get(mid)
             if op == "machine_update":
                 if "name" in msg:
@@ -1065,7 +1151,7 @@ class Hub:
                         else:
                             mc.pop("port", None)
                 elif "host" in msg or "port" in msg:
-                    raise ValueError("本机不能改成 ssh 主机")
+                    raise ValueError(tr("本机不能改成 ssh 主机"))
                 C.save(self.cfg)
                 if m:
                     m.name = mc.get("name") or m.id
@@ -1073,7 +1159,7 @@ class Hub:
                         m.reconnect_fresh()
             else:
                 if mc.get("type") == "local":
-                    raise ValueError("本机不能删除")
+                    raise ValueError(tr("本机不能删除"))
                 mcs.remove(mc)
                 C.save(self.cfg)
                 if m:
@@ -1245,7 +1331,7 @@ class Hub:
         body = await self.json_body(request)
         if self.auth.has_password() and not self.auth.check_password(body.get("current")):
             self.auth.failed(self.client_ip(request))
-            raise web.HTTPForbidden(text="当前密码不正确")
+            raise web.HTTPForbidden(text=tr("当前密码不正确"))
         try:
             self.auth.set_password(body.get("new"))
         except ValueError as e:
@@ -1293,7 +1379,7 @@ class Hub:
         return web.json_response({"ok": True})
 
     async def push_test(self, request):
-        await self.push_all({"title": "Glimpse 测试通知", "body": "通知已经可以正常工作", "tag": "test", "url": "/"})
+        await self.push_all({"title": tr("Glimpse 测试通知"), "body": tr("通知已经可以正常工作"), "tag": "test", "url": "/"})
         return web.json_response({"ok": True, "count": len(self.push_subs)})
 
     # --- `gli new` / the Finder Quick Action: open the new-session form in the Glimpse window on this computer.

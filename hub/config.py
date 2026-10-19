@@ -16,7 +16,10 @@ DEFAULTS = {
     # host "auto" = this computer's Tailscale IP, tailscale_hostname "auto" = its MagicDNS name
     "hub": {"listen": [{"host": "auto", "port": 8443}, {"host": "127.0.0.1", "port": 8443}],
             "tailscale_hostname": "auto", "caffeinate": True,
-            "push_subject": "mailto:glimpse@users.noreply.github.com", "approval_wait_seconds": 600},
+            "push_subject": "mailto:glimpse@users.noreply.github.com", "approval_wait_seconds": 600,
+            # what the hub and the machines write (notifications, system lines in chat): "zh" | "en"; set from
+            # Settings → 外观 → 语言 when a language is picked by hand
+            "language": "zh"},
     # usage_url: optional key-usage API (POST <url>/limit and /summary with the key as Bearer),
     # e.g. "https://api.funcloud.ai/v1/model/key-usage"; empty = no usage shown
     # balance (optional, off by default): "off" | "on_exhausted" (a session whose key runs out of balance / is

@@ -1402,10 +1402,15 @@ def new_session_url(cfg, path):
     if not os.path.isdir(p):
         p = os.path.dirname(p)
     q = "cwd=" + quote(p, safe="")
-    local = next((m for m in cfg.get("machines") or [] if m.get("type") == "local" and m.get("id")), None)
-    if local:
-        q += "&m=" + quote(str(local["id"]), safe="")
+    mid = local_machine_id(cfg)
+    if mid:
+        q += "&m=" + quote(mid, safe="")
     return hub_base_url(cfg) + "#new?" + q
+
+
+def local_machine_id(cfg):
+    m = next((m for m in cfg.get("machines") or [] if m.get("type") == "local" and m.get("id")), None)
+    return str(m["id"]) if m else ""
 
 
 async def serve(cfg, hub):

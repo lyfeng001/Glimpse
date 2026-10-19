@@ -347,28 +347,36 @@ def test_finder_quick_action(tmp_path):
     import shlex
     import subprocess
     import finder
-    gli = "/Users/x/my code/glimpse/gli"
-    dest = finder.write(str(tmp_path / "Glimpse.workflow"), gli, "/opt/homebrew/bin:/usr/bin:/bin")
+    from urllib.parse import parse_qs, urlsplit
+    dest = finder.write(str(tmp_path / "Glimpse.workflow"), "https://mac.tail.ts.net:8443/", "M1")
     info = plistlib.load(open(os.path.join(dest, "Contents", "Info.plist"), "rb"))
     svc = info["NSServices"][0]
     assert svc["NSMenuItem"]["default"] == finder.MENU and svc["NSMessage"] == "runWorkflowAsService"
     assert svc["NSRequiredContext"]["NSApplicationIdentifier"] == "com.apple.finder"
+    assert svc["NSSendFileTypes"] == ["public.folder"]
     assert finder.ours(dest) and not finder.ours(str(tmp_path))
     doc = plistlib.load(open(os.path.join(dest, "Contents", "document.wflow"), "rb"))
     p = doc["actions"][0]["action"]["ActionParameters"]
     assert p["inputMethod"] == 1 and p["shell"] == "/bin/sh"           # the selection arrives as "$@", not as text
     assert doc["workflowMetaData"]["serviceApplicationBundleID"] == "com.apple.finder"
-    # the script: the installer's PATH (tailscale), then `gli new` with the selected path as one argument
+    cmd = p["COMMAND_STRING"]
+    # Quick Actions may not touch ~/Documents (where the project lives): the script runs nothing from the project
+    assert ROOT not in cmd and os.path.abspath(ROOT) not in cmd and "gli" not in cmd
+    if sys.platform != "darwin":
+        return
+    for f in ("Info.plist", "document.wflow"):
+        subprocess.run(["plutil", "-lint", os.path.join(dest, "Contents", f)], check=True, capture_output=True)
+    # run it with `open` replaced by printf: the link for the selected folder (one argument, never evaluated)
     sh = tmp_path / "run.sh"
-    assert shlex.quote(gli) in p["COMMAND_STRING"]
-    sh.write_text(p["COMMAND_STRING"].replace(shlex.quote(gli), "printf '%s|' \"$PATH\""))
-    out = subprocess.run(["/bin/sh", str(sh), "/tmp/a b/$(x)"], capture_output=True, text=True).stdout
-    assert out == "/opt/homebrew/bin:/usr/bin:/bin|new|/tmp/a b/$(x)|"          # one argument, never evaluated
-    out = subprocess.run(["/bin/sh", str(sh)], capture_output=True, text=True, env={"HOME": "/h"}).stdout
-    assert out.endswith("|new|/h|")                                              # nothing selected: home
-    if sys.platform == "darwin":
-        for f in ("Info.plist", "document.wflow"):
-            subprocess.run(["plutil", "-lint", os.path.join(dest, "Contents", f)], check=True, capture_output=True)
+    sh.write_text(cmd.replace("/usr/bin/open", "printf '%s'"))
+    d = "/Users/x/我的 项目 & #1/$(touch boom)"
+    url = subprocess.run(["/bin/sh", str(sh), d], capture_output=True, text=True, cwd=str(tmp_path)).stdout
+    assert url.startswith("https://mac.tail.ts.net:8443/#new?")
+    q = parse_qs(urlsplit(url).fragment[4:])
+    assert q["cwd"] == [d] and q["m"] == ["M1"] and not (tmp_path / "boom").exists()
+    assert subprocess.run(["/bin/sh", str(sh)], capture_output=True, text=True).stdout == ""   # nothing selected
+    sh.write_text(finder.script("https://h:1/", "").replace("/usr/bin/open", "printf '%s'"))
+    assert subprocess.run(["/bin/sh", str(sh), "/a"], capture_output=True, text=True).stdout == "https://h:1/#new?cwd=%2Fa"
 
 
 def test_create_ultracode_and_codex_ultra_control(hub_mod):

@@ -30,6 +30,24 @@ import machines as M  # noqa: E402
 ROOT = C.ROOT
 WEB = os.path.join(ROOT, "web")
 DATA = C.DATA
+
+
+def web_build():
+    """Fingerprint of the web app's files: an open page that loaded other code reloads itself (a page left open
+    across a hub update would otherwise keep running the old code)."""
+    h = hashlib.sha256()
+    for dp, dns, fns in os.walk(WEB):
+        dns.sort()
+        for fn in sorted(fns):
+            if fn.endswith((".js", ".css", ".html", ".webmanifest")):
+                p = os.path.join(dp, fn)
+                h.update(os.path.relpath(p, WEB).encode() + b"\0")
+                with open(p, "rb") as f:
+                    h.update(f.read())
+    return h.hexdigest()[:12]
+
+
+WEB_BUILD = web_build()
 VERSION = "0.4.1"
 log = logging.getLogger("glimpse.hub")
 PHONE_QUEUE_MAX = 4000       # messages; a phone that falls this far behind is disconnected
@@ -570,7 +588,7 @@ class Hub:
         return out
 
     def state(self):
-        return {"t": "state", "hub": {"version": VERSION}, "keys": self.keys_view(), "balance": self.balance_view(),
+        return {"t": "state", "hub": {"version": VERSION, "web": WEB_BUILD}, "keys": self.keys_view(), "balance": self.balance_view(),
                 "options": self.options(),
                 "machines": [self.machines[k].info(self.presets_view(self.machines[k])) for k in self.order]}
 
@@ -723,7 +741,6 @@ class Hub:
             return
         if op == "visible":
             p.visible = bool(msg.get("v"))
-            self.ui_flush()
             return
         if op in ("machine_test", "machine_add", "machine_update", "machine_remove"):
             try:
@@ -1281,21 +1298,27 @@ class Hub:
         if not (isinstance(mid, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,32}", mid)):
             mid = None                           # (an unknown one: the web app falls back to this computer)
         self.ui_pending = {"t": "ui_new", "cwd": cwd, "m": mid, "until": time.time() + UI_HOLD}
-        return web.json_response({"ok": True, "delivered": self.ui_flush()})
+        done = self.ui_flush()
+        if not done:
+            log.info("new-session form: no Glimpse window open on this computer yet, waiting %ds", UI_HOLD)
+        return web.json_response({"ok": True, "delivered": done})
 
     def ui_flush(self):
-        """Hand a pending ui_new to the local windows on screen. True when one got it."""
+        """Hand a pending ui_new to the Glimpse windows open on this computer (logged-in browsers on 127.0.0.1,
+        whether in front or not: the caller brings the window up next). None open yet: it waits for the next one
+        that connects, up to UI_HOLD. True when a window got it."""
         u = self.ui_pending
         if not u:
             return False
         if time.time() > u["until"]:
             self.ui_pending = None
             return False
-        to = [p for p in self.phones if p.local and p.on_screen()]
+        to = [p for p in self.phones if p.local and p.device and not p.ws.closed]
         for p in to:
             p.send({k: v for k, v in u.items() if k != "until"})
         if to:
             self.ui_pending = None
+            log.info("new-session form handed to %d Glimpse window(s) on this computer", len(to))
         return bool(to)
 
     async def ws(self, request):
@@ -1307,6 +1330,10 @@ class Hub:
         p = Phone(ws, dev and dev["id"], local=self.is_local(request))
         self.phones.add(p)
         p.send(self.state())
+        if p.local and p.device:
+            log.info("Glimpse window on this computer connected (%d open)",
+                     sum(1 for x in self.phones if x.local and x.device))
+            self.ui_flush()                      # a form asked for before this window was open
         try:
             async for msg in ws:
                 if msg.type != aiohttp.WSMsgType.TEXT:

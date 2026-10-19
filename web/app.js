@@ -634,6 +634,25 @@ document.addEventListener('visibilitychange', () => {
   send({ op: 'visible', v: onScreen() });
 });
 for (const ev of ['focus', 'blur']) window.addEventListener(ev, () => send({ op: 'visible', v: onScreen() }));
+// ---- the hub serves newer web code than this page runs (a window left open across an update): reload, but only
+// while nobody looks at it and nothing would be lost (no unsaved edit, no sheet open); else on the next blur / hide
+function checkBuild(b) {
+  if (!b) return;
+  if (!S.webBuild) { S.webBuild = b; return; }        // what this page loaded with
+  if (b === S.webBuild || S.reloadWanted) return;
+  S.reloadWanted = true;
+  if (!reloadIfSafe()) toast('Glimpse 已更新', '切到别的窗口后会自动刷新，或点这里现在刷新', () => reloadIfSafe(true), 'done');
+}
+function reloadIfSafe(now) {
+  if (!S.reloadWanted) return false;
+  if ((FS.edit && FS.edit.text !== FS.edit.base) || $$('dialog[open]').length) return false;
+  if (!now && onScreen()) return false;
+  draftSave(); edStash();
+  location.reload();
+  return true;
+}
+window.addEventListener('blur', () => setTimeout(reloadIfSafe, 300));
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') reloadIfSafe(); });
 setInterval(() => { if (document.visibilityState === 'visible') ping(); }, 5000);
 // websocket download rate, sampled every second
 setInterval(() => {
@@ -655,6 +674,7 @@ function onMsg(m) {
         }
       }
       S.keys = m.keys || []; S.balance = m.balance || null; S.hub = m.hub || null; S.options = m.options || null; S.haveState = true;
+      checkBuild(S.hub && S.hub.web);
       renderHome();
       if (S.view) renderView();
       refreshOpenSheets();

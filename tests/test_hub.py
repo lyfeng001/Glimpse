@@ -505,23 +505,33 @@ def test_ui_new_through_the_hub(hub_mod, tmp_path, monkeypatch):
                 mp.setattr(server.Hub, "client_ip", staticmethod(lambda req: "100.64.1.2"))
                 r = await client.post("/api/ui/new", json={"cwd": "/a"}, headers={"Authorization": "Bearer " + tok})
                 assert r.status == 401
-            # no window on screen: held, and handed over when one comes on screen (not to a phone elsewhere)
+            # an open window that is not in front (Finder is) still gets it: the caller brings it up afterwards
             await win.send_json({"op": "visible", "v": False})
             await asyncio.sleep(0.05)
-            for ph in hub.phones:
-                ph.local = True
-            r = await client.post("/api/ui/new", json={"cwd": "/held"}, headers={"Authorization": "Bearer " + tok})
-            assert (await r.json())["delivered"] is False
+            r = await client.post("/api/ui/new", json={"cwd": "/bg"}, headers={"Authorization": "Bearer " + tok})
+            assert (await r.json())["delivered"] is True
+            assert json.loads((await win.receive(timeout=3)).data)["cwd"] == "/bg"
+            # no Glimpse window on this computer (only a phone elsewhere, and `gli attach` with the CLI token): held,
+            # then handed to the window that opens next
             for ph in hub.phones:
                 ph.local = False                       # as if it were a phone over Tailscale
-            await win.send_json({"op": "visible", "v": True})
-            await asyncio.sleep(0.1)
-            assert hub.ui_pending is not None
-            for ph in hub.phones:
-                ph.local = True
-            await win.send_json({"op": "visible", "v": True})
-            assert json.loads((await win.receive(timeout=3)).data)["cwd"] == "/held" and hub.ui_pending is None
-            await win.close()
+            cli = await client.ws_connect("/ws", headers={"Authorization": "Bearer " + hub.token})
+            assert json.loads((await cli.receive()).data)["hub"]["web"] == server.WEB_BUILD
+            r = await client.post("/api/ui/new", json={"cwd": "/held"}, headers={"Authorization": "Bearer " + tok})
+            assert (await r.json())["delivered"] is False and hub.ui_pending is not None
+            win2 = await client.ws_connect("/ws", headers=sess)
+            assert json.loads((await win2.receive(timeout=3)).data)["t"] == "state"
+            assert json.loads((await win2.receive(timeout=3)).data) == {"t": "ui_new", "cwd": "/held", "m": None}
+            assert hub.ui_pending is None
+            for w in (win, cli):                       # neither the phone nor the CLI got it
+                while True:
+                    try:
+                        m = json.loads((await w.receive(timeout=0.3)).data)
+                    except asyncio.TimeoutError:
+                        break
+                    assert m["t"] != "ui_new" or m["cwd"] != "/held"
+            for w in (win, win2, cli):
+                await w.close()
         finally:
             await client.close()
     asyncio.run(run())

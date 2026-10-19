@@ -4651,12 +4651,32 @@ _glimpse_wrap() {
 }
 claude() { _glimpse_wrap claude "$@"; }
 codex() { _glimpse_wrap codex "$@"; }
+# A Glimpse terminal (zsh) has no Warp around it: Tab completion with a menu, and grey suggestions from your
+# history (zsh-autosuggestions, if installed; → or End accepts). Other terminals are left alone.
+if [ -n "${ZSH_VERSION:-}" ] && [ "${TERM_PROGRAM:-}" = glimpse ] && [ -z "${ZSH_EXECUTION_STRING:-}" ]; then
+  if ! whence compdef >/dev/null 2>&1; then autoload -Uz compinit && compinit -i; fi
+  zstyle ':completion:*' menu select
+  zstyle ':completion:*' matcher-list 'm:{a-z}={A-Za-z}'
+  for _glimpse_f in %(suggest)s; do
+    if [ -r "$_glimpse_f" ]; then
+      set -A ZSH_AUTOSUGGEST_STRATEGY history completion
+      . "$_glimpse_f"
+      break
+    fi
+  done
+  unset _glimpse_f
+fi
 '''
+SUGGEST_PATHS = ["/opt/homebrew/share/zsh-autosuggestions/zsh-autosuggestions.zsh",     # brew (Apple silicon)
+                 "/usr/local/share/zsh-autosuggestions/zsh-autosuggestions.zsh",        # brew (Intel)
+                 "/usr/share/zsh-autosuggestions/zsh-autosuggestions.zsh",              # Debian / Ubuntu
+                 "/usr/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh"]  # Arch
 
 
-def cmd_shell_init():
+def cmd_shell_init(suggest=None):
     launcher = os.path.join(project_dir(), "gli")
-    print(SHELL_INIT % {"launcher": shlex.quote(launcher)}, end="")
+    print(SHELL_INIT % {"launcher": shlex.quote(launcher),
+                        "suggest": " ".join(shlex.quote(p) for p in (suggest or SUGGEST_PATHS))}, end="")
 
 
 def cmd_history(argv, adopt=False):

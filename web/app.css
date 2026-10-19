@@ -211,6 +211,12 @@ code, pre, kbd { font-family: var(--mono); }
 .w-row-tap.stack { flex-direction: column; align-items: stretch; gap: 1px; }
 .w-row-tap.stack .w-sub { padding-left: 28px; }
 .widget[data-w="keys"], .widget[data-w="memory"] { width: 236px; }
+/* a list in a widget taller than the tile: four rows show, the rest scrolls (vertical swipes stay in it) */
+.w-scroll { max-height: 95px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; padding-right: 2px;
+  -webkit-overflow-scrolling: touch; }
+.w-scroll.more { -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 16px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 16px), transparent); }
+.w-scroll:focus-visible { outline: 2px solid var(--accent-text); outline-offset: 2px; border-radius: 4px; }
 .widget[data-w="netinfo"] { width: 256px; }
 .w-row .ni { display: flex; flex-direction: column; gap: 1px; }
 .ni-l { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

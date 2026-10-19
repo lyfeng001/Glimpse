@@ -261,14 +261,17 @@ const WIDGETS = [
         return '<div class="w-col"><div class="w-sub">Key ' + esc(k.name) + (k.exhausted ? ' · 已用完' : '') + '</div><div class="w-big">' + pctTxt(w) +
           '<small>7 天</small></div><div class="w-sub">5 小时 ' + pctTxt(s5) + (k.usage.today_cost != null ? ' · 今日 $' + k.usage.today_cost : '') + '</div></div>';
       }
-      const rows = keys.slice().sort((a, b) => ((week(b.usage) || {}).percent || 0) - ((week(a.usage) || {}).percent || 0)).slice(0, 4).map((k) => {
+      // every key, highest 7-day percentage first (unusable ones last); four rows tall, the rest scrolls
+      const pct = (k) => (k.usage.error ? -1 : (week(k.usage) || {}).percent || 0);
+      const rows = keys.slice().sort((a, b) => pct(b) - pct(a)).map((k) => {
         if (k.usage.error) return '<div class="w-row"><span class="grow">' + esc(k.name) + '</span><span style="color:var(--c-err)">不可用</span></div>';
         const w = week(k.usage);
         return '<div class="w-row"><span class="grow">' + esc(k.name) + '</span>' + meter(w ? w.percent : 0) + '<b style="min-width:34px;text-align:right">' + pctTxt(w) + '</b></div>';
       }).join('');
       const b = S.balance || {};
       const mode = { off: '', on_exhausted: ' · 自动换', least_used: ' · 按用量分配' }[b.mode] || '';
-      return wHead(this) + '<div class="w-sub" style="margin-bottom:4px">7 天额度' + mode + '</div><div class="w-rows" style="gap:9px">' + rows + '</div>';
+      return wHead(this) + '<div class="w-sub" style="margin-bottom:4px">7 天额度' + mode + (keys.length > 4 ? ' · ' + keys.length + ' 个' : '') + '</div>' +
+        '<div class="w-rows w-scroll" style="gap:9px"' + (keys.length > 4 ? ' tabindex="0" role="region" aria-label="全部 ' + keys.length + ' 个 Key 的用量"' : '') + '>' + rows + '</div>';
     },
   },
   {
@@ -401,14 +404,20 @@ function renderWidgets(host, scope, ctx) {
       el.dataset.w = w.id; el.setAttribute('aria-label', w.title);
     }
     have.delete(w.id);
+    const sc = el.querySelector('.w-scroll'); const top = sc ? sc.scrollTop : 0;
     setHTML(el, html);
     const next = prev ? prev.nextSibling : host.firstChild;
     if (next !== el) host.insertBefore(el, next);
+    const sc2 = el.querySelector('.w-scroll');
+    if (sc2) { if (sc2 !== sc) sc2.scrollTop = top; wScrollFade(sc2); }     // a usage refresh keeps where you scrolled to
     prev = el;
   }
   for (const el of have.values()) el.remove();
   return want.length;
 }
+// a scrolling list in a widget: faded at the bottom while there is more below
+function wScrollFade(el) { el.classList.toggle('more', el.scrollTop + el.clientHeight < el.scrollHeight - 2); }
+document.addEventListener('scroll', (e) => { if (e.target.classList && e.target.classList.contains('w-scroll')) wScrollFade(e.target); }, true);
 
 // ------------------------------------------------------------------ toast / in-app banner
 function toast(title, body, onTap, kind) {

@@ -1330,6 +1330,30 @@ def test_shell_init_defines_functions(capsys):
     assert r.returncode == 0, r.stderr
 
 
+def test_shell_init_completion_only_in_glimpse_zsh(capsys, tmp_path):
+    import shutil
+    import subprocess
+    stub = tmp_path / "zsh-autosuggestions.zsh"
+    stub.write_text('_zsh_autosuggest_start() { :; }\nGLIMPSE_SUGGEST_LOADED=1\n')
+    A.cmd_shell_init([str(tmp_path / "missing.zsh"), str(stub)])
+    out = capsys.readouterr().out
+    probe = out + '\nprint -r -- "loaded=${GLIMPSE_SUGGEST_LOADED:-0} compdef=$(whence -w compdef) strategy=${ZSH_AUTOSUGGEST_STRATEGY}"\n'
+    env = {"HOME": str(tmp_path), "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    if shutil.which("zsh"):
+        def run(**kw):
+            # -f: no rc files; the script on stdin (like an interactive shell: no ZSH_EXECUTION_STRING)
+            return subprocess.run(["zsh", "-f", "-s"], input=probe, capture_output=True, text=True,
+                                  env=dict(env, **kw)).stdout.strip()
+        assert run(TERM_PROGRAM="glimpse") == "loaded=1 compdef=compdef: function strategy=history completion"
+        assert run(TERM_PROGRAM="WarpTerminal") == "loaded=0 compdef=compdef: none strategy="
+        assert run(TERM_PROGRAM="glimpse", GLIMPSE="0").startswith("loaded=1")   # (GLIMPSE=0 is about claude/codex)
+    # bash (and sh) source it too: nothing zsh-only runs there, and nothing fails
+    if shutil.which("bash"):
+        r = subprocess.run(["bash", "-c", out + '\necho "ok ${GLIMPSE_SUGGEST_LOADED:-0}"'], capture_output=True,
+                           text=True, env=dict(env, TERM_PROGRAM="glimpse"))
+        assert r.stdout.strip() == "ok 0" and r.stderr == "", r.stderr
+
+
 def test_transient_error_classification():
     t = A.is_transient_error
     assert t("stream disconnected before completion: Our servers are currently overloaded. Please try again later.")

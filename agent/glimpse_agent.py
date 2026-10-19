@@ -1405,7 +1405,10 @@ class Session:
             if self.kind == "claude":
                 argv = argv[:1] + ["--resume", self.agent_session_id] + argv[1:]
             elif self.kind == "codex":
-                argv = argv[:1] + ["resume", self.agent_session_id] + argv[1:]
+                # `resume ID` LAST, after every option: codex drops all `-c` given before the subcommand as soon as
+                # one `-c` follows it (seen with 0.163: a changed effort, `-c model_reasoning_effort=…` after resume,
+                # dropped the key-file provider -> "Missing environment variable: V_API_KEY")
+                argv = argv + ["resume", self.agent_session_id]
         if self.kind == "codex":
             argv = argv[:1] + CODEX_FLAGS + argv[1:]
         return argv

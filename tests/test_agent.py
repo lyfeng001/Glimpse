@@ -959,9 +959,12 @@ def test_codex_launch_argv_no_forced_no_daemon_and_overrides():
     s.agent_session_id = "tid-1"
     s.overrides = {"model": "gpt-x"}
     argv = s.launch_argv(resume=True)
-    i = argv.index("resume")                                   # global -c flags go before the subcommand
-    assert argv[0] == "codex" and argv[i + 1] == "tid-1" and argv[-2:] == ["-m", "gpt-x"]
+    # `resume ID` last: codex drops the -c flags before the subcommand when one follows it (key-file provider lost)
+    assert argv[0] == "codex" and argv[-2:] == ["resume", "tid-1"] and argv[-4:-2] == ["-m", "gpt-x"]
     assert "old" not in argv and "tui.notifications=true" in argv
+    s.overrides = {"model": "gpt-x", "effort": "max", "sandbox": "danger-full-access"}
+    argv = s.launch_argv(resume=True)
+    assert argv[-2:] == ["resume", "tid-1"] and argv.index("resume") > max(i for i, a in enumerate(argv) if a == "-c")
     out = A.codex_override_argv(["codex", "-m", "old", "-c", 'model_reasoning_effort="low"', "--sandbox=read-only",
                                  "--no-daemon"], {"model": "gpt-x", "effort": "high", "sandbox": "danger-full-access",
                                                   "approval": "never"})

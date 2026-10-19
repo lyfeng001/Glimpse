@@ -1825,15 +1825,39 @@ function mathSpan(tex, display) {
 // $…$ only when it can't be money: no space just inside the $, no digit right after the closing one, and not only
 // a number ("$5 and $10" stays text). \$ is a literal dollar.
 const MATH_INLINE = /\\\$|\\\((.+?)\\\)|\$(?!\s)((?:\\.|[^$\n\\])+?)\$(?!\d)/g;
+// code spans as in CommonMark: a run of N backticks up to the next run of exactly N, so ``a`b`` and ```` ```js ````
+// are code too. -> [[isCode, text, raw], ...]; one space inside both ends is dropped (`` `x` `` shows `x`)
+function codeSplit(s) {
+  const out = []; let i = 0; let from = 0;
+  while (i < s.length) {
+    if (s[i] !== '`') { i++; continue; }
+    let j = i; while (s[j] === '`') j++;
+    let k = j; let end = -1;
+    while (k < s.length) {
+      if (s[k] !== '`') { k++; continue; }
+      let e = k; while (s[e] === '`') e++;
+      if (e - k === j - i) { end = k; break; }
+      k = e;
+    }
+    if (end < 0) { i = j; continue; }                      // no closing run: the backticks are text
+    if (i > from) out.push([false, s.slice(from, i), s.slice(from, i)]);
+    let c = s.slice(j, end);
+    if (c.length >= 2 && c[0] === ' ' && c[c.length - 1] === ' ' && c.trim()) c = c.slice(1, -1);
+    out.push([true, c, s.slice(i, end + j - i)]);
+    i = from = end + j - i;
+  }
+  if (from < s.length) out.push([false, s.slice(from), s.slice(from)]);
+  return out;
+}
 function mdInline(s, math) {
   const keep = [];                                                // finished pieces, out of the way of later rules
   const hold = (html) => '\u0002' + (keep.push(html) - 1) + '\u0003';
   const link = (text, url) => '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + text + '</a>';
   let t = String(s).replace(/[\u0002\u0003\u0004\u0005]/g, (c) => (math && (c === '\u0004' || c === '\u0005') ? c : ''));
+  // code spans first (a $ or * in code is code), then math, both out of the way before escaping
+  t = codeSplit(t).map(([code, x]) => (code ? hold('<code>' + esc(x) + '</code>') : x)).join('');
   if (math) {
-    // code spans first (a $ in `code` is code), then math, both out of the way before escaping
-    t = t.replace(/`([^`\n]+)`/g, (_, c) => hold('<code>' + esc(c) + '</code>'))
-      .replace(/\u0004(\d+)\u0005/g, (_, k) => hold(mathSpan(math[+k], true)))
+    t = t.replace(/\u0004(\d+)\u0005/g, (_, k) => hold(mathSpan(math[+k], true)))
       .replace(MATH_INLINE, (m0, paren, dollar) => {
         if (m0 === '\\$') return '$';
         const tex = paren != null ? paren : dollar;
@@ -1841,14 +1865,15 @@ function mdInline(s, math) {
         return hold(mathSpan(tex, false));
       });
   }
-  return esc(t)
-    .replace(/`([^`\n]+)`/g, (_, c) => hold('<code>' + c + '</code>'))
+  let h = esc(t)
     .replace(/!?\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, t, u) => hold(link(t, u)))
     .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
     .replace(/(^|[^\w*])\*([^*\s][^*\n]*?)\*(?![\w*])/g, '$1<i>$2</i>')
     .replace(/~~([^~\n]+)~~/g, '<s>$1</s>')
-    .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, (_, pre, u) => pre + hold(link(u, u)))
-    .replace(/\u0002(\d+)\u0003/g, (_, k) => keep[+k]);
+    .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, (_, pre, u) => pre + hold(link(u, u)));
+  // a held piece can hold another (`code` inside [link text](url)): put them back until none is left
+  for (let n = 0; n < 4 && /\u0002\d+\u0003/.test(h); n++) h = h.replace(/\u0002(\d+)\u0003/g, (_, k) => keep[+k]);
+  return h;
 }
 function codeBlock(body, lang) {
   // highlighted when the fence names a language we know (always the dark palette: the block is dark)
@@ -1857,29 +1882,51 @@ function codeBlock(body, lang) {
     '<button type="button" class="copy-code" aria-label="复制代码">' + ic('copy', 'sm') + '<span>复制</span></button>' +
     '<code>' + code + '</code></pre>';
 }
+// a fenced block: ``` or ~~~ (3 or more) at the start of a line, closed by a line of the same character, at least
+// as long (CommonMark). Backticks in the middle of a line are code spans, never fences.
+// (~~~ only with nothing or one word after it: "~~~ 分割线 ~~~" stays text)
+const MD_FENCE = /^(\s*)(?:(`{3,})\s*([^\s`]*)[^`]*|(~{3,})\s*([^\s~`]*)\s*)$/;
+function mdFence(body, lang, closed) {
+  const ll = lang.toLowerCase();
+  if (ll === 'math') return '<div class="math-block">' + mathSpan(body, true) + '</div>';
+  // closed fence only (a reply still being written may stop inside the diagram)
+  if (ll === 'mermaid' && closed) {
+    return '<div class="mermaid-box" data-src="' + esc(body) + '"><div class="mm-bar"><span class="lang">mermaid</span>' +
+      '<button type="button" class="mm-toggle" aria-pressed="false">源码</button></div><div class="mm-view" role="img" aria-label="Mermaid 图"></div>' +
+      codeBlock(body, '') + '</div>';
+  }
+  return codeBlock(body, lang);
+}
 function md(text) {
-  const parts = String(text || '').split(/```/);
-  let h = '';
-  parts.forEach((p, i) => {
-    if (i % 2) {
-      const m = p.match(/^([\w+#.-]*)\n/); const lang = m ? m[1] : '';
-      const body = (m ? p.slice(m[0].length) : p).replace(/\n$/, '');
-      const ll = lang.toLowerCase();
-      if (ll === 'math') { h += '<div class="math-block">' + mathSpan(body, true) + '</div>'; return; }
-      // closed fence only (a reply still being written may stop inside the diagram)
-      if (ll === 'mermaid' && i < parts.length - 1) {
-        h += '<div class="mermaid-box" data-src="' + esc(body) + '"><div class="mm-bar"><span class="lang">mermaid</span>' +
-          '<button type="button" class="mm-toggle" aria-pressed="false">源码</button></div><div class="mm-view" role="img" aria-label="Mermaid 图"></div>' +
-          codeBlock(body, '') + '</div>';
-        return;
-      }
-      h += codeBlock(body, lang);
-      return;
+  const lines = String(text || '').replace(/\r\n?/g, '\n').replace(/[\u0002-\u0007]/g, '').split('\n');
+  let h = ''; let prose = [];
+  for (let k = 0; k < lines.length; k++) {
+    const f = lines[k].match(MD_FENCE);
+    if (!f) { prose.push(lines[k]); continue; }
+    if (prose.length) { h += mdProse(prose.join('\n')); prose = []; }
+    const ind = f[1].length; const mark = f[2] || f[4]; const lang = f[3] || f[5] || '';
+    const body = []; let closed = false;
+    for (k++; k < lines.length; k++) {
+      const c = lines[k].match(/^\s*(`{3,}|~{3,})\s*$/);
+      if (c && c[1][0] === mark[0] && c[1].length >= mark.length) { closed = true; break; }
+      body.push(ind ? lines[k].replace(new RegExp('^ {0,' + ind + '}'), '') : lines[k]);
     }
-    // display math ($$…$$, \[…\]) can span lines: taken out first, put back as a block (alone on its line) or inline
-    const math = [];
-    p = p.replace(/`[^`\n]+`|\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]/g, (m0, a, b) =>
-      (a == null && b == null ? m0 : '\u0004' + (math.push((a != null ? a : b).trim()) - 1) + '\u0005'));
+    h += mdFence(body.join('\n'), lang, closed);
+  }
+  if (prose.length) h += mdProse(prose.join('\n'));
+  return h;
+}
+function mdProse(p) {
+  let h = '';
+  {
+    // display math ($$…$$, \[…\]) can span lines: taken out first, put back as a block (alone on its line) or inline.
+    // Code spans are set aside meanwhile (a $$ in code is code).
+    const math = []; const codes = [];
+    p = p.split('\n').map((ln) => codeSplit(ln).map(([code, , raw]) => (code ? '\u0006' + (codes.push(raw) - 1) + '\u0007' : raw)).join('')).join('\n')
+      .replace(/\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]/g, (m0, a, b) => '\u0004' + (math.push((a != null ? a : b).trim()) - 1) + '\u0005');
+    const unc = (s) => s.replace(/\u0006(\d+)\u0007/g, (_, k) => codes[+k]);
+    p = unc(p);
+    for (let i = 0; i < math.length; i++) math[i] = unc(math[i]);
     const inl = (s) => mdInline(s, math);
     let list = null;
     const close = () => { if (list) { h += '</' + list + '>'; list = null; } };
@@ -1910,12 +1957,16 @@ function md(text) {
         h += '<blockquote>' + q.map(inl).join('<br>') + '</blockquote>';
       }
       else if ((mm = line.match(/^\s*[-*•]\s+(.*)$/))) { flush(); if (list !== 'ul') { close(); h += '<ul>'; list = 'ul'; } h += '<li>' + inl(mm[1]) + '</li>'; }
-      else if ((mm = line.match(/^\s*\d+[.)]\s+(.*)$/))) { flush(); if (list !== 'ol') { close(); h += '<ol>'; list = 'ol'; } h += '<li>' + inl(mm[1]) + '</li>'; }
+      else if ((mm = line.match(/^\s*(\d+)[.)]\s+(.*)$/))) {
+        // a list interrupted by a code block goes on with its own number (3. after a block stays 3.)
+        flush(); if (list !== 'ol') { close(); h += mm[1] !== '1' ? '<ol start="' + (+mm[1]) + '">' : '<ol>'; list = 'ol'; }
+        h += '<li>' + inl(mm[2]) + '</li>';
+      }
       else if (!line.trim()) { flush(); close(); }
       else { close(); para.push(line); }
     }
     flush(); close();
-  });
+  }
   return h;
 }
 // a GFM table: a row with "|" followed by a delimiter row like "| --- | :-: |"

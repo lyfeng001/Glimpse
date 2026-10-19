@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import hmac
+import ipaddress
 import json
 import logging
 import copy
@@ -1314,13 +1315,33 @@ def cert_paths():
     return os.path.join(DATA, "certs", "ts.crt"), os.path.join(DATA, "certs", "ts.key")
 
 
-def ssl_context():
-    cert, key = cert_paths()
+def ssl_context(paths=None):
+    cert, key = paths or cert_paths()
     if not (os.path.isfile(cert) and os.path.isfile(key)):
         return None
     ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     ctx.load_cert_chain(cert, key)
     return ctx
+
+
+def local_cert_paths():
+    """`gli local-cert`: a certificate for 127.0.0.1 (the Tailscale one only names the .ts.net host)."""
+    return os.path.join(DATA, "certs", "local.crt"), os.path.join(DATA, "certs", "local.key")
+
+
+def is_loopback(host):
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def site_context(host, ctx, local):
+    """TLS context for one listen address: the 127.0.0.1 certificate on loopback when there is one (only
+    together with TLS elsewhere, so every address keeps the same scheme)."""
+    return local if ctx is not None and local is not None and is_loopback(host) else ctx
 
 
 def renew_cert(cfg):
@@ -1420,12 +1441,19 @@ async def serve(cfg, hub):
     ctx = ssl_context()
     if ctx is None:
         log.warning("no TLS certificate: serving plain HTTP (iPhone push notifications need HTTPS)")
+    try:
+        local = ssl_context(local_cert_paths())
+    except (OSError, ssl.SSLError) as e:
+        log.warning("127.0.0.1 certificate unusable (%s): run gli local-cert again", e)
+        local = None
     sites = 0
     for ls in resolve_hub(cfg)[0]:
+        sctx = site_context(ls["host"], ctx, local)
         try:
-            await web.TCPSite(runner, ls["host"], ls["port"], ssl_context=ctx).start()
+            await web.TCPSite(runner, ls["host"], ls["port"], ssl_context=sctx).start()
             sites += 1
-            log.info("listening on %s://%s:%s", "https" if ctx else "http", ls["host"], ls["port"])
+            log.info("listening on %s://%s:%s%s", "https" if sctx else "http", ls["host"], ls["port"],
+                     " (127.0.0.1 certificate)" if sctx is local and local is not None else "")
         except OSError as e:
             log.error("cannot listen on %s:%s: %s", ls["host"], ls["port"], e)
     if not sites:

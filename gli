@@ -16,6 +16,7 @@
 #   gli shell-init       shell functions so plain `claude` / `codex` run as Glimpse sessions
 #   gli new [PATH]       open the new-session form in the browser with PATH (default: here) filled in
 #   gli finder-install   Finder right-click → 快速操作 → 用 Glimpse 新建会话 (macOS); gli finder-uninstall removes it
+#   gli local-cert       a trusted certificate for https://127.0.0.1 (desktop window); gli local-cert remove
 #   gli test             run the test suite
 set -e
 
@@ -63,6 +64,7 @@ case "${1:-help}" in
   logout)   shift; exec "$PY" "$HUB" --revoke "${1:?usage: gli logout DEVICE_ID|all}" ;;
   test)     exec "$PY" -m pytest -q "$DIR/tests" ;;
   new)      exec "$PY" "$DIR/hub/finder.py" new "${2:-.}" ;;
+  local-cert)       shift; exec "$PY" "$DIR/hub/localcert.py" "$@" ;;
   finder-install)   exec "$PY" "$DIR/hub/finder.py" install ;;
   finder-uninstall) exec "$PY" "$DIR/hub/finder.py" uninstall ;;
   attach)

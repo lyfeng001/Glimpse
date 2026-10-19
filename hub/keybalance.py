@@ -1,5 +1,10 @@
 """Optional key balancing (keys.balance in config.json): which key a session should use.
 
+least_used keeps the keys' 7-day usage percentages close to each other: a new session goes to the key with the
+lowest percentage, and between turns a session moves from a key that is clearly ahead (REBALANCE_POINTS) to the
+lowest one. "Percentage" is projected a little ahead with the key's measured spend rate (PROJECT_SEC), so several
+sessions started between two usage polls don't all land on the same key.
+
 Pure functions; the hub calls them with its key list, the usage it fetched (keys.usage_url) and the keys
 sessions use right now. Nothing here talks to the network or to a machine.
 """
@@ -10,6 +15,8 @@ MODES = ("off", "on_exhausted", "least_used")
 EXHAUSTED_TTL = 30 * 60          # a key that ran out is skipped this long (or until its usage shows room again)
 SWAP_LIMIT, SWAP_WINDOW = 3, 10 * 60   # automatic swaps per session in that window, then the user decides
 REBALANCE_GAP = 30 * 60           # least_used: a session moves at most once in this time
+REBALANCE_POINTS = 5.0            # ... and only off a key this many percentage points above the target
+PROJECT_SEC = 3600                # percentages are compared as they will be in an hour at the measured rate
 
 # the key itself is the problem: no balance / quota, rejected / invalid / disabled key
 KEY_FATAL_RE = re.compile(
@@ -40,18 +47,18 @@ def week_window(u):
     return max(ws, key=lambda w: w["window_sec"]) if ws else None
 
 
-def capacity(u, now=None):
-    """Sustainable spend rate of a key: what is left of its 7-day quota per second until that window resets.
-    None = unknown (no usage data / no long window)."""
+def week_percent(u, rate=None, extra=0.0):
+    """A key's 7-day usage in percent, projected PROJECT_SEC ahead at `rate` (its measured spend per second)
+    plus `extra` (a session's spend moved to / from it). None = unknown."""
     w = week_window(u)
-    if not w or not isinstance(w.get("limit"), (int, float)) or w["limit"] <= 0:
+    if not w:
         return None
-    now = time.time() if now is None else now
-    left = max(0.0, float(w["limit"]) - float(w.get("used") or 0))
-    secs = (w.get("reset_at") or 0) - now
-    if secs <= 0:
-        secs = float(w.get("window_sec") or 7 * 86400)
-    return left / max(secs, 3600.0)
+    lim = w.get("limit")
+    if isinstance(lim, (int, float)) and lim > 0:
+        used = float(w.get("used") or 0) + max(0.0, (rate or 0.0) + extra) * PROJECT_SEC
+        return 100.0 * used / lim
+    p = w.get("percent")
+    return float(p) if isinstance(p, (int, float)) else None
 
 
 class RateTracker:
@@ -104,28 +111,10 @@ def live_exhausted(exhausted, usage, now=None):
     return out
 
 
-def loads(names, usage, rates, in_use, now=None):
-    """Per key: (capacity, measured rate, sessions). The per-session rate of a key is its rate / sessions."""
-    out = {}
-    for n in names:
-        out[n] = (capacity(usage.get(n), now), (rates or {}).get(n), (in_use or {}).get(n, 0))
-    return out
-
-
-def per_session_rate(ld):
-    """Typical spend of one session: the average over keys with measured rate and sessions (None = unknown)."""
-    xs = [r / k for c, r, k in ld.values() if r is not None and k > 0]
-    return sum(xs) / len(xs) if xs else None
-
-
-def ratio(c, r, k, sess_rate, extra=0):
-    """Load ratio of a key with `extra` more sessions: spend / sustainable spend. Lower is better."""
-    if c is None:
-        return None
-    spend = (r if r is not None else (k * sess_rate if sess_rate else 0.0)) + extra * (sess_rate or 0.0)
-    if c <= 0:
-        return float("inf")
-    return spend / c
+def session_rate(names, rates, in_use):
+    """Typical spend of one session per second: the average over keys with a measured rate and sessions."""
+    xs = [rates[n] / in_use[n] for n in names if (rates or {}).get(n) is not None and (in_use or {}).get(n, 0) > 0]
+    return sum(xs) / len(xs) if xs else 0.0
 
 
 def usable(n, usage, exhausted, avoid, any_window=False):
@@ -144,55 +133,45 @@ def usable(n, usage, exhausted, avoid, any_window=False):
 
 
 def pick_key(names, usage, exhausted=(), in_use=None, avoid=(), rates=None, now=None, any_window=False):
-    """Key for one more session: the one whose 7-day load ratio is lowest after adding it (keeps all keys
-    burning at the same relative pace). Without usage data: fewest sessions. Then config order."""
-    in_use = in_use or {}
-    ld = loads(names, usage, rates, in_use, now)
-    sr = per_session_rate(ld) or 1.0
+    """Key for one more session: the lowest 7-day usage percentage with that session added (keys with usage
+    data first). Then fewest sessions, then config order."""
+    in_use, rates = in_use or {}, rates or {}
+    sr = session_rate(names, rates, in_use)
     best = None
     for i, n in enumerate(names):
         if not usable(n, usage, exhausted, avoid, any_window):
             continue
-        c, r, k = ld[n]
-        q = ratio(c, r, k, sr, extra=1)
-        score = (0 if q is not None else 1, q if q is not None else 0.0, k, i)
+        p = week_percent(usage.get(n), rates.get(n), sr)
+        score = (p is None, p or 0.0, in_use.get(n, 0), i)
         if best is None or score < best[0]:
             best = (score, n)
     return best[1] if best else None
 
 
-def should_rebalance(cur, names, usage, exhausted=(), in_use=None, rates=None, now=None, gain=0.2):
-    """Between turns: another key for one session on `cur` when moving it lowers the higher of the two
-    load ratios by at least `gain` (20 %). None = stay. Needs 7-day usage on both keys.
-    What moves is that session's own spend (its key's measured rate / its sessions), not the average session's:
-    idle sessions elsewhere pull the average down, and a busy session alone on its key would look like a big win
-    when it only carries its spend to another key."""
-    in_use = in_use or {}
-    ld = loads(names, usage, rates, in_use, now)
-    if cur not in ld or ld[cur][0] is None:
+def should_rebalance(cur, names, usage, exhausted=(), in_use=None, rates=None, now=None):
+    """Between turns: move one session off `cur` when its 7-day percentage is REBALANCE_POINTS or more above
+    the lowest usable key's, to that key (fewer sessions, then config order on a tie). None = stay.
+    The session takes its own spend along (its key's measured rate / its sessions); a move that would leave the
+    higher of the two percentages no lower is skipped."""
+    in_use, rates = in_use or {}, rates or {}
+    k0 = in_use.get(cur, 0)
+    r0 = rates.get(cur)
+    mine = r0 / k0 if r0 is not None and k0 > 0 else session_rate(names, rates, in_use)
+    p0 = week_percent(usage.get(cur), r0)
+    if p0 is None:
         return None
-    sr = per_session_rate(ld)
-    if not sr:
-        return None
-    c0, r0, k0 = ld[cur]
-    mine = r0 / k0 if r0 is not None and k0 > 0 else sr          # what this session spends
-    spend0 = r0 if r0 is not None else k0 * sr
-
-    def load(c, spend):
-        return float("inf") if c <= 0 else max(0.0, spend) / c
-    before_cur, after_cur = load(c0, spend0), load(c0, spend0 - mine)
+    p0_after = week_percent(usage.get(cur), r0, -mine)
     best = None
     for i, n in enumerate(names):
         if n == cur or not usable(n, usage, exhausted, ()):
             continue
-        c, r, k = ld[n]
-        if c is None:
+        p = week_percent(usage.get(n), rates.get(n))
+        if p is None or p0 - p < REBALANCE_POINTS:
             continue
-        spend = r if r is not None else k * sr
-        there = load(c, spend + mine)
-        before, after = max(before_cur, load(c, spend)), max(after_cur, there)
-        # equal results: the key that ends up least loaded, then fewer sessions, then config order
-        score = (after, there, k, i)
-        if before > 0 and after <= before * (1 - gain) and (best is None or score < best[0]):
+        there = week_percent(usage.get(n), rates.get(n), mine)
+        if mine > 0 and max(p0_after, there) >= max(p0, p):     # (spend unknown yet: the gap alone decides)
+            continue
+        score = (p, in_use.get(n, 0), i)
+        if best is None or score < best[0]:
             best = (score, n)
     return best[1] if best else None

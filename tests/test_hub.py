@@ -385,6 +385,72 @@ def test_finder_quick_action(tmp_path):
     assert out == "-a|%s|https://127.0.0.1:8443/#new?cwd=%%2Fa%%20b&m=M1|" % app
 
 
+def test_local_cert(tmp_path):
+    import socket
+    import ssl
+    import subprocess
+    import threading
+    from cryptography import x509
+    import localcert
+    crt, key, ca = localcert.write(str(tmp_path))
+    assert oct(os.stat(key).st_mode & 0o777) == "0o600"
+    assert sorted(os.listdir(tmp_path / "certs")) == ["local-ca.crt", "local.crt", "local.key"]   # no CA key anywhere
+    cacert = x509.load_pem_x509_certificate(open(ca, "rb").read())
+    nc = cacert.extensions.get_extension_for_class(x509.NameConstraints)
+    assert nc.critical and cacert.extensions.get_extension_for_class(x509.BasicConstraints).value.path_length == 0
+    assert {str(s.value) for s in nc.value.permitted_subtrees} == {"127.0.0.1/32", "::1/128", "localhost"}
+    leaf = x509.load_pem_x509_certificate(open(crt, "rb").read())
+    days = (leaf.not_valid_after_utc - leaf.not_valid_before_utc).days
+    assert days <= 825
+    # a real TLS handshake: the CA as the only trust anchor, 127.0.0.1 verified, another name refused
+    sctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    sctx.load_cert_chain(crt, key)
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    port = srv.getsockname()[1]
+
+    def serve():
+        for _ in range(2):
+            c, _ = srv.accept()
+            try:
+                with sctx.wrap_socket(c, server_side=True) as s:
+                    s.recv(1)
+            except (ssl.SSLError, OSError):
+                pass
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    cctx = ssl.create_default_context(cafile=ca)
+    with socket.create_connection(("127.0.0.1", port)) as raw:
+        with cctx.wrap_socket(raw, server_hostname="127.0.0.1") as s:
+            assert s.getpeercert()["subjectAltName"][0] == ("IP Address", "127.0.0.1")
+    with pytest.raises(ssl.SSLCertVerificationError):
+        with socket.create_connection(("127.0.0.1", port)) as raw:
+            cctx.wrap_socket(raw, server_hostname="example.com")
+    t.join(5)
+    srv.close()
+    if sys.platform == "darwin":
+        # macOS's own evaluation (what Safari / Chrome use), with the CA as root for this check only
+        one = tmp_path / "leaf.pem"
+        one.write_bytes(leaf.public_bytes(__import__("cryptography").hazmat.primitives.serialization.Encoding.PEM))
+        ok = subprocess.run(["security", "verify-cert", "-c", str(one), "-r", ca, "-p", "ssl", "-s", "127.0.0.1", "-L", "-q"],
+                            capture_output=True)
+        assert ok.returncode == 0, ok.stderr
+        bad = subprocess.run(["security", "verify-cert", "-c", str(one), "-r", ca, "-p", "ssl", "-s", "example.com", "-L", "-q"],
+                             capture_output=True)
+        assert bad.returncode != 0
+
+
+def test_site_context_loopback(hub_mod):
+    _, server = hub_mod
+    ts, local = object(), object()
+    assert server.site_context("127.0.0.1", ts, local) is local
+    assert server.site_context("::1", ts, local) is local and server.site_context("localhost", ts, local) is local
+    assert server.site_context("100.96.1.2", ts, local) is ts
+    assert server.site_context("127.0.0.1", ts, None) is ts
+    assert server.site_context("127.0.0.1", None, local) is None       # no TLS elsewhere: keep one scheme
+
+
 def test_finder_finds_the_installed_web_app(tmp_path):
     import plistlib
     import finder
@@ -783,12 +849,14 @@ def _wk(limit, used, days_left, now=1000.0, ts=None, pct=None):
                                           "percent": pct if pct is not None else 100.0 * used / limit}]}
 
 
-def test_keybalance_capacity_and_rates():
+def test_keybalance_percent_and_rates():
     import keybalance as KB
-    now = 1000.0
-    # 70 left, 7 days to the reset -> 10 per day
-    assert abs(KB.capacity(_wk(100, 30, 7), now) - 70 / (7 * 86400)) < 1e-12
-    assert KB.capacity({"ts": 1, "windows": [{"window_sec": 18000, "limit": 1, "used": 0}]}, now) is None   # 5 h only
+    # the 7-day window's percentage, projected an hour ahead at the measured rate
+    assert KB.week_percent(_wk(600, 60, 7)) == 10.0
+    assert abs(KB.week_percent(_wk(600, 60, 7), rate=1e-3) - 100 * (60 + 3.6) / 600) < 1e-9
+    assert abs(KB.week_percent(_wk(600, 60, 7), rate=1e-3, extra=-1e-3) - 10.0) < 1e-9
+    assert KB.week_percent({"ts": 1, "windows": [{"window_sec": 18000, "limit": 1, "used": 0}]}) is None   # 5 h only
+    assert KB.week_percent({"ts": 1, "error": "x"}) is None
     t = KB.RateTracker()
     t.observe("a", _wk(100, 10, 7, ts=0))
     t.observe("a", _wk(100, 13, 7, ts=300))            # 3 per 300 s
@@ -797,13 +865,20 @@ def test_keybalance_capacity_and_rates():
     assert "a" not in t.rate
 
 
-def test_keybalance_pick_equalises_burn_rate():
+def test_keybalance_pick_lowest_percent():
     import keybalance as KB
     now = 1000.0
-    # same burn rate, but k2 has much more left: the new session goes to k2 even though k2 used more in absolute terms
+    # the percentage decides, not the absolute amount: k2 used more (300 > 80) but is at 30 % of its week, k1 at 80 %
     u = {"k1": _wk(100, 80, 3, now), "k2": _wk(1000, 300, 3, now)}
     rates = {"k1": 0.001, "k2": 0.001}
     assert KB.pick_key(["k1", "k2"], u, in_use={"k1": 1, "k2": 1}, rates=rates, now=now) == "k2"
+    # same percentage now, but k1 burns fast: in an hour it is ahead, so the new session goes to k2
+    u2 = {"k1": _wk(600, 60, 3, now), "k2": _wk(600, 60, 3, now)}
+    assert KB.pick_key(["k1", "k2"], u2, in_use={"k1": 1}, rates={"k1": 5e-3}, now=now) == "k2"
+    # equal: fewer sessions, then config order; a key without usage data comes after the ones with
+    assert KB.pick_key(["k1", "k2"], u2, in_use={"k1": 1}, now=now) == "k2"
+    assert KB.pick_key(["k1", "k2"], u2, now=now) == "k1"
+    assert KB.pick_key(["x", "k1"], dict(u2, x={}), now=now) == "k1"
     # a key spent on the 7-day window or flagged invalid is never picked; the 5 h window does not matter here
     u["k3"] = _wk(100, 100, 3, now)
     u["k4"] = {"ts": 1, "error": "Key 无效或已停用"}
@@ -816,35 +891,36 @@ def test_keybalance_pick_equalises_burn_rate():
     assert KB.pick_key(["a", "b"], {}, in_use={"a": 2}) == "b"
 
 
-def test_keybalance_rebalance_only_when_it_helps():
+def test_keybalance_rebalance_evens_out_percentages():
     import keybalance as KB
     now = 1000.0
     u = {"k1": _wk(100, 90, 3, now), "k2": _wk(100, 10, 3, now)}
-    # k1: 10 left, 3 sessions burning; k2: 90 left, 1 session -> moving one session lowers the max load a lot
     rates = {"k1": 3e-4, "k2": 1e-4}
     assert KB.should_rebalance("k1", ["k1", "k2"], u, in_use={"k1": 3, "k2": 1}, rates=rates, now=now) == "k2"
-    # balanced already: stay
-    u2 = {"k1": _wk(100, 50, 3, now), "k2": _wk(100, 50, 3, now)}
-    assert KB.should_rebalance("k1", ["k1", "k2"], u2, in_use={"k1": 1, "k2": 1}, rates={"k1": 1e-4, "k2": 1e-4}, now=now) is None
-    # no measured rates yet: no move
-    assert KB.should_rebalance("k1", ["k1", "k2"], u, in_use={"k1": 3, "k2": 1}, now=now) is None
+    # no measured rates yet: the percentages alone are far apart, so it moves too
+    assert KB.should_rebalance("k1", ["k1", "k2"], u, in_use={"k1": 3, "k2": 1}, now=now) == "k2"
+    # close already (less than REBALANCE_POINTS apart): stay; at the threshold: move; never to a key that is ahead
+    for used2, want in ((47, None), (45, "k2"), (60, None)):
+        u2 = {"k1": _wk(100, 50, 3, now), "k2": _wk(100, used2, 3, now)}
+        assert KB.should_rebalance("k1", ["k1", "k2"], u2, in_use={"k1": 1, "k2": 1}, now=now) == want, used2
 
 
-def test_keybalance_rebalance_moves_the_sessions_own_spend():
-    # seen 2026-10-19: one busy session alone on k2 (k1 the most used key, with an idle session; k3 unused) was moved
-    # to k1. The session's spend was estimated as the average over all sessions (idle ones pull it down), so moving
-    # it looked like a big win, and among the then-equal candidates config order picked k1.
+def test_keybalance_rebalance_with_todays_numbers():
+    # seen 2026-10-19 10:25: session fd49b2, alone on key2 (1.2 % of its week), was moved to key1 (10.2 %, the most
+    # used key). With percentages: from key2 it stays (all keys within a few points), and once it is on key1 it
+    # moves to an unused key (key3: 0 %, no sessions, first of those in config order), not to key10 (6.2 %).
     import keybalance as KB
     now = 1000.0
-    names = ["k1", "k2", "k3", "k5"]
-    u = {"k1": _wk(600, 61, 6.5, now), "k2": _wk(600, 7, 6.5, now), "k3": _wk(600, 0, 6.5, now), "k5": _wk(600, 0, 6.5, now)}
-    # k5: two idle (codex) sessions, measured rate 0
-    rates = {"k1": 1e-4, "k2": 1e-3, "k5": 0.0}
-    # the only spender on k2: moving it just moves its spend, nothing gets better -> stay
-    assert KB.should_rebalance("k2", names, u, in_use={"k1": 1, "k2": 1, "k5": 2}, rates=rates, now=now) is None
-    # two busy sessions on k2: one moves, and to the least loaded key (k3), not to the first in config order
-    rates["k2"] = 2e-3
-    assert KB.should_rebalance("k2", names, u, in_use={"k1": 1, "k2": 2, "k5": 2}, rates=rates, now=now) == "k3"
+    used = {"key1": (600, 60.92), "key2": (600, 6.97), "key3": (600, 0), "key5": (600, 0), "key7": (600, 0),
+            "key8": (600, 0), "key9": (600, 7.63), "key10": (900, 56.19), "public": (600, 0)}
+    u = {n: _wk(lim, x, 6.5, now) for n, (lim, x) in used.items()}
+    u["key4"] = u["key6"] = {"ts": now, "error": "Key 无效或已停用"}
+    names = ["key1", "key2", "key3", "key4", "key5", "key6", "key7", "key8", "key9", "key10", "public"]
+    before = {"key1": 1, "key2": 1, "key5": 2}                  # key5: two idle codex sessions (rate 0)
+    assert KB.should_rebalance("key2", names, u, in_use=before, rates={"key1": 1e-4, "key2": 1e-3, "key5": 0.0}, now=now) is None
+    now_ = {"key1": 2, "key5": 2}                               # fd49b2 and an idle codex session on key1
+    assert KB.should_rebalance("key1", names, u, in_use=now_, rates={"key1": 2e-3, "key5": 0.0}, now=now) == "key3"
+    assert KB.pick_key(names, u, in_use=now_, rates={"key1": 2e-3, "key5": 0.0}, now=now) == "key3"
 
 
 def test_keybalance_fatal_and_exhausted():

@@ -34,7 +34,7 @@ Glimpse turns your phone into a remote control for those sessions. What you see 
 
 - **Session tabs across machines**: every session from every machine in one list. Each shows the machine id (M1, M2…), task name, working directory, live status and the latest reply.
 - **Three views**:
-  - **Chat** renders the Claude Code / Codex transcript as chat bubbles, with expandable tool calls and output; Markdown tables, quotes and links are rendered and code blocks are highlighted.
+  - **Chat** renders the Claude Code / Codex transcript as chat bubbles, with expandable tool calls and output; Markdown tables, quotes and links are rendered and code blocks are highlighted. Formulas (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`, ```` ```math ````) are typeset with KaTeX and ```` ```mermaid ```` blocks are drawn as diagrams (源码 shows the source; a diagram with a syntax error shows its source). Amounts like "$5 and $10" stay text.
   - **Terminal** is the full terminal screen, rendered with xterm.js.
   - **Files** browses the session's working directory: a folder tree with git status marks, previews of text (line numbers, wrap, syntax highlighting for about 20 languages), Markdown (渲染 | 源码), images and diffs, and a 改动 list of changed files with +/− counts. 引用 puts `@path` into the composer. On a wide screen (≥ 1200 px) the files are a column next to chat / terminal; drag its edge to resize it (double-click for the default).
     - **编辑** edits a text file in place (highlighted, Tab / Shift+Tab indent, ⌘S / Ctrl+S saves). Saving names the version you started from: if the file changed meanwhile (the AI edited it), you are asked before it is overwritten. An unsaved edit survives leaving the session or reloading the page. The file keeps its encoding (UTF-8 or GB18030), line endings and permissions; the write is atomic.
@@ -318,6 +318,7 @@ web/                     the PWA (vanilla JS + xterm.js, no build step); web/ico
 ## Acknowledgements
 
 - [xterm.js](https://xtermjs.org/) (MIT) renders the terminal on the phone
+- [KaTeX](https://katex.org/) (MIT) and [Mermaid](https://mermaid.js.org/) (MIT) draw formulas and diagrams in chat (vendored, loaded only when a message has one)
 - [Tailscale](https://tailscale.com/) provides the network and HTTPS certificates
 - The interaction design was inspired by [Moshi](https://getmoshi.app/) and [Happier](https://github.com/happier-dev/happier)
 

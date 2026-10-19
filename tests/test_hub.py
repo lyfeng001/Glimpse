@@ -446,6 +446,42 @@ def test_local_cert(tmp_path):
         assert bad.returncode != 0
 
 
+def test_vendor_served_gzipped(hub_mod, tmp_path, monkeypatch):
+    """mermaid (5 MB) goes out gzipped to browsers that accept it; the original stays for those that don't."""
+    import gzip
+    from aiohttp.test_utils import TestClient, TestServer
+    C, server = hub_mod
+    web = tmp_path / "web"
+    (web / "vendor" / "mermaid").mkdir(parents=True)
+    big = ("var mermaid = %r;\n" % ("x" * 64) * 4000).encode()
+    (web / "vendor" / "mermaid" / "mermaid.min.js").write_bytes(big)
+    (web / "vendor" / "small.js").write_bytes(b"var a = 1;\n")
+    monkeypatch.setattr(server, "WEB", str(web))
+    server.precompress_vendor()
+    gz = web / "vendor" / "mermaid" / "mermaid.min.js.gz"
+    assert gz.exists() and gzip.decompress(gz.read_bytes()) == big and gz.stat().st_size < len(big) / 10
+    assert not (web / "vendor" / "small.js.gz").exists()                    # small files: not worth it
+    t = gz.stat().st_mtime
+    server.precompress_vendor()
+    assert gz.stat().st_mtime == t                                           # up to date: left alone
+
+    async def run():
+        hub = server.Hub(C.load())
+        client = TestClient(TestServer(hub.app()))
+        await client.start_server()
+        try:
+            r = await client.get("/static/vendor/mermaid/mermaid.min.js", headers={"Accept-Encoding": "gzip"}, auto_decompress=False)
+            assert r.status == 200 and r.headers.get("Content-Encoding") == "gzip"
+            assert "javascript" in r.headers.get("Content-Type", "") and gzip.decompress(await r.read()) == big
+            r = await client.get("/static/vendor/mermaid/mermaid.min.js", headers={"Accept-Encoding": "identity"})
+            assert r.status == 200 and r.headers.get("Content-Encoding") is None and await r.read() == big
+            r = await client.get("/static/vendor/mermaid/mermaid.min.js.gz/../mermaid.min.js")
+            assert r.status in (200, 404)                                    # (normalised; never outside web/)
+        finally:
+            await client.close()
+    asyncio.run(run())
+
+
 def test_site_context_loopback(hub_mod):
     _, server = hub_mod
     ts, local = object(), object()

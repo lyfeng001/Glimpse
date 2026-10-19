@@ -12,6 +12,9 @@ __pycache__/
 node_modules/
 .DS_Store
 
+# gzip copies of web/vendor files, made by the hub at startup
+web/vendor/**/*.gz
+
 # local scratch
 scratch/
 instruction.md

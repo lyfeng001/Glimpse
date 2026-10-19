@@ -48,6 +48,32 @@ def web_build():
 
 
 WEB_BUILD = web_build()
+
+
+def precompress_vendor(root=None):
+    """gzip next to each large file in web/vendor (mermaid is 5 MB, ~1.5 MB gzipped); aiohttp's FileResponse
+    sends the .gz to browsers that accept gzip. Only vendored files: they change only with an update, which
+    restarts the hub. Not in git (.gitignore)."""
+    import gzip
+    root = root or os.path.join(WEB, "vendor")
+    for dp, _, fns in os.walk(root):
+        for fn in fns:
+            if not fn.endswith((".js", ".css")):
+                continue
+            p = os.path.join(dp, fn)
+            gz = p + ".gz"
+            try:
+                st = os.stat(p)
+                if st.st_size < 32 * 1024 or (os.path.exists(gz) and os.stat(gz).st_mtime >= st.st_mtime):
+                    continue
+                with open(p, "rb") as f:
+                    data = gzip.compress(f.read(), 9, mtime=0)
+                tmp = gz + ".tmp"
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                os.replace(tmp, gz)
+            except OSError as e:
+                log.warning("cannot precompress %s: %s", fn, e)
 VERSION = "0.4.1"
 log = logging.getLogger("glimpse.hub")
 PHONE_QUEUE_MAX = 4000       # messages; a phone that falls this far behind is disconnected
@@ -1621,6 +1647,7 @@ def main():
             print("logged out " + a.revoke)
         return
     os.environ["GLIMPSE_APPROVAL_WAIT"] = str(int(cfg["hub"].get("approval_wait_seconds") or 600))
+    precompress_vendor()
     renew_cert(cfg)
 
     async def run():

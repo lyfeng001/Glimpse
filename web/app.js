@@ -1549,6 +1549,7 @@ function renderPreview() {
   }
   const top = host.scrollTop;
   setHTML(host, bar + body);
+  if (rendered) renderRich(host);
   host.scrollTop = top;
 }
 // ---- editing a file: a textarea over the highlighted text (same font and padding, scrolled together), line
@@ -1815,12 +1816,32 @@ $('#fpane').addEventListener('click', (e) => {
 
 // ------------------------------------------------------------------ chat rendering
 // tiny, safe markdown: everything is escaped first; code fences (highlighted), inline code, bold, italic, strikethrough,
-// headings, lists, quotes, rules, tables and http(s) links only (no raw HTML, no images: the page loads nothing remote)
-function mdInline(s) {
+// headings, lists, quotes, rules, tables and http(s) links only (no raw HTML, no images: the page loads nothing remote).
+// math ($…$, $$…$$, \(…\), \[…\], ```math) and ```mermaid come out as placeholders with their source; renderRich()
+// draws them with KaTeX / mermaid (vendored, loaded the first time one is shown)
+function mathSpan(tex, display) {
+  return '<span class="math' + (display ? ' display' : '') + '" data-tex="' + esc(tex) + '">' + esc(display ? tex : '$' + tex + '$') + '</span>';
+}
+// $…$ only when it can't be money: no space just inside the $, no digit right after the closing one, and not only
+// a number ("$5 and $10" stays text). \$ is a literal dollar.
+const MATH_INLINE = /\\\$|\\\((.+?)\\\)|\$(?!\s)((?:\\.|[^$\n\\])+?)\$(?!\d)/g;
+function mdInline(s, math) {
   const keep = [];                                                // finished pieces, out of the way of later rules
   const hold = (html) => '\u0002' + (keep.push(html) - 1) + '\u0003';
   const link = (text, url) => '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + text + '</a>';
-  return esc(String(s).replace(/[\u0002\u0003]/g, ''))
+  let t = String(s).replace(/[\u0002\u0003\u0004\u0005]/g, (c) => (math && (c === '\u0004' || c === '\u0005') ? c : ''));
+  if (math) {
+    // code spans first (a $ in `code` is code), then math, both out of the way before escaping
+    t = t.replace(/`([^`\n]+)`/g, (_, c) => hold('<code>' + esc(c) + '</code>'))
+      .replace(/\u0004(\d+)\u0005/g, (_, k) => hold(mathSpan(math[+k], true)))
+      .replace(MATH_INLINE, (m0, paren, dollar) => {
+        if (m0 === '\\$') return '$';
+        const tex = paren != null ? paren : dollar;
+        if (paren == null && (/\s$/.test(tex) || /^[\d.,\s]+$/.test(tex))) return m0;
+        return hold(mathSpan(tex, false));
+      });
+  }
+  return esc(t)
     .replace(/`([^`\n]+)`/g, (_, c) => hold('<code>' + c + '</code>'))
     .replace(/!?\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, t, u) => hold(link(t, u)))
     .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
@@ -1829,6 +1850,13 @@ function mdInline(s) {
     .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, (_, pre, u) => pre + hold(link(u, u)))
     .replace(/\u0002(\d+)\u0003/g, (_, k) => keep[+k]);
 }
+function codeBlock(body, lang) {
+  // highlighted when the fence names a language we know (always the dark palette: the block is dark)
+  const code = window.HL && HL.lang(lang) ? HL.html(body, lang) : esc(body);
+  return '<pre>' + (lang ? '<span class="lang">' + esc(lang) + '</span>' : '') +
+    '<button type="button" class="copy-code" aria-label="复制代码">' + ic('copy', 'sm') + '<span>复制</span></button>' +
+    '<code>' + code + '</code></pre>';
+}
 function md(text) {
   const parts = String(text || '').split(/```/);
   let h = '';
@@ -1836,17 +1864,27 @@ function md(text) {
     if (i % 2) {
       const m = p.match(/^([\w+#.-]*)\n/); const lang = m ? m[1] : '';
       const body = (m ? p.slice(m[0].length) : p).replace(/\n$/, '');
-      // highlighted when the fence names a language we know (always the dark palette: the block is dark)
-      const code = window.HL && HL.lang(lang) ? HL.html(body, lang) : esc(body);
-      h += '<pre>' + (lang ? '<span class="lang">' + esc(lang) + '</span>' : '') +
-        '<button type="button" class="copy-code" aria-label="复制代码">' + ic('copy', 'sm') + '<span>复制</span></button>' +
-        '<code>' + code + '</code></pre>';
+      const ll = lang.toLowerCase();
+      if (ll === 'math') { h += '<div class="math-block">' + mathSpan(body, true) + '</div>'; return; }
+      // closed fence only (a reply still being written may stop inside the diagram)
+      if (ll === 'mermaid' && i < parts.length - 1) {
+        h += '<div class="mermaid-box" data-src="' + esc(body) + '"><div class="mm-bar"><span class="lang">mermaid</span>' +
+          '<button type="button" class="mm-toggle" aria-pressed="false">源码</button></div><div class="mm-view" role="img" aria-label="Mermaid 图"></div>' +
+          codeBlock(body, '') + '</div>';
+        return;
+      }
+      h += codeBlock(body, lang);
       return;
     }
+    // display math ($$…$$, \[…\]) can span lines: taken out first, put back as a block (alone on its line) or inline
+    const math = [];
+    p = p.replace(/`[^`\n]+`|\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]/g, (m0, a, b) =>
+      (a == null && b == null ? m0 : '\u0004' + (math.push((a != null ? a : b).trim()) - 1) + '\u0005'));
+    const inl = (s) => mdInline(s, math);
     let list = null;
     const close = () => { if (list) { h += '</' + list + '>'; list = null; } };
     let para = [];
-    const flush = () => { if (para.length) { h += '<p>' + para.map(mdInline).join('<br>') + '</p>'; para = []; } };
+    const flush = () => { if (para.length) { h += '<p>' + para.map(inl).join('<br>') + '</p>'; para = []; } };
     const lines = p.split('\n');
     for (let k = 0; k < lines.length; k++) {
       const line = lines[k];
@@ -1858,20 +1896,21 @@ function md(text) {
         const rows = [];
         while (k < lines.length && lines[k].includes('|') && lines[k].trim()) rows.push(mdCells(lines[k++]));
         k--;
-        h += '<div class="md-table"><table><thead><tr>' + head.map((c, j) => '<th' + (al[j] || '') + '>' + mdInline(c) + '</th>').join('') +
-          '</tr></thead><tbody>' + rows.map((r) => '<tr>' + head.map((_, j) => '<td' + (al[j] || '') + '>' + mdInline(r[j] || '') + '</td>').join('') + '</tr>').join('') +
+        h += '<div class="md-table"><table><thead><tr>' + head.map((c, j) => '<th' + (al[j] || '') + '>' + inl(c) + '</th>').join('') +
+          '</tr></thead><tbody>' + rows.map((r) => '<tr>' + head.map((_, j) => '<td' + (al[j] || '') + '>' + inl(r[j] || '') + '</td>').join('') + '</tr>').join('') +
           '</tbody></table></div>';
       }
-      else if ((mm = line.match(/^(#{1,4})\s+(.*)$/))) { flush(); close(); h += '<h' + mm[1].length + '>' + mdInline(mm[2]) + '</h' + mm[1].length + '>'; }
+      else if ((mm = line.match(/^\s*\u0004(\d+)\u0005\s*$/))) { flush(); close(); h += '<div class="math-block">' + mathSpan(math[+mm[1]], true) + '</div>'; }
+      else if ((mm = line.match(/^(#{1,4})\s+(.*)$/))) { flush(); close(); h += '<h' + mm[1].length + '>' + inl(mm[2]) + '</h' + mm[1].length + '>'; }
       else if (/^ {0,3}([-*_])(?:\s*\1){2,}\s*$/.test(line)) { flush(); close(); h += '<hr>'; }
       else if ((mm = line.match(/^\s*>\s?(.*)$/))) {
         flush(); close();
         const q = [mm[1]];
         while (k + 1 < lines.length && (mm = lines[k + 1].match(/^\s*>\s?(.*)$/))) { q.push(mm[1]); k++; }
-        h += '<blockquote>' + q.map(mdInline).join('<br>') + '</blockquote>';
+        h += '<blockquote>' + q.map(inl).join('<br>') + '</blockquote>';
       }
-      else if ((mm = line.match(/^\s*[-*•]\s+(.*)$/))) { flush(); if (list !== 'ul') { close(); h += '<ul>'; list = 'ul'; } h += '<li>' + mdInline(mm[1]) + '</li>'; }
-      else if ((mm = line.match(/^\s*\d+[.)]\s+(.*)$/))) { flush(); if (list !== 'ol') { close(); h += '<ol>'; list = 'ol'; } h += '<li>' + mdInline(mm[1]) + '</li>'; }
+      else if ((mm = line.match(/^\s*[-*•]\s+(.*)$/))) { flush(); if (list !== 'ul') { close(); h += '<ul>'; list = 'ul'; } h += '<li>' + inl(mm[1]) + '</li>'; }
+      else if ((mm = line.match(/^\s*\d+[.)]\s+(.*)$/))) { flush(); if (list !== 'ol') { close(); h += '<ol>'; list = 'ol'; } h += '<li>' + inl(mm[1]) + '</li>'; }
       else if (!line.trim()) { flush(); close(); }
       else { close(); para.push(line); }
     }
@@ -1888,6 +1927,95 @@ function mdCells(line) {
   if (s.endsWith('|')) s = s.slice(0, -1);
   return s.split('|').map((c) => c.trim().replace(/\u0001/g, '|'));
 }
+// ---- math (KaTeX) and diagrams (mermaid): vendored under /static/vendor, loaded the first time one is shown
+// (mermaid is big: ~1.5 MB gzipped). Until then, and if drawing fails, the source stays visible.
+const VENDOR = {};
+function vendor(name) {
+  if (VENDOR[name]) return VENDOR[name];
+  const files = { katex: ['katex/katex.min.css', 'katex/katex.min.js'], mermaid: ['mermaid/mermaid.min.js'] }[name];
+  VENDOR[name] = Promise.all(files.map((f) => new Promise((ok, bad) => {
+    const el = f.endsWith('.css') ? Object.assign(document.createElement('link'), { rel: 'stylesheet', href: '/static/vendor/' + f })
+      : Object.assign(document.createElement('script'), { src: '/static/vendor/' + f, async: true });
+    el.onload = ok; el.onerror = () => bad(new Error(f));
+    document.head.appendChild(el);
+  }))).then(() => window[name]);
+  VENDOR[name].catch(() => { delete VENDOR[name]; });       // a failed load is tried again next time
+  return VENDOR[name];
+}
+function darkScheme() {
+  const t = document.documentElement.getAttribute('data-theme');
+  return t ? t === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+}
+const MM_CACHE = new Map();                                 // theme + source -> svg (chat re-renders a message often)
+let mmQueue = Promise.resolve(); let mmSeq = 0;
+function mermaidSvg(src) {
+  const theme = darkScheme() ? 'dark' : 'default';
+  const key = theme + '\n' + src;
+  if (MM_CACHE.has(key)) return MM_CACHE.get(key);
+  // one diagram at a time (mermaid keeps global state), with the theme of the moment
+  const p = mmQueue = mmQueue.catch(() => {}).then(() => vendor('mermaid')).then((mm) => {
+    // labels as plain SVG text (no HTML in them at all), strict: no click handlers / links into scripts
+    // (dark: pie slices in the app's colours; mermaid's first dark slice is nearly black)
+    const pie = theme === 'dark' ? Object.fromEntries(['#5AA9FF', '#C792EA', '#3DDC6A', '#FFB547', '#56D4DD', '#FF6B63', '#8CC4FF', '#DDB3F5']
+      .map((c, i) => ['pie' + (i + 1), c])) : {};
+    mm.initialize({ startOnLoad: false, securityLevel: 'strict', theme, suppressErrorRendering: true, htmlLabels: false,
+      flowchart: { htmlLabels: false }, themeVariables: pie, fontFamily: getComputedStyle(document.body).fontFamily });
+    return mm.render('mm' + (++mmSeq), src);
+  }).then((r) => cleanSvg(r.svg));
+  MM_CACHE.set(key, p);
+  if (MM_CACHE.size > 60) MM_CACHE.delete(MM_CACHE.keys().next().value);
+  p.catch(() => MM_CACHE.delete(key));
+  return p;
+}
+// belt and braces on top of mermaid's own sanitising: no scripts, embedded HTML, event handlers or script links
+function cleanSvg(svg) {
+  const doc = new DOMParser().parseFromString(svg, 'image/svg+xml');
+  const root = doc.documentElement;
+  if (!root || root.nodeName !== 'svg') throw new Error('not svg');
+  for (const el of root.querySelectorAll('script, foreignObject, iframe, object, embed, img, image')) el.remove();
+  for (const el of [root, ...root.querySelectorAll('*')]) {
+    for (const a of [...el.attributes]) {
+      if (/^on/i.test(a.name) || (/href$/i.test(a.name) && !/^#/.test(a.value.trim()))) el.removeAttribute(a.name);
+    }
+  }
+  return new XMLSerializer().serializeToString(root);
+}
+function renderRich(root) {
+  if (!root) return;
+  const maths = $$('.math:not([data-done])', root);
+  if (maths.length) {
+    for (const el of maths) el.dataset.done = '1';
+    vendor('katex').then((katex) => {
+      for (const el of maths) {
+        try {
+          el.innerHTML = katex.renderToString(el.dataset.tex, { displayMode: el.classList.contains('display'), throwOnError: false,
+            trust: false, strict: 'ignore', maxExpand: 500, output: 'htmlAndMathml' });
+        } catch (_) { el.classList.add('bad'); }
+      }
+    }).catch(() => { for (const el of maths) delete el.dataset.done; });
+  }
+  for (const box of $$('.mermaid-box:not([data-done])', root)) {
+    box.dataset.done = '1';
+    mermaidSvg(box.dataset.src).then((svg) => {
+      const v = box.querySelector('.mm-view'); if (!v) return;
+      v.innerHTML = svg;                                    // mermaid's own output, sanitised (securityLevel strict)
+      box.classList.add('drawn');
+    }).catch(() => { box.classList.add('failed'); const v = box.querySelector('.mm-view'); if (v) v.textContent = '图表语法有误，显示源码'; });
+  }
+}
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('.mm-toggle'); if (!b) return;
+  const box = b.closest('.mermaid-box'); const src = !box.classList.contains('src');
+  box.classList.toggle('src', src); b.setAttribute('aria-pressed', String(src)); b.textContent = src ? '图' : '源码';
+});
+// the theme changed: diagrams are drawn again in its colours
+const themeHook = window.onThemeApplied;
+window.onThemeApplied = () => {
+  if (themeHook) themeHook();
+  for (const box of $$('.mermaid-box[data-done]')) { delete box.dataset.done; box.classList.remove('drawn', 'failed'); }
+  renderRich(document.body);
+};
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => window.onThemeApplied());
 const TOOL_ICON = { Bash: 'term', Shell: 'term', Read: 'file', Write: 'pencil', Edit: 'pencil', MultiEdit: 'pencil', Grep: 'search', Glob: 'search',
   WebFetch: 'globe', WebSearch: 'globe', Task: 'sparkle', Agent: 'sparkle', TodoWrite: 'list', AskUserQuestion: 'help' };
 function chatItemEl(it, el) {
@@ -1898,6 +2026,7 @@ function chatItemEl(it, el) {
   } else if (it.role === 'assistant') {
     el.classList.add('md');
     setHTML(el, md(it.text) + '<span class="ts">' + hhmm(it.ts) + '</span>');
+    renderRich(el);
   } else if (it.role === 'tool') {
     const i = it.text.indexOf(':');
     const name = it.tool || (i > 0 ? it.text.slice(0, i) : it.text);
@@ -3288,6 +3417,7 @@ function renderMemory() {
     '<div class="cell"><span class="grow sub">还没有保存的结论。助手确认重要结论后会自动保存；完整历史已在后台记录，可以在上面搜索。</span></div>';
   h += '</div>';
   setHTML(body, h);
+  renderRich(body);
   const q = $('#mem-q');
   q.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); memSearch(q.value); } };
   q.onsearch = () => memSearch(q.value);

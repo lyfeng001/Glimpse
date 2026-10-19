@@ -1137,7 +1137,13 @@ class Hub:
                         samesite="Strict", path="/")
 
     def issue_session(self, request):
-        tok, dev = self.auth.new_device(device_name(request), self.client_ip(request))
+        # logging in again on a device that already has a valid session (an installed app opening its start URL
+        # with a fresh pairing code): the credentials are used up, but the device keeps its session instead of
+        # becoming one more entry in 账号与设备
+        tok = self.request_token(request)
+        dev = self.auth.device_for(tok) if tok else None
+        if not dev:
+            tok, dev = self.auth.new_device(device_name(request), self.client_ip(request))
         resp = web.json_response({"ok": True, "session": tok, "device": dev["id"]})
         self.set_cookie(resp, tok)
         self.auth.ok(self.client_ip(request))

@@ -521,7 +521,13 @@ async function boot() {
   const pair = u.searchParams.get('pair');
   if (u.searchParams.has('t')) u.searchParams.delete('t');             // links from older versions: ignored
   if (pair) {
-    try { await loginWith({ pair }); } catch (e) { S.pairErr = e.status === 429 ? '尝试次数过多，请稍后再试' : '登录链接无效或已过期，请在电脑上重新运行 gli url'; }
+    // an installed app opens its start URL, which carries a fresh pairing code (for iOS Home Screen apps, which
+    // don't share Safari's login). Already logged in: keep that session; pairing again added a device per launch
+    let known = false;
+    try { await api('/api/me'); known = true; } catch (_) {}
+    if (!known) {
+      try { await loginWith({ pair }); } catch (e) { S.pairErr = e.status === 429 ? '尝试次数过多，请稍后再试' : '登录链接无效或已过期，请在电脑上重新运行 gli url'; }
+    }
     u.searchParams.delete('pair');
   }
   if (pair || location.search) history.replaceState(null, '', u.pathname + u.hash);

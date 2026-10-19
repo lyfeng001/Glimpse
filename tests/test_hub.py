@@ -952,6 +952,35 @@ def test_login_pairing_password_devices(hub_mod, tmp_path):
     asyncio.run(run())
 
 
+def test_login_again_keeps_the_device(hub_mod):
+    """An installed app opens its start URL (a fresh pairing code) on every launch: an already logged-in device
+    keeps its session and stays one entry in the device list; the code is used up all the same."""
+    from aiohttp.test_utils import TestClient, TestServer
+    C, server = hub_mod
+
+    async def run():
+        hub = server.Hub(C.load())
+        client = TestClient(TestServer(hub.app()))
+        await client.start_server()
+        try:
+            r = await client.post("/api/login", json={"pair": hub.auth.new_pair()})
+            tok = (await r.json())["session"]
+            auth = {"Authorization": "Bearer " + tok}
+            code = hub.auth.new_pair()
+            r = await client.post("/api/login", json={"pair": code}, headers=auth)
+            assert r.status == 200 and (await r.json())["session"] == tok
+            r = await client.get("/api/devices", headers=auth)
+            assert len((await r.json())["devices"]) == 1
+            assert (await client.post("/api/login", json={"pair": code})).status == 401      # used up
+            # a revoked session is no session: logging in makes a new device
+            hub.auth.revoke_all()
+            r = await client.post("/api/login", json={"pair": hub.auth.new_pair()}, headers=auth)
+            assert r.status == 200 and (await r.json())["session"] != tok
+        finally:
+            await client.close()
+    asyncio.run(run())
+
+
 def test_cli_token_only_from_localhost(hub_mod):
     C, server = hub_mod
     hub = server.Hub(C.load())

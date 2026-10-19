@@ -337,6 +337,7 @@ def test_new_session_url(hub_mod, monkeypatch, tmp_path):
     assert parse(server.new_session_url(cfg, "src")) == (str(d / "src"), "M1")                    # relative to here
     with pytest.raises(ValueError):
         server.new_session_url(cfg, str(d / "missing"))
+    assert server.new_session_url(cfg, str(d), "https://127.0.0.1:8443/").startswith("https://127.0.0.1:8443/#new?cwd=")
     cfg["machines"] = []
     assert parse(server.new_session_url(cfg, str(d)))[1] is None
     server.RUNTIME.clear()
@@ -377,6 +378,32 @@ def test_finder_quick_action(tmp_path):
     assert subprocess.run(["/bin/sh", str(sh)], capture_output=True, text=True).stdout == ""   # nothing selected
     sh.write_text(finder.script("https://h:1/", "").replace("/usr/bin/open", "printf '%s'"))
     assert subprocess.run(["/bin/sh", str(sh), "/a"], capture_output=True, text=True).stdout == "https://h:1/#new?cwd=%2Fa"
+    # an installed Glimpse window: the link opens in it (open -a APP URL)
+    app = "/Users/x/Applications/Chrome Apps.localized/Glimpse.app"
+    sh.write_text(finder.script("https://127.0.0.1:8443/", "M1", app).replace("/usr/bin/open", "printf '%s|'"))
+    out = subprocess.run(["/bin/sh", str(sh), "/a b"], capture_output=True, text=True).stdout
+    assert out == "-a|%s|https://127.0.0.1:8443/#new?cwd=%%2Fa%%20b&m=M1|" % app
+
+
+def test_finder_finds_the_installed_web_app(tmp_path):
+    import plistlib
+    import finder
+
+    def app(where, name, url, **extra):
+        c = tmp_path / where / (name + ".app") / "Contents"
+        c.mkdir(parents=True)
+        with open(c / "Info.plist", "wb") as f:
+            plistlib.dump(dict({"CFBundleName": name, "CrAppModeShortcutURL": url}, **extra), f)
+        return str(c.parent)
+    a = app("Chrome Apps.localized", "Glimpse", "https://127.0.0.1:8443/?pair=old")   # installed from a login link
+    app("Chrome Apps.localized", "Other", "https://127.0.0.1:9000/")
+    app("Chrome Apps.localized", "Elsewhere", "https://example.com:8443/")
+    app(".", "Plain", "")
+    roots = [str(tmp_path)]
+    assert finder.desktop_app(8443, {"127.0.0.1", "mac.ts.net"}, roots) == (a, "https://127.0.0.1:8443/")
+    assert finder.desktop_app(8443, {"mac.ts.net"}, roots) is None             # another host: not ours
+    assert finder.desktop_app(7000, {"127.0.0.1"}, roots) is None
+    assert finder.desktop_app(8443, {"127.0.0.1"}, [str(tmp_path / "missing")]) is None
 
 
 def test_create_ultracode_and_codex_ultra_control(hub_mod):
@@ -801,6 +828,23 @@ def test_keybalance_rebalance_only_when_it_helps():
     assert KB.should_rebalance("k1", ["k1", "k2"], u2, in_use={"k1": 1, "k2": 1}, rates={"k1": 1e-4, "k2": 1e-4}, now=now) is None
     # no measured rates yet: no move
     assert KB.should_rebalance("k1", ["k1", "k2"], u, in_use={"k1": 3, "k2": 1}, now=now) is None
+
+
+def test_keybalance_rebalance_moves_the_sessions_own_spend():
+    # seen 2026-10-19: one busy session alone on k2 (k1 the most used key, with an idle session; k3 unused) was moved
+    # to k1. The session's spend was estimated as the average over all sessions (idle ones pull it down), so moving
+    # it looked like a big win, and among the then-equal candidates config order picked k1.
+    import keybalance as KB
+    now = 1000.0
+    names = ["k1", "k2", "k3", "k5"]
+    u = {"k1": _wk(600, 61, 6.5, now), "k2": _wk(600, 7, 6.5, now), "k3": _wk(600, 0, 6.5, now), "k5": _wk(600, 0, 6.5, now)}
+    # k5: two idle (codex) sessions, measured rate 0
+    rates = {"k1": 1e-4, "k2": 1e-3, "k5": 0.0}
+    # the only spender on k2: moving it just moves its spend, nothing gets better -> stay
+    assert KB.should_rebalance("k2", names, u, in_use={"k1": 1, "k2": 1, "k5": 2}, rates=rates, now=now) is None
+    # two busy sessions on k2: one moves, and to the least loaded key (k3), not to the first in config order
+    rates["k2"] = 2e-3
+    assert KB.should_rebalance("k2", names, u, in_use={"k1": 1, "k2": 2, "k5": 2}, rates=rates, now=now) == "k3"
 
 
 def test_keybalance_fatal_and_exhausted():

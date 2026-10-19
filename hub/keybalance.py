@@ -163,7 +163,10 @@ def pick_key(names, usage, exhausted=(), in_use=None, avoid=(), rates=None, now=
 
 def should_rebalance(cur, names, usage, exhausted=(), in_use=None, rates=None, now=None, gain=0.2):
     """Between turns: another key for one session on `cur` when moving it lowers the higher of the two
-    load ratios by at least `gain` (20 %). None = stay. Needs 7-day usage on both keys."""
+    load ratios by at least `gain` (20 %). None = stay. Needs 7-day usage on both keys.
+    What moves is that session's own spend (its key's measured rate / its sessions), not the average session's:
+    idle sessions elsewhere pull the average down, and a busy session alone on its key would look like a big win
+    when it only carries its spend to another key."""
     in_use = in_use or {}
     ld = loads(names, usage, rates, in_use, now)
     if cur not in ld or ld[cur][0] is None:
@@ -172,17 +175,24 @@ def should_rebalance(cur, names, usage, exhausted=(), in_use=None, rates=None, n
     if not sr:
         return None
     c0, r0, k0 = ld[cur]
-    before_cur = ratio(c0, r0, k0, sr)
-    after_cur = ratio(c0, r0, k0, sr, extra=-1)
+    mine = r0 / k0 if r0 is not None and k0 > 0 else sr          # what this session spends
+    spend0 = r0 if r0 is not None else k0 * sr
+
+    def load(c, spend):
+        return float("inf") if c <= 0 else max(0.0, spend) / c
+    before_cur, after_cur = load(c0, spend0), load(c0, spend0 - mine)
     best = None
-    for n in names:
+    for i, n in enumerate(names):
         if n == cur or not usable(n, usage, exhausted, ()):
             continue
         c, r, k = ld[n]
         if c is None:
             continue
-        before = max(before_cur, ratio(c, r, k, sr))
-        after = max(after_cur, ratio(c, r, k, sr, extra=1))
-        if before > 0 and after <= before * (1 - gain) and (best is None or after < best[0]):
-            best = (after, n)
+        spend = r if r is not None else k * sr
+        there = load(c, spend + mine)
+        before, after = max(before_cur, load(c, spend)), max(after_cur, there)
+        # equal results: the key that ends up least loaded, then fewer sessions, then config order
+        score = (after, there, k, i)
+        if before > 0 and after <= before * (1 - gain) and (best is None or score < best[0]):
+            best = (score, n)
     return best[1] if best else None

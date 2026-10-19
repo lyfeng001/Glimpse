@@ -24,16 +24,59 @@ BUNDLE_ID = "com.glimpse.new-session"
 SERVICES = os.path.expanduser("~/Library/Services")
 
 
-def script(base, mid):
-    """base = the hub's URL ("https://host:port/"), mid = this computer's machine id (may be "")."""
+def script(base, mid, app=None):
+    """base = the hub's URL ("https://host:port/"), mid = this computer's machine id (may be ""), app = the
+    installed Glimpse window (a browser's web app) to open the link in, else the default browser."""
     from urllib.parse import quote
     m = "&m=" + quote(mid, safe="") if mid else ""
     return ("[ -n \"$1\" ] || exit 0\n"
             "q=$(/usr/bin/osascript -l JavaScript -e 'function run(a) { return encodeURIComponent(a[0]) }' \"$1\") || exit 1\n"
-            "exec /usr/bin/open %s\"$q\"%s\n") % (shlex.quote(base + "#new?cwd="), shlex.quote(m) if m else "")
+            "exec /usr/bin/open %s%s\"$q\"%s\n") % ("-a %s " % shlex.quote(app) if app else "",
+                                                  shlex.quote(base + "#new?cwd="), shlex.quote(m) if m else "")
 
 
-def workflow(base, mid):
+def desktop_app(port, hosts, roots=None):
+    """The Glimpse window installed from a Chromium browser (Chrome / Edge / Brave: 安装 / 创建快捷方式 → 窗口):
+    (app path, its address). The address matters: the login cookie belongs to the one it was installed from.
+    None when there is none."""
+    from urllib.parse import urlsplit
+    roots = roots or [os.path.expanduser("~/Applications"), "/Applications"]
+    found = []
+    for r in roots:
+        try:
+            subs = [r] + [os.path.join(r, d) for d in os.listdir(r) if d.endswith(" Apps.localized")]
+        except OSError:
+            continue
+        for d in subs:
+            try:
+                apps = [os.path.join(d, a) for a in os.listdir(d) if a.endswith(".app")]
+            except OSError:
+                continue
+            for a in apps:
+                try:
+                    with open(os.path.join(a, "Contents", "Info.plist"), "rb") as f:
+                        url = plistlib.load(f).get("CrAppModeShortcutURL") or ""
+                    u = urlsplit(url)
+                    if u.scheme == "https" and u.port == port and (u.hostname or "") in hosts:
+                        found.append((os.path.getmtime(a), a, "https://%s/" % u.netloc))
+                except (OSError, ValueError, plistlib.InvalidFileException):
+                    continue
+    return max(found)[1:] if found else None
+
+
+def link_target(cfg):
+    """(hub address, app or None) for links opened on this computer: the installed Glimpse window and its
+    address when there is one, else the default browser and the address `gli url` prints."""
+    import server
+    base = server.hub_base_url(cfg)
+    listen, name = server.resolve_hub(cfg)
+    port = (listen[0] if listen else {"port": 8443})["port"]
+    hosts = {x["host"] for x in listen} | {"127.0.0.1", "localhost"} | ({name} if name else set())
+    app = desktop_app(port, hosts) if sys.platform == "darwin" else None
+    return (app[1], app[0]) if app else (base, None)
+
+
+def workflow(base, mid, app=None):
     """(Info.plist, document.wflow) as dicts."""
     info = {
         "NSServices": [{
@@ -56,7 +99,7 @@ def workflow(base, mid):
             "ActionBundlePath": "/System/Library/Automator/Run Shell Script.action",
             "ActionName": "Run Shell Script",
             "ActionParameters": {
-                "COMMAND_STRING": script(base, mid),
+                "COMMAND_STRING": script(base, mid, app),
                 "CheckedForUserDefaultShell": True,
                 "inputMethod": 1,                      # 1 = as arguments
                 "shell": "/bin/sh",
@@ -106,9 +149,9 @@ def workflow(base, mid):
     return info, doc
 
 
-def write(dest, base, mid):
+def write(dest, base, mid, app=None):
     """Write the .workflow bundle at `dest` (replacing an older one of ours)."""
-    info, doc = workflow(base, mid)
+    info, doc = workflow(base, mid, app)
     contents = os.path.join(dest, "Contents")
     os.makedirs(contents, exist_ok=True)
     with open(os.path.join(contents, "Info.plist"), "wb") as f:
@@ -134,31 +177,49 @@ def refresh_services():
         pass
 
 
-def hub_link():
-    """The hub's URL (as `gli url` prints it: its certificate and your login cookie belong to that name) and this
-    computer's machine id, from config.json."""
+def load_cfg():
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     try:
         import config as C
-        import server
+        __import__("server")                     # needs the .venv (aiohttp)
     except ImportError as e:
         raise SystemExit("run `gli setup` first (%s)" % e)
-    cfg = C.load()
-    return server.hub_base_url(cfg), server.local_machine_id(cfg)
+    return C.load()
+
+
+def cmd_new(path):
+    """gli new PATH: the new-session form for PATH, in the Glimpse window if one is installed."""
+    cfg = load_cfg()
+    import server
+    base, app = link_target(cfg)
+    try:
+        url = server.new_session_url(cfg, path, base)
+    except ValueError as e:
+        raise SystemExit("gli new: %s" % e)
+    if sys.platform == "darwin":
+        os.execv("/usr/bin/open", ["open"] + (["-a", app] if app else []) + [url])
+    if shutil.which("xdg-open"):
+        os.execvp("xdg-open", ["xdg-open", url])
+    print(url)
 
 
 def main(argv):
+    cmd = argv[0] if argv else ""
+    if cmd == "new":
+        return cmd_new(argv[1] if len(argv) > 1 else ".")
     if sys.platform != "darwin":
         raise SystemExit("the Finder Quick Action is macOS only; use `gli new PATH` instead")
-    cmd = argv[0] if argv else ""
     dest = os.path.join(SERVICES, NAME + ".workflow")
     if cmd == "install":
         if os.path.exists(dest) and not ours(dest):
             raise SystemExit("%s exists and is not Glimpse's; not touching it" % dest)
-        base, mid = hub_link()
-        write(dest, base, mid)
+        cfg = load_cfg()
+        import server
+        base, app = link_target(cfg)
+        mid = server.local_machine_id(cfg)
+        write(dest, base, mid, app)
         refresh_services()
-        print("installed %s (opens %s, machine %s)" % (dest, base, mid or "-"))
+        print("installed %s\n  opens %s in %s, machine %s" % (dest, base, app or "the default browser", mid or "-"))
         print("Finder: right-click a folder → 快速操作 (or 服务) → %s" % MENU)
         print("not in the menu? turn on “%s” in System Settings → 键盘 → 键盘快捷键 → 服务 "
               "(or 隐私与安全性 → 扩展 → 访达)" % MENU)
@@ -172,7 +233,7 @@ def main(argv):
             refresh_services()
             print("removed " + dest)
     else:
-        raise SystemExit("usage: finder.py install|uninstall")
+        raise SystemExit("usage: finder.py new [PATH] | install | uninstall")
 
 
 if __name__ == "__main__":

@@ -1392,9 +1392,10 @@ def hub_base_url(cfg):
     return "https://%s:%s/" % (name or first["host"], first["port"])
 
 
-def new_session_url(cfg, path):
+def new_session_url(cfg, path, base=None):
     """`gli new PATH` / the Finder Quick Action: a link that opens the web app's new-session sheet with this
-    computer and PATH filled in (a file: its folder). It only fills the form; nothing starts until 创建."""
+    computer and PATH filled in (a file: its folder). It only fills the form; nothing starts until 创建.
+    base: the hub address to use (default: the one `gli url` prints)."""
     from urllib.parse import quote
     p = os.path.abspath(os.path.expanduser(path or "."))
     if not os.path.exists(p):
@@ -1405,7 +1406,7 @@ def new_session_url(cfg, path):
     mid = local_machine_id(cfg)
     if mid:
         q += "&m=" + quote(mid, safe="")
-    return hub_base_url(cfg) + "#new?" + q
+    return (base or hub_base_url(cfg)) + "#new?" + q
 
 
 def local_machine_id(cfg):

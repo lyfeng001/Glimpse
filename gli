@@ -62,12 +62,7 @@ case "${1:-help}" in
   devices)  exec "$PY" "$HUB" --devices ;;
   logout)   shift; exec "$PY" "$HUB" --revoke "${1:?usage: gli logout DEVICE_ID|all}" ;;
   test)     exec "$PY" -m pytest -q "$DIR/tests" ;;
-  new)
-    # the new-session form in the browser, with this computer and PATH (default: here) filled in
-    URL="$("$PY" "$HUB" --new-url "${2:-.}")"
-    if [ "$(uname)" = Darwin ]; then exec open "$URL"; fi
-    if command -v xdg-open >/dev/null 2>&1; then exec xdg-open "$URL"; fi
-    echo "$URL" ;;
+  new)      exec "$PY" "$DIR/hub/finder.py" new "${2:-.}" ;;
   finder-install)   exec "$PY" "$DIR/hub/finder.py" install ;;
   finder-uninstall) exec "$PY" "$DIR/hub/finder.py" uninstall ;;
   attach)

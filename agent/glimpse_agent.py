@@ -1841,14 +1841,14 @@ class Session:
             return False
         if not is_transient_error(err) or self.ac_count >= AUTO_CONTINUE_MAX:
             if self.ac_count >= AUTO_CONTINUE_MAX:
-                self.event("error", "连续 %d 次自动继续都没成功，已停止" % AUTO_CONTINUE_MAX, err)
+                self.event("error", "自动发了 %d 次“继续”都还是出错，已停下，请看一下" % AUTO_CONTINUE_MAX, err)
             return False
         delay = AUTO_CONTINUE_DELAYS[min(self.ac_count, len(AUTO_CONTINUE_DELAYS) - 1)]
         self.ac_count += 1
         self.ac_pending = True
         n = self.ac_count
         self.set_status("waiting", "临时错误，%d 秒后自动继续（第 %d/%d 次）" % (delay, n, AUTO_CONTINUE_MAX), None)
-        it = self.add_chat("system", "—— %s：%d 秒后自动发送“%s”（连续第 %d/%d 次，成功一轮后重新计数）——"
+        it = self.add_chat("system", "—— %s：%d 秒后自动发送“%s”（已连着出错 %d 次，到 %d 次就停下通知你；AI 正常回复完一次后从 0 算起）——"
                            % (clip(err, 120), delay, AUTO_CONTINUE_TEXT, n, AUTO_CONTINUE_MAX))
         if it:
             self.d.send_subs(self, {"t": "chat", "sid": self.sid, "items": [it]})

@@ -2470,7 +2470,7 @@ function fillMore() {
   $('#act-ac-row').hidden = !ai;
   if (ai) {
     $('#act-ac').checked = !!s.auto_continue;
-    $('#act-ac-sub').textContent = s.auto_continue ? (s.ac_count ? '已自动继续 ' + s.ac_count + ' 次（成功一轮后清零，最多连续 5 次）' : '已开启：遇到临时错误会自动发送“继续”')
+    $('#act-ac-sub').textContent = s.auto_continue ? (s.ac_count ? '已连着出错并自动继续 ' + s.ac_count + ' 次（到 5 次就停下通知你；AI 正常回复完一次后从 0 算起）' : '已开启：遇到临时错误会自动发送“继续”')
       : '服务器过载、流中断、输出被截断时自动发送“继续”；Key 余额不足等仍会通知你';
   }
   const running = s && s.status !== 'exited' && s.status !== 'error';

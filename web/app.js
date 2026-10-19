@@ -660,6 +660,12 @@ function onMsg(m) {
       refreshOpenSheets();
       newFromRouteNow();
       break;
+    case 'ui_new':         // `gli new` / Finder (hub computer only): the new-session form for a folder
+      if (typeof m.cwd === 'string' && m.cwd) {
+        newRoute = { cwd: m.cwd.slice(0, 4096), m: typeof m.m === 'string' ? m.m : '' };
+        if (S.haveState) newFromRouteNow();
+      }
+      break;
     case 'pong':
       clearTimeout(S.pongTimer); S.pongTimer = null; S.lastPong = performance.now();
       flushOutbox();

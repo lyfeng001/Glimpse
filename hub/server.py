@@ -2,6 +2,7 @@
 """Glimpse hub: serves the phone web app and relays between phones and machine agents."""
 import argparse
 import asyncio
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -33,6 +34,7 @@ VERSION = "0.4.1"
 log = logging.getLogger("glimpse.hub")
 PHONE_QUEUE_MAX = 4000       # messages; a phone that falls this far behind is disconnected
 VISIBLE_FRESH = 15           # s; a "visible" phone that has been silent longer is treated as gone (push again)
+UI_HOLD = 60                 # s; `gli new` waits this long for a Glimpse window on this computer to come on screen
 CODE_CHECK_EVERY = 10        # s; how often the agent source on disk is checked against what the machines run
 FS_ACTIONS = ("list", "read", "git", "diff", "write", "create", "mkdir")
 FS_TEXT_LIMIT = 2 * 1024 * 1024   # characters in a saved / new file (the agent checks the encoded size too)
@@ -193,9 +195,10 @@ async def ssh_test(host, port=None):
 class Phone:
     """One websocket. Messages go through a queue so a slow phone never stalls the machines."""
 
-    def __init__(self, ws, device=None):
+    def __init__(self, ws, device=None, local=False):
         self.ws = ws
         self.device = device       # device session id (None: local CLI)
+        self.local = local         # connected from this computer (127.0.0.1): a window on the hub's own desktop
         self.subs = set()          # (m, sid)
         self.visible = True
         self.last_seen = time.time()
@@ -236,6 +239,7 @@ class Hub:
         self.push_path = os.path.join(DATA, "push_subs.json")
         self.push_subs = self._load_push()
         self.phones = set()
+        self.ui_pending = None       # a `gli new` form waiting for a Glimpse window on this computer
         self.machines = {}
         self.order = []
         self.sub_count = {}        # (m, sid) -> number of phones subscribed
@@ -719,6 +723,7 @@ class Hub:
             return
         if op == "visible":
             p.visible = bool(msg.get("v"))
+            self.ui_flush()
             return
         if op in ("machine_test", "machine_add", "machine_update", "machine_remove"):
             try:
@@ -1201,7 +1206,7 @@ class Hub:
     @web.middleware
     async def auth_mw(self, request, handler):
         p = request.path
-        if (p.startswith("/api/") and p not in ("/api/login", "/api/logout")) or p == "/ws":
+        if (p.startswith("/api/") and p not in ("/api/login", "/api/logout", "/api/ui/new")) or p == "/ws":
             if not self.authed(request):
                 raise web.HTTPUnauthorized(text="login required")
         resp = await handler(request)
@@ -1242,13 +1247,64 @@ class Hub:
         await self.push_all({"title": "Glimpse 测试通知", "body": "通知已经可以正常工作", "tag": "test", "url": "/"})
         return web.json_response({"ok": True, "count": len(self.push_subs)})
 
+    # --- `gli new` / the Finder Quick Action: open the new-session form in the Glimpse window on this computer.
+    # A link can't do it: Chrome opens an installed web app at its start page and drops the URL it was given.
+    def ui_token_ok(self, request):
+        """From this computer only, with the CLI token or the Quick Action's own token (finder.json holds its
+        SHA-256; the token can do nothing but this)."""
+        if not self.is_local(request):
+            return False
+        tok = self.request_token(request)
+        if not tok:
+            return False
+        if hmac.compare_digest(tok.encode(), self.token.encode()):
+            return True
+        try:
+            with open(os.path.join(DATA, "finder.json")) as f:
+                want = json.load(f).get("token_sha256") or ""
+        except (OSError, ValueError):
+            return False
+        return bool(want) and hmac.compare_digest(hashlib.sha256(tok.encode()).hexdigest(), want)
+
+    async def ui_new(self, request):
+        """{"cwd", "m"?} -> the new-session form in this computer's Glimpse window (the one on screen; when none is,
+        the next one that comes on screen within UI_HOLD). Only fills the form: nothing starts until 启动.
+        JSON only, so a web page can't send it without a CORS preflight (which gets no CORS answer)."""
+        if not self.ui_token_ok(request):
+            raise web.HTTPUnauthorized(text="login required")
+        if request.content_type != "application/json":
+            raise web.HTTPUnsupportedMediaType(text="json only")
+        body = await self.json_body(request)
+        cwd, mid = body.get("cwd"), body.get("m")
+        if not isinstance(cwd, str) or not cwd.strip() or len(cwd) > 4096 or "\x00" in cwd:
+            raise web.HTTPBadRequest(text="bad cwd")
+        if not (isinstance(mid, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,32}", mid)):
+            mid = None                           # (an unknown one: the web app falls back to this computer)
+        self.ui_pending = {"t": "ui_new", "cwd": cwd, "m": mid, "until": time.time() + UI_HOLD}
+        return web.json_response({"ok": True, "delivered": self.ui_flush()})
+
+    def ui_flush(self):
+        """Hand a pending ui_new to the local windows on screen. True when one got it."""
+        u = self.ui_pending
+        if not u:
+            return False
+        if time.time() > u["until"]:
+            self.ui_pending = None
+            return False
+        to = [p for p in self.phones if p.local and p.on_screen()]
+        for p in to:
+            p.send({k: v for k, v in u.items() if k != "until"})
+        if to:
+            self.ui_pending = None
+        return bool(to)
+
     async def ws(self, request):
         if not origin_ok(request):
             raise web.HTTPForbidden(text="bad origin")
         ws = web.WebSocketResponse(heartbeat=20, max_msg_size=8 * 1024 * 1024, compress=True)
         await ws.prepare(request)
         dev = self.auth.device_for(self.request_token(request))
-        p = Phone(ws, dev and dev["id"])
+        p = Phone(ws, dev and dev["id"], local=self.is_local(request))
         self.phones.add(p)
         p.send(self.state())
         try:
@@ -1287,6 +1343,7 @@ class Hub:
         app.router.add_post("/api/push/subscribe", self.push_subscribe)
         app.router.add_post("/api/push/unsubscribe", self.push_unsubscribe)
         app.router.add_post("/api/push/test", self.push_test)
+        app.router.add_post("/api/ui/new", self.ui_new)
         app.router.add_get("/ws", self.ws)
         app.on_startup.append(self.startup)
         app.on_cleanup.append(self.cleanup)
@@ -1413,17 +1470,20 @@ def hub_base_url(cfg):
     return "https://%s:%s/" % (name or first["host"], first["port"])
 
 
+def session_dir(path):
+    """`gli new PATH`: the folder (a file: its folder), absolute. ValueError when it doesn't exist."""
+    p = os.path.abspath(os.path.expanduser(path or "."))
+    if not os.path.exists(p):
+        raise ValueError("no such file or folder: " + p)
+    return p if os.path.isdir(p) else os.path.dirname(p)
+
+
 def new_session_url(cfg, path, base=None):
     """`gli new PATH` / the Finder Quick Action: a link that opens the web app's new-session sheet with this
     computer and PATH filled in (a file: its folder). It only fills the form; nothing starts until 创建.
     base: the hub address to use (default: the one `gli url` prints)."""
     from urllib.parse import quote
-    p = os.path.abspath(os.path.expanduser(path or "."))
-    if not os.path.exists(p):
-        raise ValueError("no such file or folder: " + p)
-    if not os.path.isdir(p):
-        p = os.path.dirname(p)
-    q = "cwd=" + quote(p, safe="")
+    q = "cwd=" + quote(session_dir(path), safe="")
     mid = local_machine_id(cfg)
     if mid:
         q += "&m=" + quote(mid, safe="")

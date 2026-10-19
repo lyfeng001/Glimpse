@@ -378,11 +378,16 @@ def test_finder_quick_action(tmp_path):
     assert subprocess.run(["/bin/sh", str(sh)], capture_output=True, text=True).stdout == ""   # nothing selected
     sh.write_text(finder.script("https://h:1/", "").replace("/usr/bin/open", "printf '%s'"))
     assert subprocess.run(["/bin/sh", str(sh), "/a"], capture_output=True, text=True).stdout == "https://h:1/#new?cwd=%2Fa"
-    # an installed Glimpse window: the link opens in it (open -a APP URL)
+    # an installed Glimpse window but no way to reach the hub over 127.0.0.1: the link, in the default browser
+    # (Chrome would open the web app at its start page and drop the link)
     app = "/Users/x/Applications/Chrome Apps.localized/Glimpse.app"
     sh.write_text(finder.script("https://127.0.0.1:8443/", "M1", app).replace("/usr/bin/open", "printf '%s|'"))
     out = subprocess.run(["/bin/sh", str(sh), "/a b"], capture_output=True, text=True).stdout
-    assert out == "-a|%s|https://127.0.0.1:8443/#new?cwd=%%2Fa%%20b&m=M1|" % app
+    assert out == "https://127.0.0.1:8443/#new?cwd=%2Fa%20b&m=M1|"
+    # with the relay the token is not on curl's command line (stdin, -K -)
+    s = finder.script("https://x/", "M1", app, ("https://127.0.0.1:8443/api/ui/new", ["--cacert", "/c a.crt"], "SECRET"))
+    curl = [ln for ln in s.splitlines() if ln.startswith("/usr/bin/curl")][0]
+    assert "SECRET" not in curl and "-K -" in curl and "'/c a.crt'" in curl and 'header = "Authorization: Bearer SECRET"' in s
 
 
 def test_local_cert(tmp_path):
@@ -449,6 +454,77 @@ def test_site_context_loopback(hub_mod):
     assert server.site_context("100.96.1.2", ts, local) is ts
     assert server.site_context("127.0.0.1", ts, None) is ts
     assert server.site_context("127.0.0.1", None, local) is None       # no TLS elsewhere: keep one scheme
+
+
+def test_ui_new_through_the_hub(hub_mod, tmp_path, monkeypatch):
+    """`gli new` / the Quick Action: the generated script (real curl) asks the hub, the hub hands the form to the
+    Glimpse window on this computer that is on screen, never to other devices; tokens and origin are checked."""
+    import hashlib
+    from aiohttp.test_utils import TestClient, TestServer
+    import finder
+    C, server = hub_mod
+    if sys.platform != "darwin":
+        pytest.skip("the Quick Action script uses macOS tools")
+
+    async def run():
+        hub = server.Hub(C.load())
+        client = TestClient(TestServer(hub.app()))
+        await client.start_server()
+        try:
+            r = await client.post("/api/login", json={"pair": hub.auth.new_pair()})
+            sess = {"Authorization": "Bearer " + (await r.json())["session"]}
+            win = await client.ws_connect("/ws", headers=sess)
+            assert json.loads((await win.receive()).data)["t"] == "state"
+            await win.send_json({"op": "visible", "v": True})
+            await asyncio.sleep(0.05)
+            url = "http://127.0.0.1:%d/api/ui/new" % client.port
+            tok = "finder-token-abc"
+            C.write_secret(os.path.join(C.DATA, "finder.json"), json.dumps({"token_sha256": hashlib.sha256(tok.encode()).hexdigest()}))
+            sh = tmp_path / "qa.sh"
+            sh.write_text(finder.script("https://x/", "M1", "/Apps/Glimpse.app", (url, [], tok))
+                          .replace("exec /usr/bin/open", "echo OPEN"))
+            d = "/Users/x/我的 项目 & \"q\" $(touch boom)"
+            p = await asyncio.create_subprocess_exec("/bin/sh", str(sh), d, cwd=str(tmp_path),
+                                                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            out, err = await p.communicate()
+            assert p.returncode == 0, err
+            assert out.decode().strip() == "OPEN -a /Apps/Glimpse.app" and not (tmp_path / "boom").exists()
+            got = json.loads((await win.receive(timeout=3)).data)
+            assert got == {"t": "ui_new", "cwd": d, "m": "M1"}
+            # the CLI token works too; a session token, a wrong token, no token, form posts, another computer: no
+            r = await client.post("/api/ui/new", json={"cwd": "/a"}, headers={"Authorization": "Bearer " + hub.token})
+            assert r.status == 200 and (await r.json())["delivered"] is True
+            assert json.loads((await win.receive(timeout=3)).data)["cwd"] == "/a"
+            for h in (sess, {"Authorization": "Bearer nope"}, {}):
+                assert (await client.post("/api/ui/new", json={"cwd": "/a"}, headers=h)).status == 401
+            r = await client.post("/api/ui/new", data="cwd=/a", headers={"Authorization": "Bearer " + tok,
+                                                                          "Content-Type": "text/plain"})
+            assert r.status == 415
+            assert (await client.post("/api/ui/new", json={"cwd": ""}, headers={"Authorization": "Bearer " + tok})).status == 400
+            with monkeypatch.context() as mp:                # as if from another computer on the tailnet
+                mp.setattr(server.Hub, "client_ip", staticmethod(lambda req: "100.64.1.2"))
+                r = await client.post("/api/ui/new", json={"cwd": "/a"}, headers={"Authorization": "Bearer " + tok})
+                assert r.status == 401
+            # no window on screen: held, and handed over when one comes on screen (not to a phone elsewhere)
+            await win.send_json({"op": "visible", "v": False})
+            await asyncio.sleep(0.05)
+            for ph in hub.phones:
+                ph.local = True
+            r = await client.post("/api/ui/new", json={"cwd": "/held"}, headers={"Authorization": "Bearer " + tok})
+            assert (await r.json())["delivered"] is False
+            for ph in hub.phones:
+                ph.local = False                       # as if it were a phone over Tailscale
+            await win.send_json({"op": "visible", "v": True})
+            await asyncio.sleep(0.1)
+            assert hub.ui_pending is not None
+            for ph in hub.phones:
+                ph.local = True
+            await win.send_json({"op": "visible", "v": True})
+            assert json.loads((await win.receive(timeout=3)).data)["cwd"] == "/held" and hub.ui_pending is None
+            await win.close()
+        finally:
+            await client.close()
+    asyncio.run(run())
 
 
 def test_finder_finds_the_installed_web_app(tmp_path):

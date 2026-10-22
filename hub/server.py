@@ -136,6 +136,7 @@ EN = {
     "通知已经可以正常工作": "Notifications work",
     "知识库未配置（设置 → 扩展）": "No vault configured (Settings → Extensions)",
     "定时任务开始了：%s": "Scheduled task started: %s",
+    "定时任务没有启动：%s": "Scheduled task did not start: %s",
     "定时任务的“%s”不对": "The scheduled task's %s is not valid",
     "没有这个定时任务": "No such scheduled task",
     "%s 离线": "%s is offline",
@@ -474,10 +475,17 @@ class Hub:
             prev = m.sessions.get(r.get("sid")) if r.get("sid") else None
             if prev and prev.get("status") in ("running", "starting", "waiting"):
                 continue                       # the previous run is still busy
-            asyncio.ensure_future(self.sched_start(x, m, slot))
+            asyncio.ensure_future(self.sched_start_quiet(x, m, slot))
         if changed:
             self._save_sched()
             self.state_dirty.set()
+
+    async def sched_start_quiet(self, x, m, slot):
+        """sched_start from the loop: a failure is recorded (and pushed) there, nothing to raise to."""
+        try:
+            await self.sched_start(x, m, slot)
+        except ValueError:
+            pass
 
     async def sched_start(self, x, m, slot=None):
         """Start the task's session; returns its session info (or raises ValueError)."""
@@ -510,6 +518,10 @@ class Hub:
             # recorded as this slot's run: a failing task does not start a new session every 20 s
             r.update(last=slot or r.get("last") or time.time(), ran=time.time(), error=str(e) or tr("超时"))
             log.warning("scheduled task %s failed: %s", x["id"], e)
+            if slot is not None:               # at its time nobody is watching: say it did not start
+                await self.push_all({"title": tr("定时任务没有启动：%s", x["name"]), "body": r["error"][:200],
+                                     "subtitle": "%s %s" % (m.id, m.name), "tag": "sched:" + x["id"], "url": "/",
+                                     "kind": "error"})
             raise ValueError(r["error"])
         finally:
             self.sched_busy.discard(x["id"])

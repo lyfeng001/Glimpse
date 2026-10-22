@@ -1547,6 +1547,21 @@ def test_schedule_loop_runs_catches_up_and_waits(hub_mod):
         with pytest.raises(ValueError):
             await hub.sched_op(p, "sched_save", {"task": {"name": "x", "cron": "bad", "machine": "M1",
                                                            "kind": "claude", "cwd": "~", "prompt": "p"}})
+        # a start that fails at its time: recorded once for that slot, and pushed (nobody is watching at 8:00)
+        await hub.sched_op(p, "sched_save", {"id": tid, "task": dict(hub.sched_tasks()[0], enabled=True)})
+        hub.sched_runs[tid]["last"] = at(2026, 11, 3, 9, 0)
+
+        async def fail(obj, timeout=None):
+            m.calls.append(obj)
+            return {"t": "error", "msg": "目录不存在: ~/radar"}
+        m.call = fail
+        for s in m.sessions.values():
+            s["status"] = "idle"
+        await tick(at(2026, 11, 4, 8, 0, 10))
+        await tick(at(2026, 11, 4, 8, 0, 30))
+        assert len(m.calls) == 6 and "目录不存在" in hub.sched_runs[tid]["error"]
+        assert pushed[-1]["kind"] == "error" and "论文日报" in pushed[-1]["title"]
+        assert hub.sched_view()[0]["error"]
         await hub.sched_op(p, "sched_remove", {"id": tid})
         assert hub.sched_tasks() == [] and tid not in hub.sched_runs
     asyncio.run(run())

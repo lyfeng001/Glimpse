@@ -246,6 +246,12 @@
       <div class="g-h">可选</div>
       <div class="group">
         <label class="cell" for="new-name"><span class="lbl">任务名</span><input id="new-name" placeholder="默认用目录名" enterkeyhint="go"></label>
+        <div class="cell" id="new-wf-row" hidden>
+          <span class="grow">项目工作流<div class="sub" id="new-wf-sub">按统一目录建好 git 仓库，登记到知识库，AI 记录实验和日志</div></span>
+          <span class="switch"><input type="checkbox" role="switch" id="new-wf" aria-label="项目工作流"><i></i></span></div>
+        <div class="cell" id="new-wf-pub-row" hidden>
+          <span class="grow">推到 GitHub<div class="sub">建私有仓库并推送（先做密钥和大文件检查）</div></span>
+          <span class="switch"><input type="checkbox" role="switch" id="new-wf-pub" aria-label="推到 GitHub"><i></i></span></div>
         <label class="cell" for="new-args"><span class="lbl">额外参数</span>
           <input id="new-args" class="mono" placeholder="--verbose" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="go"></label>
       </div>
@@ -373,6 +379,8 @@
       <div class="cell" id="act-ac-row"><span class="cell-ic" style="background:#0A84FF" aria-hidden="true"><svg class="ic"><use href="#i-refresh"/></svg></span>
         <span class="grow">临时错误自动继续<div class="sub" id="act-ac-sub">服务器过载、流中断、输出被截断时自动发送“继续”</div></span>
         <span class="switch"><input type="checkbox" role="switch" id="act-ac" aria-label="临时错误自动继续"><i></i></span></div>
+      <button type="button" class="cell" id="act-wf" hidden><span class="cell-ic" style="background:#8E5CF7" aria-hidden="true"><svg class="ic"><use href="#i-folder"/></svg></span>
+        <span class="grow">启用项目工作流<div class="sub" id="act-wf-sub">建 git 仓库、登记到知识库；这一轮结束后重启并接上原对话</div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
       <button type="button" class="cell" id="act-fit"><span class="cell-ic" style="background:#2FB457" aria-hidden="true"><svg class="ic"><use href="#i-resize"/></svg></span><span class="grow">终端尺寸<div class="sub" id="act-fit-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
     </div>
     <div class="g-h">在其他地方打开</div>
@@ -473,6 +481,7 @@
     <p id="cf-msg" style="text-align:center;color:var(--text-2);font-size:14px;margin-bottom:18px"></p>
     <div style="display:flex;flex-direction:column;gap:8px">
       <button type="button" id="cf-ok" class="btn danger lg block"></button>
+      <button type="button" id="cf-alt" class="btn lg block" hidden></button>
       <button type="button" class="btn lg block" data-close>取消</button>
     </div>
   </div>

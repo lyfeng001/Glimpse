@@ -1412,6 +1412,55 @@ def test_daemon_language_op_and_persistence(tmp_path):
         A.LANG = old
 
 
+def test_vault_workflow_session_args(tmp_path):
+    """A session in a registered project gets the vault MCP server + instruction, merged with AMem's into ONE
+    --mcp-config and ONE --append-system-prompt (claude) / ONE developer_instructions (codex); elsewhere nothing."""
+    linker = tmp_path / "vault-linker"
+    linker.write_text("#!/bin/sh\n")
+    linker.chmod(0o755)
+    vault = tmp_path / "vault"
+    (vault / ".vault-linker").mkdir(parents=True)
+    proj = tmp_path / "proj"
+    (proj / "src" / "deep").mkdir(parents=True)
+    (proj / ".vault-linker.json").write_text(json.dumps({"id": "proj", "vault": str(vault)}))
+    assert A.vault_link(str(proj / "src" / "deep")) == ("proj", os.path.realpath(str(proj)))
+    assert A.vault_link(str(tmp_path)) is None
+    d, s = _session("claude")
+    s.cwd = str(proj / "src")
+    v = A.Vault(d)
+    v.attach(s)
+    assert s.vault_project is None                                # not configured: off
+    v.configure({"linker": str(linker), "path": str(vault), "junk": 1})
+    v.attach(s)
+    assert s.vault_project == "proj" and v.on()
+    mem = A.Memory(d)
+    mem.cfg = dict(A.MEMORY_DEFAULT, enabled=True, python="/opt/py")
+    s.memory_project = "proj"
+    args = A.extension_args(s, mem, v)
+    assert args.count("--mcp-config") == 1 and args.count("--append-system-prompt") == 1
+    servers = json.loads(args[args.index("--mcp-config") + 1])["mcpServers"]
+    assert set(servers) == {"amem", "vault"} and servers["vault"]["command"] == str(linker)
+    assert servers["vault"]["args"] == ["--vault", str(vault), "mcp", "--project", "proj", "--who", s.sid]
+    prompt = args[args.index("--append-system-prompt") + 1]
+    assert "AMem" in prompt and "exp_new" in prompt
+    assert "mcp__vault__exp_update" in v.claude_allow(s)
+    _, cx = _session("codex")
+    cx.cwd, cx.memory_project = str(proj), "proj"
+    v.attach(cx)
+    ca = A.extension_args(cx, mem, v)
+    assert sum(1 for x in ca if x.startswith("developer_instructions=")) == 1
+    assert any(x.startswith("mcp_servers.vault.command=") for x in ca) and any(x.startswith("mcp_servers.amem.") for x in ca)
+    s.memory_project = None                                       # vault alone
+    args = A.extension_args(s, mem, v)
+    assert set(json.loads(args[args.index("--mcp-config") + 1])["mcpServers"]) == {"vault"}
+    s.vault_project = None                                        # neither: nothing added
+    assert A.extension_args(s, mem, v) == []
+    _, sh = _session("shell")
+    sh.cwd = str(proj)
+    v.attach(sh)
+    assert sh.vault_project is None
+
+
 def test_transient_error_classification():
     t = A.is_transient_error
     assert t("stream disconnected before completion: Our servers are currently overloaded. Please try again later.")

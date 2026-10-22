@@ -88,6 +88,7 @@ class Machine:
         self.task = None
         self.req = 0
         self.memory = None             # AMem status reported by the agent (None = not configured / old agent)
+        self.vault = False             # the vault (vault-linker) is on this machine and configured
         self.netinfo = None            # {ip, city, region, country, org, ts} of the machine's internet exit
         self.speed = None              # last speed test {down_bps, ttfb_ms, ts} or {error, ts}
         self.speed_task = None         # the running speed test (requests from several devices share it)
@@ -101,7 +102,7 @@ class Machine:
     def info(self, presets_view):
         return {"id": self.id, "name": self.name, "type": self.cfg.get("type"), "online": self.online,
                 "error": self.error, "version": self.version, "outdated": self.outdated, "host": self.host, "stats": self.stats,
-                "usage_today": self.usage_today, "memory": self.memory, "netinfo": self.netinfo, "speed": self.speed, "ssh_host": self.cfg.get("host"), "port": self.cfg.get("port"),
+                "usage_today": self.usage_today, "memory": self.memory, "vault": self.vault, "netinfo": self.netinfo, "speed": self.speed, "ssh_host": self.cfg.get("host"), "port": self.cfg.get("port"),
                 "presets": presets_view, "default_cwd": self.cfg.get("default_cwd"),
                 "sessions": [self.sessions[k] for k in self.order if k in self.sessions]}
 

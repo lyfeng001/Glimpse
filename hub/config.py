@@ -33,6 +33,10 @@ DEFAULTS = {
     # store: the vault ("" = data/memory in the project on this computer, ~/.glimpse/data/memory on ssh machines);
     # budget: vault size limit, oldest tool output / tool calls are compacted away beyond it
     "memory": {"enabled": False, "python": "", "store": "", "budget": "20G", "keep_days": 30},
+    # vault-linker (project workflow + knowledge base), optional: "linker" = path of the vault-linker launcher on
+    # the hub computer, "path" = the vault; "machine" = the machine id that holds it (default: the local one),
+    # "owner" = GitHub account for new project repositories
+    "vault": {"linker": "", "path": "", "machine": "", "owner": "lyfeng001"},
     # choices offered by the new-session sheet and the "controls" widget (lists replace, not merge)
     "options": {
         "claude": {"models": ["default", "opus", "sonnet", "haiku", "fable", "opusplan"],

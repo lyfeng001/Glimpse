@@ -132,6 +132,10 @@ EN = {
     "当前密码不正确": "The current password is wrong",
     "Glimpse 测试通知": "Glimpse test notification",
     "通知已经可以正常工作": "Notifications work",
+    "知识库未配置（config.json 的 vault）": "No vault configured (vault in config.json)",
+    "知识库操作失败": "Vault operation failed",
+    "无效的目录": "Invalid folder",
+    "项目工作流目前只支持知识库所在的机器（%s）": "The project workflow works only on the vault's machine for now (%s)",
 }
 
 
@@ -713,6 +717,7 @@ class Hub:
             for p in list(self.phones):
                 p.send({"t": "resync", "m": m.id})
             asyncio.ensure_future(self.memory_config(m))
+            asyncio.ensure_future(self.vault_config(m))
             self.send_lang(m)
             return
         if t in ("out", "chat"):
@@ -927,6 +932,8 @@ class Hub:
                 await self.models(p, m, msg)
             elif op == "memory":
                 await self.memory(p, m, msg)
+            elif op == "project_workflow":
+                await self.project_workflow(p, m, msg)
             elif op == "netinfo":
                 asyncio.ensure_future(self.machine_netinfo(m, bool(msg.get("refresh"))))
             elif op == "speedtest":
@@ -969,6 +976,62 @@ class Hub:
         if r.get("t") == "memory_status":
             m.memory = {k: v for k, v in r.items() if k not in ("t", "req", "store")}
             self.state_dirty.set()
+
+    # --- vault-linker: the project workflow and the knowledge base (the vault lives on one machine, the hub's own)
+    def vault_machine(self):
+        """The machine that holds the vault (vault.machine, else the local one), or None."""
+        v = self.cfg.get("vault") or {}
+        mid = v.get("machine") or local_machine_id(self.cfg)
+        return self.machines.get(mid) if mid else None
+
+    def vault_on(self):
+        v = self.cfg.get("vault") or {}
+        return bool(v.get("linker") and v.get("path"))
+
+    async def vault_config(self, m):
+        """Only the vault machine gets the paths: elsewhere workflow sessions run without the vault tools."""
+        v = self.cfg.get("vault") or {}
+        vm = self.vault_machine()
+        cfg = {"linker": v.get("linker") or "", "path": v.get("path") or ""} if vm is m and self.vault_on() else {}
+        try:
+            r = await m.call({"op": "vault_config", "cfg": cfg}, timeout=20)
+        except (ConnectionError, asyncio.TimeoutError):
+            return
+        if r.get("t") == "vault_status":
+            m.vault = bool(r.get("on"))
+            self.state_dirty.set()
+
+    async def vault_cli(self, args, timeout=90):
+        """vault-linker <args> on the vault machine -> its JSON (ValueError with the message on failure)."""
+        vm = self.vault_machine()
+        if not self.vault_on() or vm is None:
+            raise ValueError(tr("知识库未配置（config.json 的 vault）"))
+        r = await vm.call({"op": "vault", "args": list(args)}, timeout=timeout)
+        if r.get("t") != "vault":
+            raise ValueError(agent_error(r, tr("知识库操作失败")))
+        return r.get("data") or {}
+
+    async def workflow_setup(self, m, cwd, publish=False):
+        """project init on the vault machine (standard layout, git init, registered in the vault), then optionally
+        publish to GitHub. For now only folders on the vault machine: elsewhere the vault and its MCP tools are not
+        reachable. A failed publish does not undo the setup (it can be retried)."""
+        if not isinstance(cwd, str) or not cwd.strip() or len(cwd) > 4096:
+            raise ValueError(tr("无效的目录"))
+        if m is not self.vault_machine():
+            raise ValueError(tr("项目工作流目前只支持知识库所在的机器（%s）", (self.vault_machine() or m).id))
+        res = {"init": await self.vault_cli(["project", "init", cwd, "--yes"])}
+        if publish:
+            try:
+                res["publish"] = await self.vault_cli(["project", "publish", cwd], timeout=200)
+            except ValueError as e:
+                res["publish_error"] = str(e)
+        return res
+
+    async def project_workflow(self, p, m, msg):
+        """Session actions → 启用项目工作流 on a running session: set the project up now; the phone then restarts
+        the session (resume) so it starts with the vault tools."""
+        res = await self.workflow_setup(m, msg.get("cwd"), bool(msg.get("publish")))
+        p.send(dict(res, t="project_workflow", m=m.id, sid=msg.get("sid"), cwd=msg.get("cwd")))
 
     async def memory(self, p, m, msg):
         action = msg.get("action")
@@ -1029,6 +1092,10 @@ class Hub:
         resume_id = msg.get("resume_id")
         if resume_id is not None and (kind == "shell" or not isinstance(resume_id, str) or not RESUME_RE.match(resume_id)):
             raise ValueError(tr("无效的会话 id"))
+        wf = None
+        if msg.get("workflow") and kind != "shell":
+            # the project first (layout, git, vault page): the session gets the vault tools when it spawns
+            wf = await self.workflow_setup(m, msg.get("cwd") or m.cfg.get("default_cwd") or "", bool(msg.get("publish")))
         key = msg.get("key") or preset.get("key")
         if kind != "shell" and not msg.get("key") and KB.mode_of(self.cfg) == "least_used":
             key = self.best_key() or key       # "默认" = let the balancer choose
@@ -1041,6 +1108,8 @@ class Hub:
             out = {"t": "created", "m": m.id, "s": r["s"]}
             if r.get("existing"):
                 out["existing"] = True       # the conversation already had a session: the phone just opens it
+            if wf:
+                out["workflow"] = wf
             p.send(out)
         else:
             p.send({"t": "error", "m": m.id, "msg": r.get("msg") or tr("创建失败")})

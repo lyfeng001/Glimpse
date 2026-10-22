@@ -1021,6 +1021,76 @@ def test_hub_language(hub_mod):
     server.HUB_LANG[0] = "zh"
 
 
+VAULT_LINKER = os.path.expanduser("~/Documents/spiritai/vault-linker/vault-linker")
+
+
+@pytest.mark.skipif(not os.access(VAULT_LINKER, os.X_OK), reason="vault-linker not checked out next to Glimpse")
+def test_project_workflow(hub_mod, tmp_path, monkeypatch):
+    """project_workflow: project init on the vault machine through the agent's op vault (the real vault-linker, a
+    throwaway vault); refused on other machines and without a vault; the vault paths go to the vault machine only."""
+    import subprocess
+    C, server = hub_mod
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "agent"))
+    import glimpse_agent as A
+    for k, v in (("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@example.com"), ("GIT_COMMITTER_NAME", "t"),
+                 ("GIT_COMMITTER_EMAIL", "t@example.com")):
+        monkeypatch.setenv(k, v)
+    vault = tmp_path / "vault"
+    subprocess.run([VAULT_LINKER, "vault", "init", str(vault)], check=True, capture_output=True)
+    proj = tmp_path / "newproj"
+    proj.mkdir()
+
+    class Agent:
+        """A machine whose calls run the real agent Vault.run (synchronously)."""
+        def __init__(self, mid):
+            self.id, self.sent = mid, []
+            self.v = A.Vault(type("D", (), {"bg_done": [], "background": staticmethod(lambda f: f())})())
+
+        async def call(self, obj, timeout=None):
+            self.sent.append(obj)
+            if obj["op"] == "vault_config":
+                self.v.configure(obj["cfg"])
+                return {"t": "vault_status", "on": self.v.on()}
+            out = {}
+            self.v.run(obj["args"], lambda r, e: out.update({"t": "error", "msg": e} if e else {"t": "vault", "data": r}))
+            fn, res, err = self.v.d.bg_done.pop()
+            fn(res, err)
+            return out
+
+    class P:
+        def __init__(self):
+            self.out = []
+
+        def send(self, o):
+            self.out.append(o)
+
+    async def run():
+        hub = server.Hub(C.load())
+        local, other = Agent("M1"), Agent("M9")
+        hub.machines = {"M1": local, "M9": other}
+        hub.cfg["machines"] = [{"id": "M1", "type": "local"}, {"id": "M9", "type": "ssh", "host": "x"}]
+        assert server.local_machine_id(hub.cfg) == "M1"
+        p = P()
+        with pytest.raises(ValueError):                      # no vault configured yet
+            await hub.project_workflow(p, local, {"cwd": str(proj)})
+        hub.cfg["vault"] = {"linker": VAULT_LINKER, "path": str(vault)}
+        await hub.vault_config(local)
+        await hub.vault_config(other)
+        assert local.sent[-1]["cfg"]["path"] == str(vault) and other.sent[-1]["cfg"] == {}
+        assert local.vault and not getattr(other, "vault", False)
+        with pytest.raises(ValueError):                      # not the vault machine
+            await hub.project_workflow(p, other, {"cwd": str(proj)})
+        await hub.project_workflow(p, local, {"cwd": str(proj), "sid": "abc123"})
+        r = p.out[-1]
+        assert r["t"] == "project_workflow" and r["init"]["id"] == "newproj" and r["init"]["git_init"]
+        assert (proj / ".vault-linker.json").exists() and (vault / "projects" / "newproj" / "project.md").exists()
+        assert A.vault_link(str(proj)) == ("newproj", os.path.realpath(str(proj)))
+        with pytest.raises(ValueError) as e:                  # vault-linker's own refusals come through
+            await hub.project_workflow(p, local, {"cwd": str(tmp_path / "missing")})
+        assert "no such folder" in str(e.value)
+    asyncio.run(run())
+
+
 def test_cli_token_only_from_localhost(hub_mod):
     C, server = hub_mod
     hub = server.Hub(C.load())

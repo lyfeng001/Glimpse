@@ -474,13 +474,19 @@ for (const d of $$('dialog.sheet')) {
     h.addEventListener('touchend', end); h.addEventListener('touchcancel', end);
   }
 }
-function confirmSheet(title, msg, okText) {
+// OK -> true, cancel / dismissed -> false; with altText a second choice -> 'alt'. style 'primary' = a blue OK
+// (not a destructive red one)
+function confirmSheet(title, msg, okText, altText, style) {
   return new Promise((resolve) => {
     const d = $('#dlg-confirm');
     $('#cf-title').textContent = title; $('#cf-msg').textContent = msg; $('#cf-ok').textContent = okText;
+    $('#cf-ok').className = 'btn lg block ' + (style === 'primary' ? 'primary' : 'danger');
+    const alt = $('#cf-alt');
+    alt.hidden = !altText; alt.textContent = altText || '';
     let done = false;
     const finish = (v) => { if (done) return; done = true; resolve(v); };
     $('#cf-ok').onclick = () => { finish(true); closeSheet(d); };
+    alt.onclick = () => { finish('alt'); closeSheet(d); };
     d.addEventListener('close', () => finish(false), { once: true });
     openSheet(d);
   });
@@ -715,6 +721,12 @@ function onMsg(m) {
     case 'resync': if (S.view && S.view.m === m.m) subscribe(); break;
     case 'created': {
       newBusy(false); closeSheet($('#dlg-new')); closeSheet($('#dlg-adopt'));
+      if (m.workflow) {
+        const w = m.workflow; const init = w.init || {};
+        toast(T('项目已就绪'), (init.git_init ? T('新建了 git 仓库') : T('沿用已有的 git 仓库')) +
+          (w.publish ? T('，已推到 ') + w.publish.repo : w.publish_error ? T('；GitHub 推送失败：') + w.publish_error : ''),
+          null, w.publish_error ? 'error' : 'done');
+      }
       // the state broadcast may arrive after this reply: insert the session now so the view has cols/rows/kind
       const mc = S.byId[m.m];
       if (mc && m.s && !mc.sessions.some((x) => x.sid === m.s.sid)) { mc.sessions.push(m.s); renderHome(); }
@@ -723,6 +735,7 @@ function onMsg(m) {
     }
     case 'restarted': if (RS.active && RS.m === m.m && RS.sid === m.sid) rsDone(m); break;
     case 'key_balance_ok': toast(T('已保存'), '', null, 'done'); break;
+    case 'project_workflow': onProjectWorkflow(m); break;
     case 'approved': if (isView(m)) { S.view.approving = null; S.view.cardSig = null; renderCard(); } break;
     case 'history': onHistory(m); break;
     case 'models': onModels(m, false); break;
@@ -2475,6 +2488,10 @@ function fillMore() {
   $('#act-restart-sub').textContent = s ? T('当前：') + (s.key || T('默认')) + (s.can_resume ? T(' · 可恢复对话') : '') : '';
   $('#act-fit-sub').textContent = s ? T('当前 ') + s.cols + '×' + s.rows : '';
   $('#act-ac-row').hidden = !ai;
+  const mc = v && S.byId[v.m];
+  $('#act-wf').hidden = !ai || !(mc && mc.vault) || !!s.vault;     // already a workflow session: nothing to turn on
+  $('#act-wf-sub').textContent = s && s.status === 'running' ? T('建 git 仓库、登记到知识库；这一轮结束后重启并接上原对话')
+    : T('建 git 仓库、登记到知识库，然后重启并接上原对话');
   if (ai) {
     $('#act-ac').checked = !!s.auto_continue;
     $('#act-ac-sub').textContent = s.auto_continue ? (s.ac_count ? T('已连着出错并自动继续 %a 次（到 5 次就停下通知你；AI 正常回复完一次后从 0 算起）', { a: s.ac_count }) : T('已开启：遇到临时错误会自动发送“继续”'))
@@ -2604,6 +2621,11 @@ function fillNewDeps() {
   const mc = S.byId[$('#new-machine').value]; const kind = newKind();
   const ai = kind !== 'shell';
   $('#new-key-row').hidden = !ai || !S.keys.length;
+  // project workflow: only where the vault is (the hub's computer, vault-linker configured), for Claude / Codex
+  const wf = ai && !!(mc && mc.vault);
+  $('#new-wf-row').hidden = !wf;
+  if (!wf) $('#new-wf').checked = false;
+  $('#new-wf-pub-row').hidden = !wf || !$('#new-wf').checked;
   const def = mc && mc.presets && mc.presets[kind] && mc.presets[kind].key;
   $('#new-key').innerHTML = '<option value="">' + (kbState().mode === 'least_used' ? T('自动（用量最低的 Key）') : T('默认') + (def ? T('（') + esc(def) + T('）') : '')) + '</option>' +
     S.keys.map((k) => '<option value="' + esc(k.name) + '">' + esc(k.name) + (keyUsageText(k) ? '  ·  ' + esc(keyUsageText(k)) : '') + '</option>').join('');
@@ -2713,6 +2735,8 @@ function openNew(mid) {
   $('#new-cwd').dataset.touched = ''; $('#new-name').value = ''; $('#new-args').value = '';
   for (const id of ['#new-model', '#new-model-sel', '#new-effort', '#new-pmode', '#new-approval', '#new-sandbox']) $(id).value = '';
   $('#new-machine').value = '';
+  $('#new-wf').checked = false; $('#new-wf-pub').checked = false;
+  $('#new-wf-pub-row').hidden = true;
   fillNew();
   openSheet($('#dlg-new'));
 }
@@ -2735,6 +2759,10 @@ $('#btn-new').onclick = () => openNew();
 $('#fab').onclick = () => openNew();
 $('#new-machine').onchange = () => { $('#new-cwd').dataset.touched = ''; fillNewDeps(); };
 for (const r of $$('#new-form input[name=kind]')) r.onchange = fillNewDeps;
+$('#new-wf').onchange = () => {
+  $('#new-wf-pub-row').hidden = !$('#new-wf').checked;
+  if ($('#new-wf').checked) $('#new-wf-pub').checked = LS.getItem('glimpse.newPublish') !== '0';   // default: push
+};
 $('#new-cwd').addEventListener('input', () => { $('#new-cwd').dataset.touched = '1'; });
 function splitArgs(s) {
   const out = []; const re = /"([^"]*)"|'([^']*)'|(\S+)/g; let m;
@@ -2766,6 +2794,11 @@ $('#new-form').addEventListener('submit', (e) => {
     if (kind === 'claude' && $('#new-pmode').value) msg.mode = $('#new-pmode').value;
     if (kind === 'codex' && $('#new-approval').value) msg.approval = $('#new-approval').value;
     if (kind === 'codex' && $('#new-sandbox').value) msg.sandbox = $('#new-sandbox').value;
+    if (!$('#new-wf-row').hidden && $('#new-wf').checked) {
+      msg.workflow = true;
+      msg.publish = $('#new-wf-pub').checked;
+      LS.setItem('glimpse.newPublish', msg.publish ? '1' : '0');
+    }
   }
   const ok = send(msg);
   if (!ok) { newBusy(false); $('#new-err').textContent = T('未连接到 hub'); }
@@ -2816,6 +2849,39 @@ function openRestart() {
   setTimeout(() => openSheet($('#dlg-restart')), $('#dlg-more').open ? 230 : 0);
 }
 $('#act-restart').onclick = openRestart;
+// ---- session actions → 启用项目工作流: set the project up now, restart (resume) once the turn is over, so the
+// session starts with the vault tools. GitHub: asked here, not silently.
+const WF = {};          // "m/sid" -> {stage: 'setup' | 'restart', publish}
+$('#act-wf').onclick = async () => {
+  const v = S.view; const s = v && session(v.m, v.sid); if (!s) return;
+  closeSheet($('#dlg-more'));
+  await new Promise((r) => setTimeout(r, 230));
+  const ans = await confirmSheet(T('启用项目工作流？'),
+    T('在 %a 建 git 仓库（已有就沿用），补齐标准目录，登记到知识库；之后会话重启并接上原对话，AI 就能记录实验和日志。要不要同时建 GitHub 私有仓库并推送？',
+      { a: s.cwd }), T('启用并推到 GitHub'), T('只在本地启用'), 'primary');
+  if (!ans) return;
+  const pub = ans === true;
+  WF[v.m + '/' + v.sid] = { stage: 'setup', publish: pub };
+  if (!send({ op: 'project_workflow', m: v.m, sid: v.sid, cwd: s.cwd, publish: pub })) {
+    delete WF[v.m + '/' + v.sid]; toast(T('未连接'), T('稍后再试'), null, 'error');
+  }
+};
+function onProjectWorkflow(m) {
+  const k = m.m + '/' + m.sid; const w = WF[k]; if (!w) return;
+  const init = m.init || {};
+  const pub = m.publish ? T('，已推到 ') + m.publish.repo : m.publish_error ? T('；GitHub 推送失败：') + m.publish_error : '';
+  toast(T('项目已就绪'), (init.git_init ? T('新建了 git 仓库') : T('沿用已有的 git 仓库')) + pub, null, m.publish_error ? 'error' : 'done');
+  w.stage = 'restart';
+  wfRestart(m.m, m.sid);
+}
+function wfRestart(mid, sid) {
+  // wait for the turn to end: a restart mid-reply would cut the answer off
+  const k = mid + '/' + sid; const w = WF[k]; const s = session(mid, sid);
+  if (!w || !s) { delete WF[k]; return; }
+  if (s.status === 'running' || s.status === 'starting') { w.timer = setTimeout(() => wfRestart(mid, sid), 3000); return; }
+  delete WF[k];
+  send({ op: 'restart', m: mid, sid, resume: true });
+}
 function rsKey() { const r = $('#rs-keys input:checked'); return r ? r.value : ''; }
 function rsSteps(cur) {
   const steps = [T('结束旧进程'), T('设置新的 Key'), T('启动并恢复对话')];

@@ -1379,7 +1379,8 @@ class Session:
                 "question": self.question, "agent_session_id": self.agent_session_id,
                 "can_resume": bool(self.agent_session_id) and self.kind in ("claude", "codex"),
                 "key": self.key, "restarts": self.restarts, "auto_continue": self.auto_continue, "ac_count": self.ac_count, "mode": self.mode(), "overrides": dict(self.overrides),
-                "memory": self.memory_project, "hot_key": bool(self.key_file) and self.fd is not None,
+                "memory": self.memory_project, "vault": getattr(self, "vault_project", None),
+                "hot_key": bool(self.key_file) and self.fd is not None,
                 "menu": self.menu}
 
     def touch(self):
@@ -1470,12 +1471,13 @@ class Session:
             if self.kind == "codex":
                 argv = argv[:1] + hot[1] + argv[1:]
         self.d.memory.attach(self)
-        if self.kind == "codex" and argv:
-            argv = argv[:1] + self.d.memory.codex_args(self) + argv[1:]
+        self.d.vault.attach(self)
+        if self.kind in ("claude", "codex") and argv:
+            argv = argv[:1] + extension_args(self, self.d.memory, self.d.vault) + argv[1:]
         if self.kind == "claude":
-            argv = argv[:1] + self.d.memory.claude_args(self) + argv[1:] if argv else argv
             argv, self.settings_file = prepare_claude_argv(argv, self.sid, self.d.sdir, None if hot else self.env,
-                                                           self.d.approval_wait, self.d.memory.claude_allow(self),
+                                                           self.d.approval_wait,
+                                                           self.d.memory.claude_allow(self) + self.d.vault.claude_allow(self),
                                                            key_file=self.key_file if hot else None)
         shell = env.get("SHELL")
         if not shell:
@@ -2240,6 +2242,8 @@ EN.update({
     "无效的项目": "Invalid project",
     "无效的上限（例如 20G）": "Invalid limit (e.g. 20G)",
     "无效的记忆操作": "Invalid memory operation",
+    "无效的知识库操作": "Invalid vault operation",
+    "这台机器上没有知识库（vault-linker 未配置）": "No vault on this machine (vault-linker not configured)",
     "无效的 init_cmds": "Invalid init_cmds",
     "无效的路径": "Invalid path",
     "路径不在会话目录内": "The path is outside the session folder",
@@ -2304,6 +2308,138 @@ def is_transient_error(text):
 # Persistent cross-session memory through AMem (https://github.com/lyfeng001/AMem), when installed.
 # Glimpse never imports it: it runs `python -m agent_memory` from the configured environment.
 # Sessions of the same project share one memory; nothing is written into the project directory.
+
+# --------------------------------------------------------------------------- vault-linker (project workflow)
+# A session whose folder is a registered project (its .vault-linker.json, or .git/.vault-linker.json for someone
+# else's repository) gets the vault MCP server and a short instruction at spawn, like AMem. Only where the vault is
+# on this machine (the hub's own computer): elsewhere the session runs as before. vault-linker lives in its own
+# repository; the hub sends its path (hub config "vault": {"linker", "path"}) with op vault_config.
+VAULT_DEFAULT = {"linker": "", "path": ""}
+VAULT_LINK = ".vault-linker.json"
+# what the hub may run through op vault (first word of the vault-linker command line)
+VAULT_CLI_OK = ("project", "vault", "log", "exp", "search", "read", "inbox")
+VAULT_PROMPT = (
+    "This project uses the shared knowledge base (vault MCP server `vault`, project `{project}`). Before redoing "
+    "work, vault_search for earlier experiments, conclusions and notes. Each experiment: exp_new before, exp_update "
+    "after (status, metrics, results); configs/<E-id>.yaml and outputs/<E-id>/ in the repository. Record notable "
+    "progress and decisions with log_add (one line each), write-ups with doc_new. Keep big files and secrets out of "
+    "the vault; propose changes to a person's note with inbox_add instead of editing it.")
+
+
+def vault_link(cwd):
+    """(project id, project root) when cwd is inside a registered project, else None."""
+    d = os.path.realpath(cwd)
+    while True:
+        for p in (os.path.join(d, VAULT_LINK), os.path.join(d, ".git", VAULT_LINK)):
+            try:
+                with open(p) as f:
+                    pid = json.load(f).get("id")
+                if isinstance(pid, str) and re.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", pid):
+                    return pid, d
+            except (OSError, ValueError, AttributeError):
+                pass
+        up = os.path.dirname(d)
+        if up == d or d == os.path.expanduser("~"):
+            return None
+        d = up
+
+
+class Vault:
+    """Per-daemon vault-linker integration: launch args for workflow sessions, and the CLI for the hub's ops."""
+
+    def __init__(self, daemon):
+        self.d = daemon
+        self.cfg = dict(VAULT_DEFAULT)
+
+    def configure(self, cfg):
+        self.cfg = dict(VAULT_DEFAULT, **{k: v for k, v in (cfg or {}).items() if k in VAULT_DEFAULT and isinstance(v, str)})
+
+    def linker(self):
+        p = os.path.expanduser(self.cfg.get("linker") or "")
+        return p if p and os.path.isfile(p) and os.access(p, os.X_OK) else None
+
+    def vault_path(self):
+        p = os.path.expanduser(self.cfg.get("path") or "")
+        return p if p and os.path.isdir(os.path.join(p, ".vault-linker")) else None
+
+    def on(self):
+        return bool(self.linker() and self.vault_path())
+
+    def attach(self, s):
+        """At spawn: the session's vault project (None = not a workflow session, or no vault here)."""
+        s.vault_project = None
+        if s.kind not in ("claude", "codex") or not self.on():
+            return
+        link = vault_link(s.cwd)
+        if link:
+            s.vault_project = link[0]
+
+    def server_entry(self, s):
+        return {"command": self.linker(),
+                "args": ["--vault", self.vault_path(), "mcp", "--project", s.vault_project, "--who", s.sid]}
+
+    def servers(self, s):
+        """{"vault": entry} for a workflow session, else {} (merged with AMem's into one --mcp-config)."""
+        return {"vault": self.server_entry(s)} if getattr(s, "vault_project", None) else {}
+
+    def prompt(self, s):
+        return VAULT_PROMPT.format(project=s.vault_project) if getattr(s, "vault_project", None) else ""
+
+    def claude_allow(self, s):
+        if not getattr(s, "vault_project", None):
+            return []
+        return ["mcp__vault__" + t for t in ("vault_search", "vault_read", "vault_list", "exp_new", "exp_update",
+                                              "doc_new", "log_add", "inbox_add")]
+
+    def codex_args(self, s):
+        """The MCP server; the instruction goes into the one developer_instructions (see extension_args)."""
+        if not getattr(s, "vault_project", None):
+            return []
+        e = self.server_entry(s)
+        return ["-c", "mcp_servers.vault.command=%s" % json.dumps(e["command"]),
+                "-c", "mcp_servers.vault.args=%s" % json.dumps(e["args"]),
+                "-c", "mcp_servers.vault.default_tools_approval_mode=\"approve\""]
+
+
+    def run(self, args, done, timeout=60):
+        """vault-linker --json <args> in the background; done(parsed JSON, error text)."""
+        import subprocess
+        lk, vp = self.linker(), self.vault_path()
+        if not lk or not vp:
+            done(None, tr("这台机器上没有知识库（vault-linker 未配置）"))
+            return
+
+        def work():
+            try:
+                r = subprocess.run([lk, "--vault", vp, "--json"] + args, stdin=subprocess.DEVNULL,
+                                   capture_output=True, timeout=timeout, cwd=os.path.expanduser("~"))
+                try:
+                    out = json.loads(r.stdout.decode("utf-8", "replace") or "{}")
+                except ValueError:
+                    out = {"error": clip(r.stderr.decode("utf-8", "replace").strip() or "exit %s" % r.returncode, 300)}
+                err = out.get("error") if isinstance(out, dict) else None
+            except (OSError, subprocess.SubprocessError) as e:
+                out, err = None, clip(str(e), 300)
+            self.d.bg_done.append((done, out, err))
+        self.d.background(work)
+
+
+def extension_args(s, memory, vault):
+    """claude / codex argv for AMem + the vault together: one --mcp-config with both servers and one
+    --append-system-prompt (claude), one developer_instructions (codex). Either may be off."""
+    prompts = [x for x in (memory.prompt(s.memory_project) if getattr(s, "memory_project", None) else "",
+                           vault.prompt(s)) if x]
+    if s.kind == "claude":
+        servers = dict({"amem": memory.server_entry(s.memory_project)} if getattr(s, "memory_project", None) else {},
+                       **vault.servers(s))
+        out = ["--mcp-config", json.dumps({"mcpServers": servers})] if servers else []
+        return out + (["--append-system-prompt", "\n\n".join(prompts)] if prompts else [])
+    if s.kind == "codex":
+        out = memory.codex_servers(s) + vault.codex_args(s)
+        return out + (["-c", "developer_instructions=%s" % json.dumps("\n\n".join(prompts), ensure_ascii=False)]
+                      if prompts else [])
+    return []
+
 
 MEMORY_DEFAULT = {"enabled": False, "python": "", "store": "", "budget": "20G", "keep_days": 30}
 MEMORY_TIMEOUT = 60
@@ -2495,14 +2631,21 @@ class Memory:
         return ["mcp__amem__" + t for t in ("memory_context", "memory_search", "memory_read", "memory_save",
                                              "memory_status")]
 
-    def codex_args(self, s):
+    def codex_servers(self, s):
+        """The amem MCP server for codex (the instruction is merged in extension_args)."""
         if not getattr(s, "memory_project", None):
             return []
         e = self.server_entry(s.memory_project)
         return ["-c", "mcp_servers.amem.command=%s" % json.dumps(e["command"]),
                 "-c", "mcp_servers.amem.args=%s" % json.dumps(e["args"]),
-                "-c", "mcp_servers.amem.default_tools_approval_mode=\"approve\"",
-                "-c", "developer_instructions=%s" % json.dumps(self.prompt(s.memory_project), ensure_ascii=False)]
+                "-c", "mcp_servers.amem.default_tools_approval_mode=\"approve\""]
+
+    def codex_args(self, s):
+        """AMem alone (server + instruction), as before; spawn uses extension_args."""
+        if not getattr(s, "memory_project", None):
+            return []
+        return self.codex_servers(s) + ["-c", "developer_instructions=%s" % json.dumps(self.prompt(s.memory_project),
+                                                                                      ensure_ascii=False)]
 
     def capture(self, s):
         """A turn ended: archive the new transcript lines (and enforce the budget). One run per project at a time."""
@@ -3150,6 +3293,7 @@ class Daemon:
         self.models_wait = {}          # same key -> callbacks waiting for the running lookup
         self.bg_done = []              # (callback, result, error) from worker threads, run in tick()
         self.memory = Memory(self)     # optional AMem integration (configured by the hub)
+        self.vault = Vault(self)       # optional vault-linker integration (configured by the hub)
 
     # --- plumbing
     def listen(self):
@@ -3854,6 +3998,20 @@ class Daemon:
                 if m.get("lang") in ("zh", "en") and m["lang"] != LANG:
                     LANG = m["lang"]
                     self.save_state()
+            elif op == "vault_config":
+                self.vault.configure(m.get("cfg") or {})
+                self.send(c, {"t": "vault_status", "req": req, "on": self.vault.on(),
+                              "linker": bool(self.vault.linker()), "vault": bool(self.vault.vault_path())})
+            elif op == "vault":
+                # the hub's vault ops on the machine that holds the vault: project init / publish / log / list / ...
+                args = m.get("args")
+                if not (isinstance(args, list) and args and all(isinstance(x, str) for x in args)
+                        and args[0] in VAULT_CLI_OK):
+                    self.send(c, {"t": "error", "req": req, "msg": tr("无效的知识库操作")})
+                else:
+                    self.vault.run(args, lambda res, err, c=c, req=req: self.send(
+                        c, {"t": "error", "req": req, "msg": err} if err else {"t": "vault", "req": req, "data": res}),
+                        timeout=180 if args[:2] == ["project", "publish"] else 60)
             elif op == "memory_config":
                 self.memory.configure(m.get("cfg") or {},
                                       lambda c=c, req=req: self.send(c, dict(self.memory.status(), t="memory_status", req=req)))

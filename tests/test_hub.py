@@ -1416,3 +1416,137 @@ def test_least_used_picks_key_for_new_sessions(hub_mod):
     h.key_usage = {"k1": _wk(100, 80, 3, now), "k2": _wk(100, 10, 3, now)}
     assert h.best_key() == "k2"
     assert h.balance_view() == {"mode": "least_used", "exclude": [], "usage": False}
+
+
+def test_schedule_cron_and_due():
+    import datetime as D
+    import schedule as SC
+    c = SC.Cron("0 8 * * *")
+    t = D.datetime(2026, 10, 22, 7, 59)
+    assert c.next(t) == D.datetime(2026, 10, 22, 8, 0) and c.prev(t) == D.datetime(2026, 10, 21, 8, 0)
+    assert c.prev(D.datetime(2026, 10, 22, 8, 0)) == D.datetime(2026, 10, 22, 8, 0)
+    wk = SC.Cron("30 9 * * 1-5")                         # weekdays only: Friday -> Monday
+    assert wk.next(D.datetime(2026, 10, 23, 10, 0)) == D.datetime(2026, 10, 26, 9, 30)
+    assert SC.Cron("*/15 * * * *").next(D.datetime(2026, 1, 1, 0, 7)) == D.datetime(2026, 1, 1, 0, 15)
+    assert SC.Cron("0 0 * * 7").dow == {0}               # 7 = Sunday too
+    assert SC.Cron("0 8 1 * 1").day_ok(D.date(2026, 10, 26))      # dom and dow both set: either
+    for bad in ("0 8 * *", "60 8 * * *", "0 24 * * *", "0 8 0 * *", "x 8 * * *", "0 8 * * */0", "5-1 * * * *"):
+        with pytest.raises(ValueError):
+            SC.Cron(bad)
+    # due: the 8:00 slot after the last run; a missed one runs on wake within a day; older ones are skipped
+    at = lambda *a: D.datetime(*a).timestamp()
+    assert SC.due(c, at(2026, 10, 21, 8, 0), at(2026, 10, 22, 7, 0)) is None          # today's not yet
+    assert SC.due(c, at(2026, 10, 21, 8, 0), at(2026, 10, 22, 8, 0, 30)) == at(2026, 10, 22, 8, 0)
+    assert SC.due(c, at(2026, 10, 22, 8, 0), at(2026, 10, 22, 9, 0)) is None          # already ran
+    assert SC.due(c, at(2026, 10, 20, 8, 0), at(2026, 10, 22, 7, 30)) == at(2026, 10, 21, 8, 0)   # slept: catch up
+    assert SC.due(c, at(2026, 10, 18, 8, 0), at(2026, 10, 22, 7, 30), catch_up=3600) == -at(2026, 10, 21, 8, 0)
+    ok = SC.check({"name": " 论文日报 ", "cron": "0  8 * * *", "machine": "M1", "kind": "codex", "cwd": "~/x",
+                   "prompt": "run", "model": "gpt-5", "junk": 1}, {"M1"})
+    assert ok == {"name": "论文日报", "cron": "0 8 * * *", "machine": "M1", "kind": "codex", "cwd": "~/x",
+                  "prompt": "run", "model": "gpt-5", "enabled": True}
+    base = {"name": "a", "cron": "0 8 * * *", "machine": "M1", "kind": "claude", "cwd": "~", "prompt": "p"}
+    for k, v in (("cron", "bad"), ("machine", "M9"), ("kind", "shell"), ("cwd", ""), ("prompt", " "),
+                 ("name", "x" * 61), ("model", "a b")):
+        with pytest.raises(ValueError):
+            SC.check(dict(base, **{k: v}), {"M1"})
+
+
+def test_schedule_loop_runs_catches_up_and_waits(hub_mod):
+    """sched_tick: a new task starts from now; the 8:00 slot starts a session with the task's prompt; a slot missed
+    while asleep runs once on wake; not while the machine is offline or the last run is busy; a slot older than a
+    day is skipped. sched_save / sched_run / sched_remove from the phone."""
+    import datetime as D
+    C, server = hub_mod
+    at = lambda *a: D.datetime(*a).timestamp()
+
+    class Mach:
+        def __init__(self):
+            self.id, self.name, self.online, self.cfg, self.sessions, self.calls = "M1", "Mac", True, {"type": "local"}, {}, []
+
+        async def call(self, obj, timeout=None):
+            self.calls.append(obj)
+            sid = "s%d" % len(self.calls)
+            self.sessions[sid] = {"sid": sid, "status": "running"}
+            return {"t": "created", "s": {"sid": sid, "name": obj["name"]}}
+
+    class P:
+        def __init__(self):
+            self.out = []
+
+        def send(self, o):
+            self.out.append(o)
+
+    async def run():
+        hub = server.Hub(C.load())
+        m = Mach()
+        hub.machines, hub.order = {"M1": m}, ["M1"]
+        hub.cfg["machines"] = [{"id": "M1", "type": "local"}]
+        pushed = []
+
+        async def push_all(payload, skip=None):
+            pushed.append(payload)
+            return 1
+        hub.push_all = push_all
+        p = P()
+        await hub.sched_op(p, "sched_save", {"task": {"name": "论文日报", "cron": "0 8 * * *", "machine": "M1",
+                                                       "kind": "codex", "cwd": "~/radar", "prompt": "整理今天的论文"}})
+        tid = p.out[-1]["id"]
+        assert hub.sched_tasks()[0]["id"] == tid and hub.sched_view()[0]["next"]
+
+        async def tick(ts):
+            await hub.sched_tick(ts)
+            for _ in range(3):
+                await asyncio.sleep(0)
+        hub.sched_runs = {}
+        await tick(at(2026, 10, 22, 7, 0))                # first sight: from now on
+        assert m.calls == []
+        await tick(at(2026, 10, 22, 8, 0, 20))
+        c = m.calls[-1]
+        assert c["op"] == "create" and c["kind"] == "codex" and c["first_prompt"] == "整理今天的论文"
+        assert c["cwd"] == "~/radar" and "论文日报" in c["name"]
+        assert hub.sched_runs[tid]["sid"] == "s1" and pushed[-1]["url"] == "/#M1/s1"
+        await tick(at(2026, 10, 22, 8, 1))                 # same slot: never twice
+        assert len(m.calls) == 1
+        # asleep through the 23rd's 8:00, awake at 9:30: once; but while the last run is busy, it waits
+        await tick(at(2026, 10, 23, 9, 30))
+        assert len(m.calls) == 1
+        m.sessions["s1"]["status"] = "idle"
+        m.online = False
+        await tick(at(2026, 10, 23, 9, 31))                # offline: waits too
+        assert len(m.calls) == 1
+        m.online = True
+        await tick(at(2026, 10, 23, 9, 32))
+        assert len(m.calls) == 2 and hub.sched_runs[tid]["last"] == at(2026, 10, 23, 8, 0)
+        m.sessions["s2"]["status"] = "idle"
+        # asleep from the 24th; the newest missed slot (the 25th's) is 23 h old at 7:00 on the 26th: it still runs,
+        # once (the 24th's is never run on its own)
+        await tick(at(2026, 10, 26, 7, 0))
+        assert len(m.calls) == 3 and hub.sched_runs[tid]["last"] == at(2026, 10, 25, 8, 0)
+        m.sessions["s3"]["status"] = "idle"
+        # the newest slot is what counts: at 9:00 on the 28th the 28th's 8:00 runs (the 26th's / 27th's are not
+        # run on their own)
+        await tick(at(2026, 10, 28, 9, 0))
+        assert len(m.calls) == 4
+        m.sessions["s4"]["status"] = "idle"
+        # a run older than a day is skipped: the task (with a 6:00 slot) last ran on the 28th, the computer wakes at
+        # 7:00 on the 31st... the newest slot (the 31st's 6:00) is 1 h old: runs. One slot per wake, never a backlog.
+        hub.sched_tasks()[0]["cron"] = "0 6 * * 1"            # Mondays only; the 26th was the last Monday
+        hub.sched_runs[tid]["last"] = at(2026, 10, 28, 8, 0)
+        await tick(at(2026, 11, 1, 12, 0))                     # Sunday: the newest Monday 6:00 is before last
+        assert len(m.calls) == 4
+        await tick(at(2026, 11, 3, 7, 0))                      # Tuesday: Monday the 2nd's 6:00 is 25 h old
+        assert len(m.calls) == 4 and hub.sched_runs[tid]["skipped"] == at(2026, 11, 2, 6, 0)
+        hub.sched_tasks()[0]["cron"] = "0 8 * * *"
+        # run now, edit (off), remove
+        await hub.sched_op(p, "sched_run", {"id": tid})
+        assert len(m.calls) == 5 and p.out[-1]["t"] == "sched_ok" and p.out[-1]["sid"] == "s5"
+        await hub.sched_op(p, "sched_save", {"id": tid, "task": dict(hub.sched_tasks()[0], enabled=False)})
+        assert hub.sched_tasks()[0]["enabled"] is False and hub.sched_view()[0]["next"] is None
+        await tick(at(2026, 10, 31, 8, 0, 30))
+        assert len(m.calls) == 5
+        with pytest.raises(ValueError):
+            await hub.sched_op(p, "sched_save", {"task": {"name": "x", "cron": "bad", "machine": "M1",
+                                                           "kind": "claude", "cwd": "~", "prompt": "p"}})
+        await hub.sched_op(p, "sched_remove", {"id": tid})
+        assert hub.sched_tasks() == [] and tid not in hub.sched_runs
+    asyncio.run(run())

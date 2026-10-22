@@ -1339,6 +1339,7 @@ class Session:
         self.menu_parsed = 0.0         # last parse_menu run (MENU_MAX_WAIT)
         self.menu = None               # interactive picker visible on the screen (parse_menu)
         self.init_cmds = []            # slash commands typed once after the first SessionStart (claude)
+        self.first_prompt = None       # a scheduled task's message: on argv at the first spawn only (not on restarts)
         self.delete_req = None         # callback(ok) while a delete waits for the process to exit
 
     # --- info
@@ -1462,6 +1463,11 @@ class Session:
         if "LANG" not in env:
             env["LANG"] = "en_US.UTF-8" if sys.platform == "darwin" else "C.UTF-8"
         argv = self.launch_argv(resume)
+        if self.first_prompt and not resume and self.kind in ("claude", "codex"):
+            # the initial prompt is the program's last positional argument (claude [options] [prompt],
+            # codex [OPTIONS] [PROMPT]); "--" first, so a prompt starting with "-" is not read as an option
+            argv = argv + ["--", self.first_prompt]
+        self.first_prompt = None
         hot = self.hot_key_setup(argv)   # -> (env var the key replaces, extra argv) or None
         if self.kind != "claude" and not hot:
             env.update(self.env)     # codex: export OPENAI_API_KEY=... ; claude: key goes into the settings file only
@@ -2243,6 +2249,7 @@ EN.update({
     "无效的上限（例如 20G）": "Invalid limit (e.g. 20G)",
     "无效的记忆操作": "Invalid memory operation",
     "无效的扩展操作": "Invalid extension request",
+    "无效的任务内容": "Invalid task text",
     "扩展清单读不了：%s": "Cannot read the extension manifest: %s",
     "扩展清单格式不对": "The extension manifest is not in the right format",
     "没有设置 %s": "%s is not set",
@@ -3609,7 +3616,7 @@ class Daemon:
 
 
     def create(self, kind, cwd, name, args, cols, rows, env=None, key=None, resume_id=None, init_cmds=None,
-               sid=None, overrides=None):
+               sid=None, overrides=None, first_prompt=None):
         """New session. With resume_id a session that already owns that conversation is reused:
         running -> returned as is, exited -> restarted in place (see create_or_reuse)."""
         if kind not in DEFAULT_PRESETS:
@@ -3638,6 +3645,10 @@ class Daemon:
             s.env = {str(k): str(v) for k, v in env.items()}
         s.key = key
         s.init_cmds = cmds
+        if isinstance(first_prompt, str) and first_prompt.strip() and not resume_id and kind != "shell":
+            if len(first_prompt) > 20000 or "\x00" in first_prompt:
+                raise RuntimeError(tr("无效的任务内容"))
+            s.first_prompt = first_prompt
         if kind == "codex" and isinstance(overrides, dict):
             s.overrides = {k: str(v) for k, v in overrides.items() if k in ("model", "effort", "approval", "sandbox") and v}
         if resume_id:
@@ -3669,7 +3680,8 @@ class Daemon:
         o = self.owner_of(kind, resume_id) if isinstance(resume_id, str) else None
         if o is None:
             done(self.create(kind, m.get("cwd"), m.get("name"), m.get("args"), m.get("cols"), m.get("rows"),
-                             m.get("env"), m.get("key"), resume_id, m.get("init_cmds")), False, None)
+                             m.get("env"), m.get("key"), resume_id, m.get("init_cmds"),
+                             first_prompt=m.get("first_prompt")), False, None)
             return
         if o.fd is not None:
             done(o, True, None)

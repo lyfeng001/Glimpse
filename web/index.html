@@ -329,6 +329,51 @@
 </dialog>
 
 <!-- add / edit a machine -->
+<dialog id="dlg-sched" class="sheet" aria-labelledby="dlg-sc-title">
+  <form id="sc-form" novalidate>
+    <div class="sh-grab" aria-hidden="true"></div>
+    <div class="sh-head">
+      <button type="button" class="txt-btn l" data-close>取消</button>
+      <h2 id="dlg-sc-title">新建定时任务</h2>
+      <button type="submit" class="txt-btn strong r" id="sc-ok">保存</button>
+    </div>
+    <div class="sh-body">
+      <div class="group">
+        <label class="cell" for="sc-name"><span class="lbl">名称</span><input id="sc-name" placeholder="例如 论文日报" maxlength="60" enterkeyhint="next"></label>
+        <div class="cell"><span class="lbl" id="sc-on-lbl">启用</span><span class="grow"></span><span class="switch"><input type="checkbox" role="switch" id="sc-on" aria-labelledby="sc-on-lbl" checked><i></i></span></div>
+      </div>
+      <div class="g-h">时间</div>
+      <div class="group">
+        <div class="cell"><span class="lbl" id="sc-freq-lbl">重复</span><select id="sc-freq" aria-labelledby="sc-freq-lbl">
+          <option value="daily">每天</option><option value="weekdays">工作日（周一到周五）</option><option value="weekly">每周一次</option><option value="hourly">每小时</option><option value="cron">自定义（cron）</option></select></div>
+        <label class="cell" for="sc-time" id="sc-time-row"><span class="lbl">时刻</span><span class="grow"></span><input id="sc-time" type="time" value="08:00" style="width:auto;text-align:right"></label>
+        <div class="cell" id="sc-dow-row" hidden><span class="lbl" id="sc-dow-lbl">星期</span><select id="sc-dow" aria-labelledby="sc-dow-lbl">
+          <option value="1">周一</option><option value="2">周二</option><option value="3">周三</option><option value="4">周四</option><option value="5">周五</option><option value="6">周六</option><option value="0">周日</option></select></div>
+        <label class="cell" for="sc-min" id="sc-min-row" hidden><span class="lbl">在第几分钟</span><input id="sc-min" type="number" inputmode="numeric" min="0" max="59" value="0"></label>
+        <label class="cell stack" for="sc-cron" id="sc-cron-row" hidden><span class="lbl">cron（分 时 日 月 星期，本机时间）</span>
+          <input id="sc-cron" class="mono" placeholder="0 8 * * *" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+      </div>
+      <p class="g-f" id="sc-next"></p>
+      <div class="g-h">在哪里运行</div>
+      <div class="group">
+        <div class="cell"><span class="lbl" id="sc-m-lbl">机器</span><select id="sc-m" aria-labelledby="sc-m-lbl"></select></div>
+        <div class="cell"><span class="lbl" id="sc-kind-lbl">类型</span><select id="sc-kind" aria-labelledby="sc-kind-lbl"><option value="claude">Claude Code</option><option value="codex">Codex</option></select></div>
+        <label class="cell stack" for="sc-cwd"><span class="lbl">工作目录</span>
+          <input id="sc-cwd" class="mono" placeholder="~/Documents/spiritai/paper-radar" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+      </div>
+      <div class="g-h">任务内容（第一条消息）</div>
+      <div class="group"><div class="cell stack"><label class="sr" for="sc-prompt">任务内容</label>
+        <textarea id="sc-prompt" rows="6" class="sc-prompt" placeholder="例如：按 paper-radar 的说明，整理今天 AI robotics 方向最值得看的 20 篇，写进知识库并给我一份日报"></textarea></div></div>
+      <div class="group" style="margin-top:16px" id="sc-run-g">
+        <button type="button" class="cell" id="sc-run"><span class="cell-ic" style="background:#2FB457" aria-hidden="true"><svg class="ic"><use href="#i-pulse"/></svg></span><span class="grow">现在运行一次<div class="sub" id="sc-run-sub">按保存的设置新开一个会话</div></span></button>
+      </div>
+      <div class="group" style="margin-top:16px" id="sc-del-g">
+        <button type="button" class="cell center danger" id="sc-del">删除这个定时任务</button>
+      </div>
+      <p id="sc-err" class="sh-err" role="alert"></p>
+    </div>
+  </form>
+</dialog>
 <dialog id="dlg-machine" class="sheet" aria-labelledby="dlg-mc-title">
   <form id="mc-form" novalidate>
     <div class="sh-grab" aria-hidden="true"></div>
@@ -560,6 +605,7 @@
     </div>
     <div class="group" style="margin-top:var(--s4)">
       <button type="button" class="cell" data-spage="machines"><span class="cell-ic" style="background:#0A84FF" aria-hidden="true"><svg class="ic"><use href="#i-server"/></svg></span><span class="grow">机器<div class="sub" id="nav-machines-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
+      <button type="button" class="cell" data-spage="sched" id="nav-sched"><span class="cell-ic" style="background:#FF6B35" aria-hidden="true"><svg class="ic"><use href="#i-history"/></svg></span><span class="grow">定时任务<div class="sub" id="nav-sched-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
       <button type="button" class="cell" data-spage="ext" id="nav-ext"><span class="cell-ic" style="background:#8E5CF7" aria-hidden="true"><svg class="ic"><use href="#i-plus-sq"/></svg></span><span class="grow">扩展<div class="sub" id="nav-ext-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
       <button type="button" class="cell" data-spage="mem" id="nav-mem" hidden><span class="cell-ic" style="background:#8E5CF7" aria-hidden="true"><svg class="ic"><use href="#i-sparkle"/></svg></span><span class="grow">记忆<div class="sub" id="nav-mem-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
     </div>
@@ -627,6 +673,13 @@
       <button type="button" class="cell" id="btn-add-machine"><span class="cell-ic" aria-hidden="true"><svg class="ic"><use href="#i-plus"/></svg></span><span class="grow" style="color:var(--accent-text)">添加机器</span></button>
       <button type="button" class="cell" id="btn-clean"><span class="cell-ic" style="background:#5C636E" aria-hidden="true"><svg class="ic"><use href="#i-broom"/></svg></span><span class="grow">清理已结束的会话<div class="sub" id="btn-clean-sub"></div></span></button>
     </div>
+  </div>
+  <div class="spage" data-page="sched" data-title="定时任务" hidden>
+    <div id="set-sched"></div>
+    <div class="group" style="margin-top:8px">
+      <button type="button" class="cell" id="btn-sched-new"><span class="cell-ic" aria-hidden="true"><svg class="ic"><use href="#i-plus"/></svg></span><span class="grow" style="color:var(--accent-text)">新建定时任务</span></button>
+    </div>
+    <p class="g-f">到点时在指定机器和目录新开一个 Claude Code / Codex 会话，把任务内容作为第一条消息发出去，并推送通知；可以在手机上看它跑、接着追问。电脑在睡眠或机器离线时错过的那次，会在醒来后补跑一次（超过一天就跳过）。上一次还在运行时，这次会等它结束。</p>
   </div>
   <div class="spage" data-page="ext" data-title="扩展" hidden>
     <div id="set-ext"></div>

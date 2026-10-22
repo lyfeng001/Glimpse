@@ -697,6 +697,11 @@ function onMsg(m) {
       }
       S.keys = m.keys || []; S.balance = m.balance || null; S.hub = m.hub || null; S.options = m.options || null; S.haveState = true;
       S.ext = Array.isArray(m.extensions) ? m.extensions : [];
+      S.sched = Array.isArray(m.schedules) ? m.schedules : [];
+      if (SCH.openWhen && (SCH.openWhen.until < Date.now() || session(SCH.openWhen.m, SCH.openWhen.sid))) {
+        const w = SCH.openWhen; SCH.openWhen = null;
+        if (session(w.m, w.sid)) setTimeout(() => openSession(w.m, w.sid), 0);
+      }
       checkBuild(S.hub && S.hub.web);
       renderHome();
       if (S.view) renderView();
@@ -765,9 +770,11 @@ function onMsg(m) {
     }
     case 'vault_view': onVault(m); break;
     case 'ext_ok': onExtOk(m); break;
+    case 'sched_ok': onSchedOk(m); break;
     case 'error':
       if (m.op === 'models' && m.kind) { onModels(m, true); break; }
       if (m.op === 'vault_view') { onVaultErr(m); break; }
+      if (/^sched_/.test(m.op || '')) { onSchedErr(m); break; }
       if (/^ext_/.test(m.op || '')) { EXT.busy = false; $('#ext-add-btn').disabled = false; toast(T('扩展'), m.msg, null, 'error'); break; }
       if ($('#dlg-new').open && !m.sid) { newBusy(false); $('#new-err').textContent = m.msg; }
       else if (ADOPT.busy && $('#dlg-adopt').open && !m.sid) { adoptFail(m.msg); }
@@ -3394,7 +3401,7 @@ async function renderSettings() {
 // ---- settings sub-pages: the main list links to pages that slide in from the right
 const THEME_NAMES = { auto: T('跟随系统'), light: T('浅色'), dark: T('深色'), solarized: 'Solarized' };
 function renderSettingsNav() {
-  renderExtPage();
+  renderExtPage(); renderSchedPage();
   $('#nav-look-sub').textContent = THEME_NAMES[themePref()] + T(' · 终端字号 ') + S.fontSize;
   const w = $$('#set-widgets input[type=checkbox]'); const won = w.filter((x) => x.checked).length;
   $('#nav-widgets-sub').textContent = w.length ? T('已开启 ') + won + ' / ' + w.length : '';
@@ -3430,6 +3437,135 @@ function renderKeyPage() {
   };
 }
 for (const el of $$('#kb-modes [data-kb]')) el.onclick = () => send({ op: 'key_balance', mode: el.dataset.kb, exclude: kbState().exclude });
+// ---- scheduled tasks (Settings → 定时任务): config.json "schedules"; the hub starts a session at each time
+const SCH = { id: null, busy: false };
+const SCH_DOW = [T('周日'), T('周一'), T('周二'), T('周三'), T('周四'), T('周五'), T('周六')];
+function schedList() { return S.sched || []; }
+function two(n) { return String(n).padStart(2, '0'); }
+function cronText(c) {
+  // the common shapes in words; anything else as written
+  const f = String(c || '').split(' ');
+  if (f.length !== 5) return c;
+  const [mi, h, dom, mon, dow] = f; const num = (x) => /^\d+$/.test(x);
+  if (num(mi) && num(h) && dom === '*' && mon === '*') {
+    const hm = two(h) + ':' + two(mi);
+    if (dow === '*') return T('每天 ') + hm;
+    if (dow === '1-5') return T('工作日 ') + hm;
+    if (num(dow) && +dow <= 7) return T('每%a', { a: SCH_DOW[+dow % 7] }) + ' ' + hm;
+  }
+  if (num(mi) && h === '*' && dom === '*' && mon === '*' && dow === '*') return T('每小时第 %a 分', { a: mi });
+  return 'cron ' + c;
+}
+function whenText(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000); const now = new Date();
+  const hm = two(d.getHours()) + ':' + two(d.getMinutes());
+  const day = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const dd = Math.round((day(d) - day(now)) / 86400000);
+  return (dd === 0 ? T('今天 ') : dd === 1 ? T('明天 ') : dd === -1 ? T('昨天 ') : (d.getMonth() + 1) + '/' + d.getDate() + ' ') + hm;
+}
+function renderSchedPage() {
+  const list = schedList();
+  $('#nav-sched-sub').textContent = list.length ? list.filter((x) => x.enabled).length + ' / ' + list.length + T(' 个已启用') : '';
+  const h = list.map((x) => {
+    const mc = S.byId[x.machine];
+    const st = !x.enabled ? T('已关闭') : x.next ? T('下次 ') + whenText(x.next) : '';
+    const last = x.error ? '<div class="sub bad">' + T('上次失败：') + esc(x.error) + '</div>'
+      : x.last ? '<div class="sub">' + T('上次 ') + esc(whenText(x.last)) + (x.skipped ? ' · ' + T('错过的一次已跳过') : '') + '</div>' : '';
+    return '<button type="button" class="cell sched-row" data-sched="' + esc(x.id) + '"><span class="cell-ic" style="background:' + (x.enabled ? '#FF6B35' : '#8E8E93') + '" aria-hidden="true">' + ic('history') + '</span>' +
+      '<span class="grow">' + esc(x.name) + '<div class="sub">' + esc(cronText(x.cron)) + ' · ' + esc(x.machine) + (mc && !mc.online ? T('（离线）') : '') + ' · ' + esc(KIND[x.kind] || x.kind) + (st ? ' · ' + esc(st) : '') + '</div>' + last + '</span>' +
+      '<svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>';
+  }).join('');
+  setHTML($('#set-sched'), '<div class="group">' + (h || '<div class="cell"><span class="grow sub">' + T('还没有定时任务') + '</span></div>') + '</div>');
+  for (const b of $$('[data-sched]', $('#set-sched'))) b.onclick = () => openSched(b.dataset.sched);
+}
+function schedFreqFrom(c) {
+  // the editor's simple form for a cron, or "cron" when it has none
+  const f = String(c || '').split(' '); const num = (x) => /^\d+$/.test(x);
+  if (f.length === 5 && f[2] === '*' && f[3] === '*' && num(f[0])) {
+    if (num(f[1]) && f[4] === '*') return { freq: 'daily', h: +f[1], mi: +f[0] };
+    if (num(f[1]) && f[4] === '1-5') return { freq: 'weekdays', h: +f[1], mi: +f[0] };
+    if (num(f[1]) && num(f[4]) && +f[4] <= 7) return { freq: 'weekly', h: +f[1], mi: +f[0], dow: +f[4] % 7 };
+    if (f[1] === '*' && f[4] === '*') return { freq: 'hourly', mi: +f[0] };
+  }
+  return { freq: 'cron' };
+}
+function schedCron() {
+  const fq = $('#sc-freq').value;
+  if (fq === 'cron') return $('#sc-cron').value.trim().replace(/\s+/g, ' ');
+  if (fq === 'hourly') return Math.max(0, Math.min(59, parseInt($('#sc-min').value, 10) || 0)) + ' * * * *';
+  const [h, mi] = ($('#sc-time').value || '08:00').split(':').map((x) => parseInt(x, 10) || 0);
+  return mi + ' ' + h + ' * * ' + (fq === 'weekdays' ? '1-5' : fq === 'weekly' ? $('#sc-dow').value : '*');
+}
+function schedFreqRows() {
+  const fq = $('#sc-freq').value;
+  $('#sc-time-row').hidden = fq === 'cron' || fq === 'hourly';
+  $('#sc-dow-row').hidden = fq !== 'weekly';
+  $('#sc-min-row').hidden = fq !== 'hourly';
+  $('#sc-cron-row').hidden = fq !== 'cron';
+  $('#sc-next').textContent = T('本机时间：') + cronText(schedCron());
+}
+for (const id of ['#sc-freq', '#sc-time', '#sc-dow', '#sc-min', '#sc-cron']) $(id).addEventListener('input', schedFreqRows);
+function openSched(id) {
+  const x = id ? schedList().find((t) => t.id === id) : null;
+  SCH.id = x ? x.id : null; SCH.busy = false;
+  $('#dlg-sc-title').textContent = x ? T('编辑定时任务') : T('新建定时任务');
+  $('#sc-name').value = x ? x.name : '';
+  $('#sc-on').checked = x ? x.enabled : true;
+  const fr = schedFreqFrom(x ? x.cron : '0 8 * * *');
+  $('#sc-freq').value = fr.freq;
+  $('#sc-time').value = two(fr.h == null ? 8 : fr.h) + ':' + two(fr.mi || 0);
+  $('#sc-dow').value = String(fr.dow == null ? 1 : fr.dow);
+  $('#sc-min').value = String(fr.mi || 0);
+  $('#sc-cron').value = x ? x.cron : '0 8 * * *';
+  setHTML($('#sc-m'), S.machines.map((mc) => '<option value="' + esc(mc.id) + '">' + esc(mc.id + ' · ' + mc.name) + '</option>').join(''));
+  $('#sc-m').value = x ? x.machine : (S.machines[0] || {}).id || '';
+  $('#sc-kind').value = x ? x.kind : 'claude';
+  $('#sc-cwd').value = x ? x.cwd : '';
+  $('#sc-prompt').value = x ? x.prompt : '';
+  $('#sc-run-g').hidden = $('#sc-del-g').hidden = !x;
+  $('#sc-err').textContent = '';
+  schedFreqRows();
+  openSheet($('#dlg-sched'));
+}
+$('#btn-sched-new').onclick = () => openSched(null);
+$('#sc-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  if (SCH.busy) return;
+  const task = { name: $('#sc-name').value.trim(), cron: schedCron(), machine: $('#sc-m').value, kind: $('#sc-kind').value,
+    cwd: $('#sc-cwd').value.trim(), prompt: $('#sc-prompt').value.trim(), enabled: $('#sc-on').checked };
+  const miss = !task.name ? '#sc-name' : !task.cwd ? '#sc-cwd' : !task.prompt ? '#sc-prompt' : null;
+  if (miss) { $('#sc-err').textContent = T('请填写名称、工作目录和任务内容'); $(miss).focus(); return; }
+  const old = SCH.id && schedList().find((t) => t.id === SCH.id);
+  if (old) for (const k of ['model', 'effort', 'mode']) if (old[k]) task[k] = old[k];
+  if (!send({ op: 'sched_save', id: SCH.id, task })) { $('#sc-err').textContent = T('未连接到 hub'); return; }
+  SCH.busy = true; $('#sc-ok').disabled = true;
+});
+$('#sc-run').onclick = () => {
+  if (SCH.busy || !SCH.id) return;
+  if (!send({ op: 'sched_run', id: SCH.id })) { $('#sc-err').textContent = T('未连接到 hub'); return; }
+  SCH.busy = true; $('#sc-run-sub').textContent = T('启动中…');
+};
+$('#sc-del').onclick = async () => {
+  if (!SCH.id || !(await confirmSheet(T('删除这个定时任务？'), T('以后不会再运行。已经开过的会话不受影响。'), T('删除')))) return;
+  send({ op: 'sched_remove', id: SCH.id }); SCH.busy = true;
+};
+function onSchedOk(m) {
+  SCH.busy = false; $('#sc-ok').disabled = false; $('#sc-run-sub').textContent = T('按保存的设置新开一个会话');
+  if (m.op === 'sched_run') {
+    // straight into the new session (a toast would sit under the settings sheet); openSession closes the sheets
+    toast(T('已开始运行'), '', null, 'done');
+    if (session(m.m, m.sid)) openSession(m.m, m.sid);
+    else SCH.openWhen = { m: m.m, sid: m.sid, until: Date.now() + 10000 };   // the state with it is on its way
+    return;
+  }
+  closeSheet($('#dlg-sched'));
+  toast(m.op === 'sched_remove' ? T('已删除定时任务') : T('已保存定时任务'), '', null, 'done');
+}
+function onSchedErr(m) {
+  SCH.busy = false; $('#sc-ok').disabled = false; $('#sc-run-sub').textContent = T('按保存的设置新开一个会话');
+  if ($('#dlg-sched').open) $('#sc-err').textContent = m.msg; else toast(T('定时任务'), m.msg, null, 'error');
+}
 // ---- extensions (Settings → 扩展): what config.json "extensions" lists, with each machine's verdict
 const EXT = { open: {}, busy: false };
 function extList() { return (S.ext || []); }
@@ -4004,6 +4140,7 @@ function refreshOpenSheets() {
   if ($('#dlg-settings').open) {
     renderSettingsMachines(); renderKeyPage(); renderSettingsNav();
     if (!$('#set-ext').contains(document.activeElement)) renderExtPage();     // not while typing a setting
+    renderSchedPage();
     $('#set-hubver').textContent = S.hub && S.hub.version ? S.hub.version : '—';
   }
   if ($('#dlg-new').open) {

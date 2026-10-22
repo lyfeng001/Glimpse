@@ -946,6 +946,40 @@ def test_create_with_resume_id(tmp_path, monkeypatch):
         d.create("shell", str(tmp_path), None, None, 80, 24, resume_id="x")
 
 
+def test_first_prompt_only_on_first_spawn(tmp_path, monkeypatch):
+    """A scheduled task's message goes on argv ("--", prompt last) at the first spawn only: a restart / resume
+    must not send it again."""
+    d = _daemon(tmp_path)
+    got = []
+
+    class Stop(Exception):
+        pass
+
+    def fork():
+        raise Stop
+    monkeypatch.setattr(A.pty, "fork", fork)
+    monkeypatch.setattr(A.Session, "hot_key_setup", lambda self, argv: got.append(list(argv)) or None)
+    with pytest.raises(Stop):
+        d.create("codex", str(tmp_path), None, None, 80, 24, first_prompt="-整理今天的论文")
+    assert got[-1][-2:] == ["--", "-整理今天的论文"] and got[-1][0] == "codex"
+    s = next(iter(d.sessions.values()), None) or A.Session(d, "abc123", "codex", "x", str(tmp_path), ["codex"], 80, 24)
+    s.first_prompt = None
+    with pytest.raises(Stop):
+        s.spawn(resume=False)                                     # a restart: no prompt again
+    assert "--" not in got[-1]
+    s2 = A.Session(d, "abc124", "claude", "x", str(tmp_path), ["claude"], 80, 24)
+    s2.first_prompt, s2.agent_session_id = "go", "sid-1"
+    with pytest.raises(Stop):
+        s2.spawn(resume=True)                                     # resuming a conversation: never
+    assert "go" not in got[-1] and s2.first_prompt is None
+    for bad in ("x" * 20001, "a\x00b"):
+        with pytest.raises(RuntimeError):
+            d.create("claude", str(tmp_path), None, None, 80, 24, first_prompt=bad)
+    with pytest.raises(Stop):
+        d.create("shell", str(tmp_path), None, None, 80, 24, first_prompt="ls")   # shells: ignored
+    assert "ls" not in got[-1]
+
+
 def test_info_hides_argv():
     _, s = _session()
     s.argv = ["/opt/bin/claude", "--settings", "/secret/path.json"]

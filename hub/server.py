@@ -8,6 +8,7 @@ import ipaddress
 import json
 import logging
 import copy
+import datetime
 import os
 import re
 import ssl
@@ -23,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config as C  # noqa: E402
 from auth import PAIR_TTL, Auth  # noqa: E402
 import keybalance as KB  # noqa: E402
+import schedule as SC  # noqa: E402
 import webpush  # noqa: E402
 from machines import Machine  # noqa: E402
 import machines as M  # noqa: E402
@@ -133,6 +135,10 @@ EN = {
     "Glimpse 测试通知": "Glimpse test notification",
     "通知已经可以正常工作": "Notifications work",
     "知识库未配置（设置 → 扩展）": "No vault configured (Settings → Extensions)",
+    "定时任务开始了：%s": "Scheduled task started: %s",
+    "定时任务的“%s”不对": "The scheduled task's %s is not valid",
+    "没有这个定时任务": "No such scheduled task",
+    "%s 离线": "%s is offline",
     "扩展 %s 没有启用": "Extension %s is not turned on",
     "扩展操作失败": "Extension request failed",
     "扩展 %s 已经添加过了": "Extension %s was already added",
@@ -156,6 +162,8 @@ HOST_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
 ARG_RE = re.compile(r"^[A-Za-z0-9_.:/\[\]@+=-]{1,120}$")   # model / effort / mode values that go on argv
 RESUME_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 EXT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+SCHED_FIELDS = {"name": "名称", "cron": "时间", "machine": "机器", "kind": "类型", "cwd": "目录", "prompt": "任务内容",
+                "model": "模型", "effort": "推理强度", "mode": "模式", "task": "任务"}
 MEMORY_ACTIONS = ("overview", "memories", "context", "sessions", "search", "compact", "budget")
 CONTROL_ACTIONS = ("mode", "model", "effort", "goal", "approval", "sandbox")
 MENU_KEYS = ("esc", "s")
@@ -370,6 +378,9 @@ class Hub:
         self.key_swaps = {}        # (machine, sid) -> times of automatic swaps (loop guard)
         self.key_rates = KB.RateTracker()   # measured 7-day spend rate per key (from successive usage polls)
         self.key_moved = {}        # (machine, sid) -> last balancing move
+        self.sched_path = os.path.join(DATA, "schedules.json")
+        self.sched_runs = self._load_sched()    # task id -> {"last": ts, "sid", "m", "error", "skipped"}
+        self.sched_busy = set()                 # task ids starting right now
         self.bg = []
         for mc in cfg.get("machines", []):
             if mc.get("enabled", True) is False:
@@ -392,6 +403,154 @@ class Hub:
 
     def _save_push(self):
         C.write_secret(self.push_path, json.dumps(self.push_subs))
+
+    # --- scheduled tasks (config.json "schedules"; when each last ran: data/schedules.json)
+    def _load_sched(self):
+        try:
+            with open(self.sched_path) as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_sched(self):
+        C.write_secret(self.sched_path, json.dumps(self.sched_runs))
+
+    def sched_tasks(self):
+        return [x for x in self.cfg.get("schedules") or [] if isinstance(x, dict) and isinstance(x.get("id"), str)]
+
+    def sched_view(self):
+        """Every task with its next run, the last run (session, error) and whether a missed run was skipped."""
+        now = datetime.datetime.now()
+        out = []
+        for x in self.sched_tasks():
+            try:
+                nxt = SC.Cron(x.get("cron")).next(now)
+            except ValueError:
+                nxt = None
+            r = self.sched_runs.get(x["id"]) or {}
+            out.append(dict({k: x.get(k) for k in ("id", "name", "cron", "machine", "kind", "cwd", "prompt", "model",
+                                                   "effort", "mode") if x.get(k) is not None},
+                            enabled=x.get("enabled", True) is not False,
+                            next=nxt.timestamp() if nxt and x.get("enabled", True) is not False else None,
+                            last=r.get("ran"), sid=r.get("sid"), error=r.get("error"), skipped=r.get("skipped")))
+        return out
+
+    async def sched_loop(self):
+        """Every 20 s: start the tasks that are due. A run missed while this computer slept or the machine was
+        offline starts once when it is back (within SC.CATCH_UP); nothing runs twice for one time slot, and a
+        task whose previous session is still busy waits for it."""
+        await asyncio.sleep(5)                # the machines connect first
+        while True:
+            try:
+                await self.sched_tick(time.time())
+            except Exception:
+                log.exception("scheduled tasks")
+            await asyncio.sleep(20)
+
+    async def sched_tick(self, now):
+        changed = False
+        for x in self.sched_tasks():
+            if x.get("enabled", True) is False or x["id"] in self.sched_busy:
+                continue
+            r = self.sched_runs.setdefault(x["id"], {})
+            if r.get("last") is None:
+                r["last"] = now                # a new task: from now on (no run for slots before it existed)
+                changed = True
+                continue
+            try:
+                slot = SC.due(SC.Cron(x["cron"]), r["last"], now)
+            except (ValueError, KeyError):
+                continue
+            if slot is None:
+                continue
+            if slot < 0:                       # too old to catch up: note it, wait for the next
+                r.update(last=-slot, skipped=-slot)
+                changed = True
+                continue
+            m = self.machines.get(x.get("machine"))
+            if m is None or not m.online:
+                continue                       # tried again every tick until it is back (or the slot is too old)
+            prev = m.sessions.get(r.get("sid")) if r.get("sid") else None
+            if prev and prev.get("status") in ("running", "starting", "waiting"):
+                continue                       # the previous run is still busy
+            asyncio.ensure_future(self.sched_start(x, m, slot))
+        if changed:
+            self._save_sched()
+            self.state_dirty.set()
+
+    async def sched_start(self, x, m, slot=None):
+        """Start the task's session; returns its session info (or raises ValueError)."""
+        self.sched_busy.add(x["id"])
+        r = self.sched_runs.setdefault(x["id"], {})
+        try:
+            kind = x["kind"]
+            preset = self.preset(m, kind)
+            argv = build_argv(kind, list(preset.get("argv") or [kind]), x)
+            key = preset.get("key")
+            if KB.mode_of(self.cfg) == "least_used":
+                key = self.best_key() or key
+            env = self.env_for(kind, key) if key else None
+            stamp = datetime.datetime.fromtimestamp(slot or time.time()).strftime("%m-%d %H:%M")
+            res = await m.call({"op": "create", "kind": kind, "cwd": x["cwd"], "name": "%s · %s" % (x["name"], stamp),
+                                "args": argv, "env": env, "key": key if env else None, "cols": 100, "rows": 32,
+                                "first_prompt": x["prompt"], "init_cmds": init_cmds(kind, x)}, timeout=60)
+            if res.get("t") != "created":
+                raise ValueError(agent_error(res, tr("创建失败")))
+            s = res["s"]
+            r.update(last=slot or r.get("last") or time.time(), ran=time.time(), sid=s["sid"], m=m.id, error=None,
+                     skipped=None)
+            log.info("scheduled task %s started on %s: %s", x["id"], m.id, s["sid"])
+            await self.push_all({"title": tr("定时任务开始了：%s", x["name"]), "body": x["prompt"][:160],
+                                 "subtitle": "%s %s" % (m.id, m.name), "tag": "sched:" + x["id"],
+                                 "url": "/#%s/%s" % (m.id, s["sid"]), "kind": "sched"},
+                                skip={p.device for p in self.phones if p.device and p.on_screen()})
+            return s
+        except (ValueError, ConnectionError, asyncio.TimeoutError) as e:
+            # recorded as this slot's run: a failing task does not start a new session every 20 s
+            r.update(last=slot or r.get("last") or time.time(), ran=time.time(), error=str(e) or tr("超时"))
+            log.warning("scheduled task %s failed: %s", x["id"], e)
+            raise ValueError(r["error"])
+        finally:
+            self.sched_busy.discard(x["id"])
+            self._save_sched()
+            self.state_dirty.set()
+
+    async def sched_op(self, p, op, msg):
+        """Settings → 定时任务: save (new or changed), remove, run now."""
+        tasks = self.cfg.setdefault("schedules", [])
+        tid = msg.get("id") if isinstance(msg.get("id"), str) else None
+        cur = next((x for x in tasks if x.get("id") == tid), None) if tid else None
+        if op == "sched_save":
+            try:
+                x = SC.check(msg.get("task"), set(self.machines))
+            except ValueError as e:
+                raise ValueError(tr("定时任务的“%s”不对", SCHED_FIELDS.get(str(e), str(e))))
+            if cur is None:
+                tid = os.urandom(4).hex()
+                tasks.append(dict(x, id=tid))
+                self.sched_runs[tid] = {"last": time.time()}
+            else:
+                if cur.get("cron") != x["cron"]:
+                    self.sched_runs.setdefault(tid, {})["last"] = time.time()   # a new time: from now on
+                cur.clear()
+                cur.update(dict(x, id=tid))
+        elif cur is None:
+            raise ValueError(tr("没有这个定时任务"))
+        elif op == "sched_remove":
+            tasks.remove(cur)
+            self.sched_runs.pop(tid, None)
+        elif op == "sched_run":
+            m = self.machines.get(cur.get("machine"))
+            if m is None or not m.online:
+                raise ValueError(tr("%s 离线", cur.get("machine")))
+            s = await self.sched_start(cur, m)
+            p.send({"t": "sched_ok", "op": op, "id": tid, "m": m.id, "sid": s["sid"]})
+            return
+        C.save(self.cfg)
+        self._save_sched()
+        self.state_dirty.set()
+        p.send({"t": "sched_ok", "op": op, "id": tid})
 
     async def push_all(self, payload, skip=None):
         """Push to every subscription except those of the devices in `skip` (they have the app on screen).
@@ -685,7 +844,7 @@ class Hub:
 
     def state(self):
         return {"t": "state", "hub": {"version": VERSION, "web": WEB_BUILD, "lang": self.lang()}, "keys": self.keys_view(), "balance": self.balance_view(),
-                "options": self.options(), "extensions": self.ext_view(),
+                "options": self.options(), "schedules": self.sched_view(), "extensions": self.ext_view(),
                 "machines": [self.machines[k].info(self.presets_view(self.machines[k])) for k in self.order]}
 
     def on_machine_state(self, m):
@@ -866,6 +1025,12 @@ class Hub:
             return
         if op == "vault_view":
             await self.vault_view(p, msg)
+            return
+        if op in ("sched_save", "sched_remove", "sched_run"):
+            try:
+                await self.sched_op(p, op, msg)
+            except ValueError as e:
+                p.send({"t": "error", "op": op, "msg": str(e)})
             return
         if op in ("ext_add", "ext_update", "ext_remove"):
             try:
@@ -1662,7 +1827,7 @@ class Hub:
                     continue
                 p.last_seen = time.time()
                 if data.get("op") in ("create", "restart", "models", "machine_test", "machine_add", "machine_update",
-                                      "machine_remove", "vault_view", "ext_add", "ext_update", "ext_remove"):
+                                      "machine_remove", "vault_view", "ext_add", "ext_update", "ext_remove", "sched_run"):
                     asyncio.ensure_future(self.phone_op(p, data))
                 else:
                     await self.phone_op(p, data)
@@ -1695,7 +1860,7 @@ class Hub:
     async def startup(self, app):
         self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
         self.bg = [asyncio.ensure_future(self.state_loop()), asyncio.ensure_future(self.config_watch_loop()),
-                   asyncio.ensure_future(self.code_watch_loop())]
+                   asyncio.ensure_future(self.code_watch_loop()), asyncio.ensure_future(self.sched_loop())]
         if self.cfg["keys"].get("usage_url"):
             t = asyncio.ensure_future(self.key_usage_loop())
             t._kul = True

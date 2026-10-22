@@ -83,6 +83,7 @@
   <symbol id="i-broom" viewBox="0 0 24 24"><path d="M19 3 11 11"/><path d="M8.5 10.5 13.5 15.5 11 21H4l-1-3c2.5-1 4-3 5.5-7.5z"/><path d="M7 21l1-3.5M10.5 21l.5-2.5"/></symbol>
   <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1" fill="currentColor"/></symbol>
   <symbol id="i-phone" viewBox="0 0 24 24"><rect x="6" y="2" width="12" height="20" rx="3"/><path d="M11 18h2"/></symbol>
+  <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"/><path d="M19 19H6a2 2 0 0 0 0 4h13v-4M9 7h6"/></symbol>
   <symbol id="i-inbox" viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5.1 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.5-6.9A2 2 0 0 0 16.8 4H7.2a2 2 0 0 0-1.7 1.1z"/></symbol>
 </svg>
 <div id="app">
@@ -124,7 +125,8 @@
   <section id="home" class="screen" hidden>
     <header class="nav" id="home-nav">
       <div class="nav-row">
-        <div class="nav-side"><button type="button" id="btn-settings" class="icon-btn" aria-label="设置"><svg class="ic"><use href="#i-gear"/></svg></button></div>
+        <div class="nav-side"><button type="button" id="btn-settings" class="icon-btn" aria-label="设置"><svg class="ic"><use href="#i-gear"/></svg></button>
+          <button type="button" id="btn-vault" class="icon-btn" aria-label="知识库" hidden><svg class="ic"><use href="#i-book"/></svg></button></div>
         <div class="nav-title" aria-hidden="true">会话</div>
         <div class="nav-side end"><button type="button" id="btn-new" class="icon-btn" aria-label="新建会话"><svg class="ic"><use href="#i-plus"/></svg></button></div>
       </div>
@@ -212,6 +214,23 @@
         <button id="btn-send" type="submit" class="send enter" aria-label="发送回车"><svg class="ic"><use href="#i-return"/></svg></button>
       </form>
     </div>
+  </section>
+
+  <!-- the vault (vault-linker knowledge base): home, folders, projects, notes, search, editing a note -->
+  <section id="kb" class="screen" hidden aria-labelledby="kb-title">
+    <header class="nav vnav scrolled">
+      <div class="nav-row">
+        <button type="button" id="kb-back" class="icon-btn" aria-label="返回"><svg class="ic"><use href="#i-back"/></svg></button>
+        <div class="vtitle"><h1 class="vname" id="kb-title">知识库</h1><div id="kb-sub" class="vsub"></div></div>
+        <button type="button" id="kb-edit" class="icon-btn" aria-label="编辑" hidden><svg class="ic"><use href="#i-pencil"/></svg></button>
+        <button type="button" id="kb-refresh" class="icon-btn" aria-label="刷新"><svg class="ic"><use href="#i-refresh"/></svg></button>
+      </div>
+      <form id="kb-search" class="kb-search" role="search">
+        <svg class="ic sm" aria-hidden="true"><use href="#i-search"/></svg>
+        <input id="kb-q" type="search" placeholder="搜索笔记、实验、日志" aria-label="搜索知识库" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="search">
+      </form>
+    </header>
+    <main id="kb-body" class="scroll kb-body" tabindex="-1"></main>
   </section>
 </div>
 
@@ -381,6 +400,8 @@
         <span class="switch"><input type="checkbox" role="switch" id="act-ac" aria-label="临时错误自动继续"><i></i></span></div>
       <button type="button" class="cell" id="act-wf" hidden><span class="cell-ic" style="background:#8E5CF7" aria-hidden="true"><svg class="ic"><use href="#i-folder"/></svg></span>
         <span class="grow">启用项目工作流<div class="sub" id="act-wf-sub">建 git 仓库、登记到知识库；这一轮结束后重启并接上原对话</div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
+      <button type="button" class="cell" id="act-kb" hidden><span class="cell-ic" style="background:#8E5CF7" aria-hidden="true"><svg class="ic"><use href="#i-book"/></svg></span>
+        <span class="grow">项目知识库<div class="sub" id="act-kb-sub">实验记录、日志、文档</div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
       <button type="button" class="cell" id="act-fit"><span class="cell-ic" style="background:#2FB457" aria-hidden="true"><svg class="ic"><use href="#i-resize"/></svg></span><span class="grow">终端尺寸<div class="sub" id="act-fit-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
     </div>
     <div class="g-h">在其他地方打开</div>

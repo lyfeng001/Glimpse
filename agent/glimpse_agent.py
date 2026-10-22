@@ -2317,7 +2317,7 @@ def is_transient_error(text):
 VAULT_DEFAULT = {"linker": "", "path": ""}
 VAULT_LINK = ".vault-linker.json"
 # what the hub may run through op vault (first word of the vault-linker command line)
-VAULT_CLI_OK = ("project", "vault", "log", "exp", "search", "read", "inbox")
+VAULT_CLI_OK = ("project", "vault", "log", "exp", "search", "read", "inbox", "ls", "asset", "write")
 VAULT_PROMPT = (
     "This project uses the shared knowledge base (vault MCP server `vault`, project `{project}`). Before redoing "
     "work, vault_search for earlier experiments, conclusions and notes. Each experiment: exp_new before, exp_update "
@@ -2401,8 +2401,8 @@ class Vault:
                 "-c", "mcp_servers.vault.default_tools_approval_mode=\"approve\""]
 
 
-    def run(self, args, done, timeout=60):
-        """vault-linker --json <args> in the background; done(parsed JSON, error text)."""
+    def run(self, args, done, timeout=60, stdin=None):
+        """vault-linker --json <args> in the background (stdin: text for `write`); done(parsed JSON, error text)."""
         import subprocess
         lk, vp = self.linker(), self.vault_path()
         if not lk or not vp:
@@ -2411,8 +2411,8 @@ class Vault:
 
         def work():
             try:
-                r = subprocess.run([lk, "--vault", vp, "--json"] + args, stdin=subprocess.DEVNULL,
-                                   capture_output=True, timeout=timeout, cwd=os.path.expanduser("~"))
+                r = subprocess.run([lk, "--vault", vp, "--json"] + args, capture_output=True, timeout=timeout,
+                                   input=stdin.encode("utf-8") if stdin is not None else b"", cwd=os.path.expanduser("~"))
                 try:
                     out = json.loads(r.stdout.decode("utf-8", "replace") or "{}")
                 except ValueError:
@@ -4011,7 +4011,8 @@ class Daemon:
                 else:
                     self.vault.run(args, lambda res, err, c=c, req=req: self.send(
                         c, {"t": "error", "req": req, "msg": err} if err else {"t": "vault", "req": req, "data": res}),
-                        timeout=180 if args[:2] == ["project", "publish"] else 60)
+                        timeout=180 if args[:2] == ["project", "publish"] else 60,
+                        stdin=m.get("input") if isinstance(m.get("input"), str) else None)
             elif op == "memory_config":
                 self.memory.configure(m.get("cfg") or {},
                                       lambda c=c, req=req: self.send(c, dict(self.memory.status(), t="memory_status", req=req)))

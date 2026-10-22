@@ -859,6 +859,9 @@ class Hub:
         if op == "visible":
             p.visible = bool(msg.get("v"))
             return
+        if op == "vault_view":
+            await self.vault_view(p, msg)
+            return
         if op in ("machine_test", "machine_add", "machine_update", "machine_remove"):
             try:
                 await self.machine_op(p, op, msg)
@@ -1001,12 +1004,15 @@ class Hub:
             m.vault = bool(r.get("on"))
             self.state_dirty.set()
 
-    async def vault_cli(self, args, timeout=90):
+    async def vault_cli(self, args, timeout=90, stdin=None):
         """vault-linker <args> on the vault machine -> its JSON (ValueError with the message on failure)."""
         vm = self.vault_machine()
         if not self.vault_on() or vm is None:
             raise ValueError(tr("知识库未配置（config.json 的 vault）"))
-        r = await vm.call({"op": "vault", "args": list(args)}, timeout=timeout)
+        req = {"op": "vault", "args": list(args)}
+        if stdin is not None:
+            req["input"] = stdin
+        r = await vm.call(req, timeout=timeout)
         if r.get("t") != "vault":
             raise ValueError(agent_error(r, tr("知识库操作失败")))
         return r.get("data") or {}
@@ -1032,6 +1038,37 @@ class Hub:
         the session (resume) so it starts with the vault tools."""
         res = await self.workflow_setup(m, msg.get("cwd"), bool(msg.get("publish")))
         p.send(dict(res, t="project_workflow", m=m.id, sid=msg.get("sid"), cwd=msg.get("cwd")))
+
+    async def vault_view(self, p, msg):
+        """The vault view (知识库): read-only browsing plus a person's edit of a note and sync, on the vault machine.
+        -> {t: vault_view, action, key, data} or {t: error, op: vault_view, action, key, msg}."""
+        action, key = msg.get("action"), msg.get("key")
+        s = lambda k, n=4096: msg.get(k) if isinstance(msg.get(k), str) and len(msg.get(k)) <= n else None
+        try:
+            if action == "overview":
+                args = ["vault", "overview"]
+            elif action == "ls":
+                args = ["ls", "--", s("folder") or ""]
+            elif action == "read" and s("path"):
+                args = ["read"] + (["--raw"] if msg.get("raw") else []) + ["--", s("path")]
+            elif action == "project" and s("id", 64):
+                args = ["project", "show", s("id", 64)]
+            elif action == "search" and s("q", 200) is not None:
+                args = ["search", "--limit", "60", "--", s("q", 200)]
+            elif action == "asset" and s("path"):
+                args = ["asset", "--", s("path")]
+            elif action == "write" and s("path") and isinstance(msg.get("text"), str) and len(msg["text"]) <= 2_000_000:
+                args = ["write"] + (["--expect", repr(float(msg["expect"]))]
+                                   if isinstance(msg.get("expect"), (int, float)) else []) + ["--", s("path")]
+            elif action == "sync":
+                args = ["vault", "sync"] + (["--push"] if msg.get("push") else [])
+            else:
+                raise ValueError(tr("无效的知识库操作"))
+            data = await self.vault_cli(args, timeout=120 if action == "sync" else 60,
+                                        stdin=msg["text"] if action == "write" else None)
+            p.send({"t": "vault_view", "action": action, "key": key, "data": data})
+        except (ValueError, ConnectionError, asyncio.TimeoutError) as e:
+            p.send({"t": "error", "op": "vault_view", "action": action, "key": key, "msg": str(e) or tr("超时")})
 
     async def memory(self, p, m, msg):
         action = msg.get("action")
@@ -1533,7 +1570,7 @@ class Hub:
                     continue
                 p.last_seen = time.time()
                 if data.get("op") in ("create", "restart", "models", "machine_test", "machine_add", "machine_update",
-                                      "machine_remove"):
+                                      "machine_remove", "vault_view"):
                     asyncio.ensure_future(self.phone_op(p, data))
                 else:
                     await self.phone_op(p, data)

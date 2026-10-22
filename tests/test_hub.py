@@ -1052,7 +1052,8 @@ def test_project_workflow(hub_mod, tmp_path, monkeypatch):
                 self.v.configure(obj["cfg"])
                 return {"t": "vault_status", "on": self.v.on()}
             out = {}
-            self.v.run(obj["args"], lambda r, e: out.update({"t": "error", "msg": e} if e else {"t": "vault", "data": r}))
+            self.v.run(obj["args"], lambda r, e: out.update({"t": "error", "msg": e} if e else {"t": "vault", "data": r}),
+                       stdin=obj.get("input"))
             fn, res, err = self.v.d.bg_done.pop()
             fn(res, err)
             return out
@@ -1088,6 +1089,31 @@ def test_project_workflow(hub_mod, tmp_path, monkeypatch):
         with pytest.raises(ValueError) as e:                  # vault-linker's own refusals come through
             await hub.project_workflow(p, local, {"cwd": str(tmp_path / "missing")})
         assert "no such folder" in str(e.value)
+        # the vault view: browse, read, search, images, a person's edit (guarded by mtime), no paths taken as flags
+        os.makedirs(vault / "notes" / "t")
+        (vault / "notes" / "t" / "a.md").write_text("# A\n\nflow matching\n")
+        (vault / "notes" / "t" / "x.png").write_bytes(b"\x89PNG\r\n\x1a\nxx")
+        async def view(**kw):
+            await hub.vault_view(p, dict(kw, op="vault_view", key="k"))
+            return p.out[-1]
+        r = await view(action="overview")
+        assert r["t"] == "vault_view" and r["key"] == "k" and "notes/t/a.md" in r["data"]["paths"]
+        assert [x["id"] for x in r["data"]["projects"]] == ["newproj"]
+        assert (await view(action="ls", folder="notes"))["data"]["dirs"][0]["name"] == "t"
+        rd = (await view(action="read", path="notes/t/a.md"))["data"]
+        assert rd["body"].startswith("# A")
+        assert (await view(action="search", q="flow"))["data"]["hits"][0]["path"] == "notes/t/a.md"
+        assert (await view(action="search", q="--help"))["t"] == "vault_view"         # text, not a flag
+        assert (await view(action="asset", path="notes/t/x.png"))["data"]["mime"] == "image/png"
+        assert (await view(action="project", id="newproj"))["data"]["page"]["meta"]["type"] == "project"
+        w = await view(action="write", path="notes/t/a.md", text="# A\n\n改过了\n", expect=rd["mtime"])
+        assert w["t"] == "vault_view" and "改过了" in (vault / "notes" / "t" / "a.md").read_text()
+        w = await view(action="write", path="notes/t/a.md", text="stale", expect=rd["mtime"])
+        assert w["t"] == "error" and "changed" in w["msg"] and "改过了" in (vault / "notes" / "t" / "a.md").read_text()
+        for bad in ({"action": "read", "path": "../../etc/passwd"}, {"action": "asset", "path": "-h"},
+                    {"action": "nope"}, {"action": "read"}, {"action": "write", "path": "notes/t/x.png", "text": "x"}):
+            assert (await view(**bad))["t"] == "error", bad
+        assert (await view(action="sync"))["data"]["pushed"] is False
     asyncio.run(run())
 
 

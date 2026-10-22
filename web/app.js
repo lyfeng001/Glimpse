@@ -608,6 +608,7 @@ function connect() {
     send({ op: 'visible', v: onScreen() });
     ping();
     if (S.view) { subscribe(); fsChanged(); }        // fs requests sent before the socket was up were dropped
+    if (curScreen === 'kb' && KB.page) { KB.asked = {}; kbAsk('overview', ''); kbFetch(KB.page); kbImages($('#kb-body')); }
   };
   ws.onmessage = (ev) => {
     if (S.ws !== ws) return;
@@ -698,6 +699,8 @@ function onMsg(m) {
       checkBuild(S.hub && S.hub.web);
       renderHome();
       if (S.view) renderView();
+      $('#btn-vault').hidden = !kbOn();
+      if (curScreen === 'kb' && KB.page && KB.data[kbPageKey(KB.page)] === undefined) kbFetch(KB.page);
       refreshOpenSheets();
       newFromRouteNow();
       break;
@@ -759,8 +762,10 @@ function onMsg(m) {
       if (!here) toast(m.title || (m.ev && m.ev.title) || 'Glimpse', m.ev && m.ev.body, () => openSession(m.m, m.sid), m.ev && m.ev.kind === 'keyswap' ? 'done' : m.ev && m.ev.kind);
       break;
     }
+    case 'vault_view': onVault(m); break;
     case 'error':
       if (m.op === 'models' && m.kind) { onModels(m, true); break; }
+      if (m.op === 'vault_view') { onVaultErr(m); break; }
       if ($('#dlg-new').open && !m.sid) { newBusy(false); $('#new-err').textContent = m.msg; }
       else if (ADOPT.busy && $('#dlg-adopt').open && !m.sid) { adoptFail(m.msg); }
       else if (MC.busy && $('#dlg-machine').open) { mcFail(m.msg); }
@@ -1110,6 +1115,14 @@ function sendBytes(bytes) {
 
 function routeTo(h) {
   if (/^new(\?|$)/.test(h || '')) { newFromRoute(h); return; }
+  const kb = kbParse(h);
+  if (kb) { kbShow(kb); return; }
+  if (curScreen === 'kb') {
+    // back out of the vault: to the session it was opened from (its hash), else the list
+    const [m0, sid0] = (h || '').split('/');
+    if (S.view && m0 === S.view.m && sid0 === S.view.sid) { kbLeave(); return; }
+    KB.page = null; KB.edit = null;
+  }
   const [m, sid] = (h || '').split('/');
   if (m && sid) { if (!S.view || S.view.m !== m || S.view.sid !== sid) openSession(m, sid, true); }
   else if (S.view) closeSession();
@@ -1869,6 +1882,7 @@ function codeSplit(s) {
   if (from < s.length) out.push([false, s.slice(from), s.slice(from)]);
   return out;
 }
+let MD_LINK = null;          // the vault view's link resolver while it renders a note (kbMd), else null
 function mdInline(s, math) {
   const keep = [];                                                // finished pieces, out of the way of later rules
   const hold = (html) => '\u0002' + (keep.push(html) - 1) + '\u0003';
@@ -1885,7 +1899,13 @@ function mdInline(s, math) {
         return hold(mathSpan(tex, false));
       });
   }
-  let h = esc(t)
+  let h = esc(t);
+  if (MD_LINK) {
+    h = h.replace(/(!?)\[([^\]\n]*)\]\(([^\s()]+)\)|\[\[([^\]\n|]+)(?:\|([^\]\n]+))?\]\]/g, (m0, bang, label, href, wiki, alias) => {
+      const r = MD_LINK(bang, label, href, wiki, alias); return r == null ? m0 : hold(r);
+    });
+  }
+  h = h
     .replace(/!?\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, t, u) => hold(link(t, u)))
     .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
     .replace(/(^|[^\w*])\*([^*\s][^*\n]*?)\*(?![\w*])/g, '$1<i>$2</i>')
@@ -2490,6 +2510,8 @@ function fillMore() {
   $('#act-ac-row').hidden = !ai;
   const mc = v && S.byId[v.m];
   $('#act-wf').hidden = !ai || !(mc && mc.vault) || !!s.vault;     // already a workflow session: nothing to turn on
+  $('#act-kb').hidden = !s || !s.vault || !kbOn();
+  if (s && s.vault) $('#act-kb-sub').textContent = s.vault + ' · ' + T('实验记录、日志、文档');
   $('#act-wf-sub').textContent = s && s.status === 'running' ? T('建 git 仓库、登记到知识库；这一轮结束后重启并接上原对话')
     : T('建 git 仓库、登记到知识库，然后重启并接上原对话');
   if (ai) {
@@ -3575,6 +3597,333 @@ function memOpenProject(p) {
   renderMemory();
 }
 $('#mem-back').onclick = () => { MEM.view = 'home'; MEM.project = null; renderMemory(); };
+
+// ------------------------------------------------------------------ the vault (知识库): vault-linker's knowledge base
+// Routes: #kb (home), #kb/p/<id> (project), #kb/n/<path> (note), #kb/d/<folder>, #kb/s/<query>. Reads go through
+// op vault_view {action, key}; notes render with the chat's markdown plus vault links ([[wikilinks]], relative links
+// and images, resolved next to the note). Editing a note: the whole text in a textarea, saved only if unchanged since.
+const KB = { page: null, data: {}, asked: {}, err: {}, paths: [], edit: null, imgs: new Map() };
+function kbOn() { return S.machines.some((mc) => mc.vault); }
+function kbParse(h) {
+  const m = /^kb(?:\/([pnds])\/(.*))?$/.exec(h || ''); if (!m) return null;
+  if (!m[1]) return { t: 'home', arg: '' };
+  try { return { t: m[1], arg: decodeURIComponent(m[2] || '') }; } catch (_) { return { t: 'home', arg: '' }; }
+}
+function kbHash(pg) { return pg.t === 'home' ? 'kb' : 'kb/' + pg.t + '/' + encodeURIComponent(pg.arg); }
+function kbGo(pg, replace) {
+  const h = '#' + kbHash(pg);
+  if (location.hash !== h) history[replace ? 'replaceState' : 'pushState']({ glimpse: 1, kb: 1 }, '', h);
+  kbShow(pg);
+}
+function kbShow(pg) {
+  for (const d of $$('dialog.sheet[open]')) d.close();
+  if (curScreen !== 'kb') show('kb', 'fwd');
+  KB.page = pg; KB.edit = null;
+  $('#kb-q').value = pg.t === 's' ? pg.arg : '';
+  kbAsk('overview', '');                                  // every note's path: [[wikilinks]] resolve against it
+  kbFetch(pg, true);
+  kbRender(); $('#kb-body').scrollTop = 0;
+}
+function kbLeave() {             // a route outside the vault: back to the screen it was opened from
+  if (curScreen !== 'kb') return;
+  KB.page = null; KB.edit = null;
+  show(S.view ? 'view' : 'home', 'back');
+  if (!S.view) renderHome();
+}
+function kbKey(action, arg) { return action + ':' + (arg || ''); }
+function kbAsk(action, arg, extra, force) {
+  const key = kbKey(action, arg);
+  if (!force && (KB.data[key] !== undefined || KB.asked[key] > Date.now() - 15000)) return;
+  if (KB.asked[key] > Date.now() - 1500) return;          // the same request a moment ago: wait for it
+  if (send(Object.assign({ op: 'vault_view', action, key }, extra || {}))) KB.asked[key] = Date.now();
+}
+const KB_ACTION = { home: 'overview', p: 'project', n: 'read', d: 'ls', s: 'search' };
+function kbPageKey(pg) { return kbKey(KB_ACTION[pg.t], pg.t === 'home' ? '' : pg.arg); }
+function kbFetch(pg, force) {
+  const a = pg.arg;
+  const extra = { home: null, p: { id: a }, n: { path: a }, d: { folder: a }, s: { q: a } }[pg.t];
+  kbAsk(KB_ACTION[pg.t], pg.t === 'home' ? '' : a, extra, force);
+}
+function onVault(m) {
+  const key = m.key; if (typeof key !== 'string') return;
+  if (m.action === 'write') { kbSaved(m.data || {}); return; }
+  if (m.action === 'sync') { kbSynced(m.data || {}); return; }
+  KB.data[key] = m.data; delete KB.err[key]; delete KB.asked[key];
+  if (m.action === 'overview' && m.data) KB.paths = m.data.paths || [];
+  if (m.action === 'asset') { kbImage(m.data || {}); return; }
+  if (m.action === 'read' && KB.edit && KB.edit.loading && key === kbKey('read', KB.edit.path) + '#raw') {
+    KB.edit = { path: KB.edit.path, text: m.data.text, mtime: m.data.mtime };
+  }
+  if (curScreen === 'kb') kbRender();
+}
+function onVaultErr(m) {
+  const key = m.key;
+  if (m.action === 'write' || m.action === 'sync') {
+    KB.busy = false; toast(m.action === 'write' ? T('没有保存') : T('同步失败'), m.msg, null, 'error'); kbRender(); return;
+  }
+  if (typeof key === 'string') { KB.err[key] = m.msg; delete KB.asked[key]; }
+  if (m.action === 'asset') { for (const im of $$('img.kb-img[data-path]', $('#kb-body'))) if (kbKey('asset', im.dataset.path) === key) im.replaceWith(kbImgFail(im.alt, m.msg)); return; }
+  if (KB.edit && KB.edit.loading) KB.edit = null;
+  if (curScreen === 'kb') kbRender();
+}
+// ---- paths inside the vault: a link in a note is relative to the note's folder ("/x" = from the vault's top)
+function kbDir(p) { const i = p.lastIndexOf('/'); return i < 0 ? '' : p.slice(0, i); }
+function kbJoin(base, rel) {
+  const out = rel.startsWith('/') ? [] : (base ? base.split('/') : []);
+  for (const seg of rel.replace(/^\/+/, '').split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') { if (!out.length) return null; out.pop(); } else out.push(seg);
+  }
+  return out.join('/');
+}
+function kbWiki(name, from) {
+  // [[name]] as Obsidian finds it: a path, else a note with that file name (the nearest one to this note)
+  const n = name.trim().replace(/\.md$/i, ''); if (!n) return null;
+  const want = n + '.md'; const dir = kbDir(from || '');
+  if (KB.paths.includes(want)) return want;
+  const hits = KB.paths.filter((p) => p === want || p.endsWith('/' + want));
+  if (!hits.length) return null;
+  hits.sort((a, b) => (b.startsWith(dir) - a.startsWith(dir)) || a.length - b.length);
+  return hits[0];
+}
+function kbLinkTarget(href, from) {
+  let h = href.trim().replace(/^<|>$/g, '');
+  if (/^[a-z][a-z0-9+.-]*:/i.test(h) || h.startsWith('#')) return null;      // http(s) etc. are handled by md()
+  h = h.split('#')[0]; if (!h) return null;
+  try { h = decodeURIComponent(h); } catch (_) {}
+  return kbJoin(kbDir(from || ''), h);
+}
+// vault links in a rendered note: while MD_LINK is set (kbMd), mdInline hands it ![alt](figs/x.png), [text](other.md)
+// and [[name|alias]] (http(s) links stay as they are); paths resolve next to the note. Images load from the vault.
+function kbMd(text, from) {
+  MD_LINK = (bang, label, href, wiki, alias) => {
+    if (wiki != null) {
+      const p = kbWiki(unesc(wiki).split('#')[0], from);
+      return p ? kbA(p, alias || wiki) : '<span class="kb-missing" title="' + esc(T('知识库里没有这篇')) + '">' + (alias || wiki) + '</span>';
+    }
+    const p = kbLinkTarget(unesc(href), from);
+    if (p == null) return null;
+    if (bang) return KB_IMG.test(p) ? '<img class="kb-img" alt="' + label.replace(/\u0002\d+\u0003/g, '') + '" data-path="' + esc(p) + '" loading="lazy" decoding="async">' : null;
+    return kbA(p, label);
+  };
+  try { return md(text); } finally { MD_LINK = null; }
+}
+function unesc(s) { return String(s).replace(/&(amp|lt|gt|quot|#39);/g, (_, e) => ({ amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'" }[e])); }
+const KB_IMG = /\.(png|jpe?g|gif|webp|svg)$/i;
+function kbA(p, html) {
+  // html: already escaped (it comes out of mdInline)
+  const pg = /\.md$/i.test(p) ? { t: 'n', arg: p } : !/\.[a-z0-9]{1,8}$/i.test(p) ? { t: 'd', arg: p.replace(/\/$/, '') } : null;
+  if (!pg) return '<span class="kb-file" title="' + esc(p) + '">' + html + '</span>';
+  return '<a class="kb-link" href="#' + esc(kbHash(pg)) + '">' + html + '</a>';
+}
+function kbImages(root) {
+  for (const im of $$('img.kb-img[data-path]:not([src])', root)) {
+    const u = KB.imgs.get(im.dataset.path);
+    if (u) im.src = u; else kbAsk('asset', im.dataset.path, { path: im.dataset.path });
+  }
+}
+function kbImgFail(alt, msg) {
+  const sp = document.createElement('span'); sp.className = 'kb-imgfail'; sp.textContent = (alt || T('图片')) + ' (' + T('无法显示') + ')'; sp.title = msg || ''; return sp;
+}
+function kbImage(d) {
+  if (!d.path || !/^image\/(png|jpeg|gif|webp|svg\+xml)$/.test(d.mime || '') || !/^[A-Za-z0-9+/=]*$/.test(d.data || '')) return;
+  const u = 'data:' + d.mime + ';base64,' + d.data;
+  KB.imgs.set(d.path, u);
+  if (KB.imgs.size > 80) KB.imgs.delete(KB.imgs.keys().next().value);
+  delete KB.data[kbKey('asset', d.path)];                          // the pixels live in KB.imgs only
+  for (const im of $$('img.kb-img[data-path]', $('#kb-body'))) if (im.dataset.path === d.path) im.src = u;
+}
+$('#kb-body').addEventListener('click', (e) => {
+  const a = e.target.closest('a[href^="#kb"]'); if (!a) return;
+  const pg = kbParse((a.getAttribute('href') || '').slice(1)); if (!pg) return;
+  e.preventDefault(); kbGo(pg);
+});
+// ---- pages
+const KB_STATUS = { planned: T('计划中'), running: T('进行中'), done: T('完成'), failed: T('失败'), active: T('进行中'), paused: T('暂停'),
+  archived: T('已归档'), unread: T('未读'), reading: T('在读'), read: T('已读') };
+const KB_TYPE = { project: T('项目'), experiment: T('实验'), log: T('日志'), doc: T('文档'), paper: T('论文'), note: T('笔记') };
+function kbPill(st) { return st ? '<span class="kb-st ' + esc(st) + '">' + esc(KB_STATUS[st] || st) + '</span>' : ''; }
+function kbRow(f, sub) {
+  const pg = { t: 'n', arg: f.path };
+  return '<a class="cell kb-row" href="#' + esc(kbHash(pg)) + '"><span class="grow"><span class="kb-t">' + esc(f.title || f.path) + '</span>' + kbPill(f.status) +
+    '<div class="sub">' + [sub != null ? sub : esc(KB_TYPE[f.type] || '') + (f.type ? ' · ' : '') + esc(f.path), f.mtime ? esc(ago(f.mtime)) : ''].filter(Boolean).join(' · ') + '</div></span>' +
+    '<svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></a>';
+}
+function kbDirRow(d) {
+  return '<a class="cell kb-row" href="#' + esc(kbHash({ t: 'd', arg: d.path })) + '"><span class="cell-ic" style="background:#5C8DF6" aria-hidden="true">' + ic('folder') + '</span>' +
+    '<span class="grow">' + esc(d.name) + '<div class="sub">' + d.notes + T(' 篇') + '</div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></a>';
+}
+function kbGroup(title, rows, empty) {
+  return (title ? '<div class="g-h">' + title + '</div>' : '') + '<div class="group">' + (rows.length ? rows.join('') : '<div class="cell"><span class="grow sub">' + empty + '</span></div>') + '</div>';
+}
+function kbWait(key) {
+  return KB.err[key] ? '<div class="empty">' + ic('alert', 'lg') + '<div>' + esc(KB.err[key]) + '</div></div>' :
+    '<div class="kb-pad"><div class="skel" style="height:22px;width:60%"></div><div class="skel" style="height:120px;margin-top:14px"></div></div>';
+}
+function kbCrumbs(path) {
+  // notes/diffusion/x.md -> 知识库 / notes / diffusion: each a link to that folder
+  const parts = path.split('/'); parts.pop();
+  let acc = ''; let h = '<a class="kb-link" href="#kb">' + T('知识库') + '</a>';
+  for (const p of parts) { acc = acc ? acc + '/' + p : p; h += ' / <a class="kb-link" href="#' + esc(kbHash({ t: 'd', arg: acc })) + '">' + esc(p) + '</a>'; }
+  return '<nav class="kb-crumbs" aria-label="' + T('位置') + '">' + h + '</nav>';
+}
+function kbRender() {
+  const pg = KB.page; const body = $('#kb-body'); if (!pg) return;
+  const key = kbPageKey(pg); const d = KB.data[key];
+  $('#kb-edit').hidden = pg.t !== 'n' || !d || !!KB.edit;
+  $('#kb-refresh').hidden = !!KB.edit;
+  $('#kb-search').hidden = !!KB.edit || pg.t === 'n';
+  $('#kb-back').setAttribute('aria-label', KB.edit ? T('取消编辑') : T('返回'));
+  if (KB.edit) { kbRenderEdit(); return; }
+  const title = pg.t === 'p' ? pg.arg : pg.t === 'n' ? (d ? (d.meta && d.meta.title) || kbTitleOf(d) : '')
+    : pg.t === 'd' ? (pg.arg.split('/').pop() || T('知识库')) : pg.t === 's' ? T('搜索') : T('知识库');
+  $('#kb-title').textContent = title || T('知识库');
+  $('#kb-sub').textContent = pg.t === 'n' ? pg.arg : pg.t === 'd' ? pg.arg : pg.t === 's' ? '“' + pg.arg + '”' : '';
+  if (d === undefined) { setHTML(body, kbWait(key)); return; }
+  let h = '';
+  if (pg.t === 'home') h = kbHomeHtml(d);
+  else if (pg.t === 'p') h = kbProjectHtml(d);
+  else if (pg.t === 'd') h = kbDirHtml(d);
+  else if (pg.t === 's') h = kbGroup('', (d.hits || []).map((x) => kbRow(x, esc(x.snippet || x.path))), T('没有找到'));
+  else if (pg.t === 'n') h = kbNoteHtml(d);
+  setHTML(body, '<div class="kb-pad">' + h + '</div>');
+  if (pg.t === 'n') { renderRich(body); kbImages(body); }
+  if (pg.t === 'home') {
+    const sy = $('#kb-sync'); if (sy) sy.onclick = kbSync;
+  }
+}
+function kbTitleOf(d) { const m = /^#\s+(.+)$/m.exec(d.body || ''); return m ? m[1].trim() : d.path.split('/').pop().replace(/\.md$/, ''); }
+function kbHomeHtml(d) {
+  const sync = d.dirty ? d.dirty + T(' 个改动未提交') : d.ahead ? d.ahead + T(' 个提交未推送') : d.remote ? T('已同步到 GitHub') : T('只在本机（没有远程仓库）');
+  let h = '<div class="group"><div class="cell"><span class="cell-ic" style="background:#8E5CF7" aria-hidden="true">' + ic('book') + '</span>' +
+    '<span class="grow">' + esc(sync) + '<div class="sub">' + esc(d.vault || '') + '</div></span>' +
+    (d.remote ? '<button type="button" class="btn sm" id="kb-sync"' + (KB.busy ? ' disabled' : '') + '>' + (KB.busy ? T('同步中…') : T('同步')) + '</button>' : '') + '</div></div>';
+  h += kbGroup(T('项目'), (d.projects || []).map((p) => '<a class="cell kb-row" href="#' + esc(kbHash({ t: 'p', arg: p.id })) + '"><span class="grow"><span class="kb-t">' + esc(p.id) + '</span>' + kbPill(p.status) +
+    '<div class="sub">' + (p.goal ? esc(p.goal) + ' · ' : '') + p.experiments + T(' 个实验') + (p.repo ? ' · GitHub' : '') + '</div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></a>'),
+    T('还没有项目。新建会话时打开“项目工作流”，或在会话操作里启用'));
+  h += kbGroup(T('分类'), [['notes', T('笔记'), 'pencil', '#F5A524'], ['papers', T('论文'), 'file', '#E8875B'], ['inbox', T('收件箱'), 'inbox', '#5C636E']].map(([p, n, i, c]) =>
+    '<a class="cell kb-row" href="#' + esc(kbHash({ t: 'd', arg: p })) + '"><span class="cell-ic" style="background:' + c + '" aria-hidden="true">' + ic(i) + '</span><span class="grow">' + n +
+    (p === 'inbox' && d.inbox ? '<div class="sub">' + d.inbox + T(' 条待整理') + '</div>' : '') + '</span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></a>'), '');
+  h += kbGroup(T('最近更新'), (d.recent || []).map((f) => kbRow(f)), T('还没有笔记'));
+  return h;
+}
+function kbProjectHtml(d) {
+  const meta = (d.page && d.page.meta) || {};
+  const exp = d.exp || []; const logs = d.log || []; const docs = d.docs || []; const refs = d.refs || [];
+  let h = '<div class="group kb-card">' +
+    '<div class="cell stack"><span class="grow">' + kbPill(meta.status) + (meta.goal ? ' <span class="kb-goal">' + esc(meta.goal) + '</span>' : '') +
+    (meta.repo ? '<div class="sub"><a href="' + esc(/^https:\/\/github\.com\//.test(meta.repo) ? meta.repo : '#') + '" target="_blank" rel="noopener noreferrer">' + esc(meta.repo) + '</a></div>' : '') +
+    (Array.isArray(meta.locations) ? meta.locations.map((l) => '<div class="sub mono">' + esc((l.machine || '') + ' · ' + (l.path || '')) + '</div>').join('') : '') +
+    '</span></div><a class="cell kb-row" href="#' + esc(kbHash({ t: 'n', arg: d.page.path })) + '"><span class="grow">' + T('项目页') + '<div class="sub">' + T('目标、现状、下一步') + '</div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></a></div>';
+  h += kbGroup(T('实验') + ' · ' + exp.length, exp.map((e) => {
+    const mt = e.metrics && typeof e.metrics === 'object' ? Object.entries(e.metrics).slice(0, 4).map(([k, v]) => esc(k) + ' ' + esc(typeof v === 'object' ? JSON.stringify(v) : v)).join(' · ') : '';
+    return kbRow(e, esc([e.date, e.machine].filter(Boolean).join(' · ')) + (mt ? ' · <span class="mono">' + mt + '</span>' : ''));
+  }), T('还没有实验记录'));
+  h += kbGroup(T('日志'), logs.slice(0, 30).map((f) => kbRow(f, '')), T('还没有日志'));
+  if (docs.length) h += kbGroup(T('文档'), docs.map((f) => kbRow(f, '')), '');
+  if (refs.length) h += kbGroup(T('资料'), refs.map((f) => kbRow(f, '')), '');
+  return h;
+}
+function kbDirHtml(d) {
+  let h = d.folder ? kbCrumbs(d.folder + '/x') : '';
+  h += kbGroup('', (d.dirs || []).map(kbDirRow).concat((d.files || []).map((f) => kbRow(f, ''))), T('这里还没有笔记'));
+  if (d.other) h += '<p class="g-f">' + d.other + T(' 个其他文件（图片、代码等）') + '</p>';
+  return h;
+}
+function kbNoteHtml(d) {
+  const meta = d.meta || {};
+  const skip = new Set(['title', 'type']);
+  const rows = Object.entries(meta).filter(([k, v]) => !skip.has(k) && v != null && v !== '' && !(Array.isArray(v) && !v.length) && !(typeof v === 'object' && !Array.isArray(v) && !Object.keys(v).length));
+  const val = (v) => Array.isArray(v) ? v.map((x) => typeof x === 'object' ? JSON.stringify(x) : String(x)).join(', ') : typeof v === 'object' ? Object.entries(v).map(([a, b]) => a + ' ' + (typeof b === 'object' ? JSON.stringify(b) : b)).join(' · ') : String(v);
+  let h = kbCrumbs(d.path);
+  if (meta.type || rows.length) {
+    h += '<div class="kb-meta">' + (meta.type ? '<span class="tag">' + esc(KB_TYPE[meta.type] || meta.type) + '</span>' : '') +
+      rows.map(([k, v]) => k === 'status' ? kbPill(v) : '<span class="kb-kv"><b>' + esc(k) + '</b> ' + esc(val(v)) + '</span>').join('') + '</div>';
+  }
+  return h + '<article class="md kb-md">' + kbMd(d.body || '', d.path) + '</article>';
+}
+// ---- editing a note: the whole file (front matter too) in a textarea; saved only if nobody changed it meanwhile
+function kbEditStart() {
+  const pg = KB.page; if (!pg || pg.t !== 'n') return;
+  KB.edit = { path: pg.arg, loading: true };
+  send({ op: 'vault_view', action: 'read', key: kbKey('read', pg.arg) + '#raw', path: pg.arg, raw: true });
+  kbRender();
+}
+function kbRenderEdit() {
+  const e = KB.edit; const body = $('#kb-body');
+  $('#kb-title').textContent = T('编辑'); $('#kb-sub').textContent = e.path;
+  if (e.loading) { setHTML(body, kbWait('')); return; }
+  if (!$('#kb-text')) {
+    body._h = null;
+    body.innerHTML = '<div class="kb-pad kb-editor"><label class="sr" for="kb-text">' + T('笔记内容') + '</label>' +
+      '<textarea id="kb-text" class="kb-text mono" autocapitalize="off" autocorrect="off" spellcheck="false"></textarea>' +
+      '<div class="kb-edit-bar"><span class="sub">' + T('保存后在“同步”时提交并推送') + '</span>' +
+      '<button type="button" class="btn" id="kb-cancel">' + T('取消') + '</button><button type="button" class="btn primary" id="kb-save">' + T('保存') + '</button></div></div>';
+    const ta = $('#kb-text'); ta.value = e.text;
+    $('#kb-cancel').onclick = kbEditCancel;
+    $('#kb-save').onclick = kbSave;
+    ta.addEventListener('keydown', (ev) => { if ((ev.metaKey || ev.ctrlKey) && ev.key === 's') { ev.preventDefault(); kbSave(); } });
+  }
+  $('#kb-save').disabled = !!KB.busy;
+  $('#kb-save').textContent = KB.busy ? T('保存中…') : T('保存');
+}
+async function kbEditCancel() {
+  const e = KB.edit; const ta = $('#kb-text');
+  if (e && ta && ta.value !== e.text && !(await confirmSheet(T('放弃修改？'), T('改动还没有保存。'), T('放弃')))) return;
+  KB.edit = null; $('#kb-body')._h = null; kbRender();
+}
+function kbSave() {
+  const e = KB.edit; const ta = $('#kb-text'); if (!e || !ta || KB.busy) return;
+  if (ta.value === e.text) { kbEditCancel(); return; }
+  KB.busy = true;
+  if (!send({ op: 'vault_view', action: 'write', key: 'write', path: e.path, text: ta.value, expect: e.mtime })) { KB.busy = false; toast(T('未连接'), T('稍后再试'), null, 'error'); }
+  kbRender();
+}
+function kbSaved(d) {
+  KB.busy = false;
+  const path = KB.edit && KB.edit.path;
+  KB.edit = null; $('#kb-body')._h = null;
+  toast(T('已保存'), d.path || '', null, 'done');
+  if (path) { delete KB.data[kbKey('read', path)]; kbAsk('read', path, { path }, true); }
+  delete KB.data[kbKey('overview', '')];
+  kbRender();
+}
+function kbSync() {
+  if (KB.busy) return;
+  KB.busy = true;
+  send({ op: 'vault_view', action: 'sync', key: 'sync', push: true });
+  kbRender();
+}
+function kbSynced(d) {
+  KB.busy = false;
+  toast(d.pushed ? T('已推送到 GitHub') : T('已提交'), d.commit || T('没有新的改动'), null, 'done');
+  delete KB.data[kbKey('overview', '')]; kbAsk('overview', '', null, true);
+  kbRender();
+}
+// ---- wiring
+$('#btn-vault').onclick = () => kbGo({ t: 'home', arg: '' });
+$('#kb-back').onclick = () => {
+  if (KB.edit) { kbEditCancel(); return; }
+  if (history.state && history.state.kb) history.back();
+  else { history.replaceState(null, '', location.pathname + (S.view ? '#' + S.view.m + '/' + S.view.sid : '')); kbLeave(); }
+};
+$('#kb-refresh').onclick = () => {
+  if (!KB.page) return;
+  delete KB.data[kbKey('overview', '')]; kbAsk('overview', '', null, true);
+  kbFetch(KB.page, true);
+};
+$('#kb-edit').onclick = kbEditStart;
+$('#kb-search').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const q = $('#kb-q').value.trim().slice(0, 200); if (!q) return;
+  delete KB.data[kbKey('search', q)];
+  kbGo({ t: 's', arg: q }, KB.page && KB.page.t === 's');
+});
+$('#act-kb').onclick = () => {
+  const v = S.view; const s = v && session(v.m, v.sid); if (!s || !s.vault) return;
+  closeSheet($('#dlg-more'));
+  setTimeout(() => kbGo({ t: 'p', arg: s.vault }), 230);
+};
 $('#acct-revoke-others').onclick = async () => {
   if (!(await confirmSheet(T('退出其他所有设备？'), T('除了这台以外，所有设备都需要重新登录。'), T('全部退出')))) return;
   try { await api('/api/devices/revoke', { all: true }); toast(T('已退出其他设备'), '', null, 'done'); renderAccount(); } catch (e) { toast(T('操作失败'), e.message, null, 'error'); }

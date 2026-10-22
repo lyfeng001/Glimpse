@@ -89,6 +89,7 @@ class Machine:
         self.req = 0
         self.memory = None             # AMem status reported by the agent (None = not configured / old agent)
         self.vault = False             # the vault (vault-linker) is on this machine and configured
+        self.ext = {}                  # extension id -> {on, error, name, version} as this machine's agent reports
         self.netinfo = None            # {ip, city, region, country, org, ts} of the machine's internet exit
         self.speed = None              # last speed test {down_bps, ttfb_ms, ts} or {error, ts}
         self.speed_task = None         # the running speed test (requests from several devices share it)

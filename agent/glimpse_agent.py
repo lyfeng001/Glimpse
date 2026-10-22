@@ -1471,13 +1471,13 @@ class Session:
             if self.kind == "codex":
                 argv = argv[:1] + hot[1] + argv[1:]
         self.d.memory.attach(self)
-        self.d.vault.attach(self)
+        self.d.ext.attach(self)
         if self.kind in ("claude", "codex") and argv:
-            argv = argv[:1] + extension_args(self, self.d.memory, self.d.vault) + argv[1:]
+            argv = argv[:1] + extension_args(self, self.d.memory, self.d.ext) + argv[1:]
         if self.kind == "claude":
             argv, self.settings_file = prepare_claude_argv(argv, self.sid, self.d.sdir, None if hot else self.env,
                                                            self.d.approval_wait,
-                                                           self.d.memory.claude_allow(self) + self.d.vault.claude_allow(self),
+                                                           self.d.memory.claude_allow(self) + self.d.ext.claude_allow(self),
                                                            key_file=self.key_file if hot else None)
         shell = env.get("SHELL")
         if not shell:
@@ -2242,8 +2242,14 @@ EN.update({
     "无效的项目": "Invalid project",
     "无效的上限（例如 20G）": "Invalid limit (e.g. 20G)",
     "无效的记忆操作": "Invalid memory operation",
-    "无效的知识库操作": "Invalid vault operation",
-    "这台机器上没有知识库（vault-linker 未配置）": "No vault on this machine (vault-linker not configured)",
+    "无效的扩展操作": "Invalid extension request",
+    "扩展清单读不了：%s": "Cannot read the extension manifest: %s",
+    "扩展清单格式不对": "The extension manifest is not in the right format",
+    "没有设置 %s": "%s is not set",
+    "缺少 %s": "%s is missing",
+    "找不到 %s": "%s not found",
+    "这台机器上没有扩展 %s": "No extension %s on this machine",
+    "扩展不允许这个操作": "The extension does not allow this request",
     "无效的 init_cmds": "Invalid init_cmds",
     "无效的路径": "Invalid path",
     "路径不在会话目录内": "The path is outside the session folder",
@@ -2309,133 +2315,252 @@ def is_transient_error(text):
 # Glimpse never imports it: it runs `python -m agent_memory` from the configured environment.
 # Sessions of the same project share one memory; nothing is written into the project directory.
 
-# --------------------------------------------------------------------------- vault-linker (project workflow)
-# A session whose folder is a registered project (its .vault-linker.json, or .git/.vault-linker.json for someone
-# else's repository) gets the vault MCP server and a short instruction at spawn, like AMem. Only where the vault is
-# on this machine (the hub's own computer): elsewhere the session runs as before. vault-linker lives in its own
-# repository; the hub sends its path (hub config "vault": {"linker", "path"}) with op vault_config.
-VAULT_DEFAULT = {"linker": "", "path": ""}
-VAULT_LINK = ".vault-linker.json"
-# what the hub may run through op vault (first word of the vault-linker command line)
-VAULT_CLI_OK = ("project", "vault", "log", "exp", "search", "read", "inbox", "ls", "asset", "write")
-VAULT_PROMPT = (
-    "This project uses the shared knowledge base (vault MCP server `vault`, project `{project}`). Before redoing "
-    "work, vault_search for earlier experiments, conclusions and notes. Each experiment: exp_new before, exp_update "
-    "after (status, metrics, results); configs/<E-id>.yaml and outputs/<E-id>/ in the repository. Record notable "
-    "progress and decisions with log_add (one line each), write-ups with doc_new. Keep big files and secrets out of "
-    "the vault; propose changes to a person's note with inbox_add instead of editing it.")
+# --------------------------------------------------------------------------- extensions
+# An extension is a folder with an extension.json (see docs/extensions.md): optional tools that live in their own
+# repositories (vault-linker, ...). The hub sends each machine the extensions it runs there (op ext_config: folder +
+# settings); the manifest says what the extension adds:
+#   cli + cli_ok      a JSON command line the hub may run through op ext (only those first words)
+#   sessions          which sessions get it: kinds, scope "all" or "project" (a marker file in the folder or above)
+#   mcp + prompt      the MCP server and the instruction those sessions start with (merged with AMem's)
+# Placeholders: {dir} (the extension's folder), {settings key}, and per session {project} {sid} {cwd}.
+EXT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+EXT_NAME_RE = re.compile(r"^[a-z0-9_]{1,32}$")
+EXT_FIELD = re.compile(r"\{([a-z_]+)\}")
+PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
-def vault_link(cwd):
-    """(project id, project root) when cwd is inside a registered project, else None."""
+def ext_fill(s, vals):
+    """{key} placeholders filled (an unknown key: ValueError, so a manifest typo shows up instead of a bad path)."""
+    def one(m):
+        if m.group(1) not in vals or vals[m.group(1)] is None:
+            raise ValueError("unknown placeholder {%s}" % m.group(1))
+        return str(vals[m.group(1)])
+    return EXT_FIELD.sub(one, s)
+
+
+def ext_marker(cwd, markers):
+    """(project id, project root) when cwd (or a folder above it, up to ~) holds one of the marker files."""
     d = os.path.realpath(cwd)
+    home = os.path.realpath(os.path.expanduser("~"))
     while True:
-        for p in (os.path.join(d, VAULT_LINK), os.path.join(d, ".git", VAULT_LINK)):
+        for rel in markers:
             try:
-                with open(p) as f:
+                with open(os.path.join(d, rel)) as f:
                     pid = json.load(f).get("id")
-                if isinstance(pid, str) and re.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", pid):
+                if isinstance(pid, str) and PROJECT_RE.match(pid):
                     return pid, d
             except (OSError, ValueError, AttributeError):
                 pass
         up = os.path.dirname(d)
-        if up == d or d == os.path.expanduser("~"):
+        if up == d or d == home:
             return None
         d = up
 
 
-class Vault:
-    """Per-daemon vault-linker integration: launch args for workflow sessions, and the CLI for the hub's ops."""
+def ext_load(folder):
+    """The manifest of the extension in folder (checked), or ValueError."""
+    folder = os.path.realpath(os.path.expanduser(folder))
+    try:
+        with open(os.path.join(folder, "extension.json"), encoding="utf-8") as f:
+            man = json.load(f)
+    except (OSError, ValueError) as e:
+        raise ValueError(tr("扩展清单读不了：%s", clip(str(e), 200)))
+    if not isinstance(man, dict) or man.get("manifest") != 1 or not EXT_ID_RE.match(str(man.get("id", ""))):
+        raise ValueError(tr("扩展清单格式不对"))
+    mcp = man.get("mcp")
+    if mcp is not None and not (isinstance(mcp, dict) and EXT_NAME_RE.match(str(mcp.get("name", ""))) and
+                                isinstance(mcp.get("command"), str) and isinstance(mcp.get("args", []), list)):
+        raise ValueError(tr("扩展清单格式不对"))
+    return folder, man
+
+
+class Ext:
+    """One extension on this machine: its manifest, folder and settings (from the hub)."""
+
+    def __init__(self, folder, man, settings):
+        self.dir, self.man, self.id = folder, man, man["id"]
+        self.settings = {}
+        for k, spec in (man.get("settings") or {}).items():
+            v = (settings or {}).get(k, (spec or {}).get("default", ""))
+            if isinstance(v, str) and (spec or {}).get("type") == "path":
+                v = os.path.expanduser(v)
+            self.settings[k] = v if isinstance(v, (str, int, float, bool)) else ""
+        self.error = self.check()
+
+    def vals(self, **more):
+        return dict(self.settings, dir=self.dir, **more)
+
+    def check(self):
+        """None when usable here, else why not."""
+        import shutil
+        for k, spec in (self.man.get("settings") or {}).items():
+            if (spec or {}).get("required") and not self.settings.get(k):
+                return tr("没有设置 %s", (spec or {}).get("label") or k)
+        for cmd in self.man.get("requires") or []:
+            if not shutil.which(str(cmd)):
+                return tr("缺少 %s", cmd)
+        try:
+            for p in self.man.get("check_paths") or []:
+                if not os.path.exists(ext_fill(p, self.vals())):
+                    return tr("找不到 %s", ext_fill(p, self.vals()))
+            cli = self.cli()
+        except ValueError as e:
+            return str(e)
+        if cli and not (os.path.isfile(cli[0]) and os.access(cli[0], os.X_OK)):
+            return tr("找不到 %s", cli[0])
+        return None
+
+    def on(self):
+        return self.error is None
+
+    def cli(self):
+        return [ext_fill(x, self.vals()) for x in self.man.get("cli") or []]
+
+    def status(self):
+        return {"id": self.id, "name": self.man.get("name") or self.id, "version": self.man.get("version"),
+                "on": self.on(), "error": self.error}
+
+    # --- per session
+    def project(self, s):
+        """The session's project for this extension: an id (scope project), "" (scope all), None (not this one)."""
+        sc = self.man.get("sessions") or {}
+        if not self.on() or not self.man.get("mcp") and not self.man.get("prompt"):
+            return None
+        if s.kind not in (sc.get("kinds") or ("claude", "codex")):
+            return None
+        if sc.get("scope") == "project":
+            link = ext_marker(s.cwd, sc.get("marker") or ())
+            return link[0] if link else None
+        return ""
+
+    def server(self, s, project):
+        m = self.man["mcp"]
+        v = self.vals(project=project, sid=s.sid, cwd=s.cwd)
+        return m["name"], {"command": ext_fill(m["command"], v), "args": [ext_fill(str(a), v) for a in m.get("args", [])]}
+
+    def prompt(self, s, project):
+        p = self.man.get("prompt")
+        return ext_fill(p, self.vals(project=project, sid=s.sid, cwd=s.cwd)) if isinstance(p, str) else ""
+
+    def allow(self):
+        m = self.man.get("mcp") or {}
+        return ["mcp__%s__%s" % (m["name"], t) for t in m.get("tools") or [] if EXT_NAME_RE.match(str(t))]
+
+
+class Extensions:
+    """The extensions this machine runs (configured by the hub): session args, and the hub's CLI calls."""
 
     def __init__(self, daemon):
         self.d = daemon
-        self.cfg = dict(VAULT_DEFAULT)
+        self.items = {}
+        self.errors = {}               # id -> why it could not load
 
     def configure(self, cfg):
-        self.cfg = dict(VAULT_DEFAULT, **{k: v for k, v in (cfg or {}).items() if k in VAULT_DEFAULT and isinstance(v, str)})
+        """cfg: {id: {"dir": folder, "settings": {...}}} from the hub (replaces the previous set)."""
+        self.items, self.errors = {}, {}
+        for eid, c in (cfg or {}).items():
+            if not isinstance(c, dict) or not isinstance(c.get("dir"), str):
+                continue
+            try:
+                folder, man = ext_load(c["dir"])
+                if man["id"] != eid:
+                    raise ValueError(tr("扩展清单格式不对"))
+                self.items[eid] = Ext(folder, man, c.get("settings") if isinstance(c.get("settings"), dict) else {})
+            except ValueError as e:
+                self.errors[eid] = str(e)
 
-    def linker(self):
-        p = os.path.expanduser(self.cfg.get("linker") or "")
-        return p if p and os.path.isfile(p) and os.access(p, os.X_OK) else None
-
-    def vault_path(self):
-        p = os.path.expanduser(self.cfg.get("path") or "")
-        return p if p and os.path.isdir(os.path.join(p, ".vault-linker")) else None
-
-    def on(self):
-        return bool(self.linker() and self.vault_path())
+    def status(self):
+        out = {k: e.status() for k, e in self.items.items()}
+        out.update({k: {"id": k, "on": False, "error": err} for k, err in self.errors.items()})
+        return out
 
     def attach(self, s):
-        """At spawn: the session's vault project (None = not a workflow session, or no vault here)."""
-        s.vault_project = None
-        if s.kind not in ("claude", "codex") or not self.on():
-            return
-        link = vault_link(s.cwd)
-        if link:
-            s.vault_project = link[0]
+        """At spawn: {extension id: project} for the extensions this session gets."""
+        s.ext = {}
+        for eid, e in self.items.items():
+            try:
+                p = e.project(s)
+            except ValueError:
+                p = None
+            if p is not None:
+                s.ext[eid] = p
+        # the session card shows the vault project (the project workflow)
+        s.vault_project = s.ext.get("vault-linker") or None
 
-    def server_entry(self, s):
-        return {"command": self.linker(),
-                "args": ["--vault", self.vault_path(), "mcp", "--project", s.vault_project, "--who", s.sid]}
+    def active(self, s):
+        return [(self.items[k], p) for k, p in (getattr(s, "ext", None) or {}).items() if k in self.items]
 
     def servers(self, s):
-        """{"vault": entry} for a workflow session, else {} (merged with AMem's into one --mcp-config)."""
-        return {"vault": self.server_entry(s)} if getattr(s, "vault_project", None) else {}
+        out = {}
+        for e, p in self.active(s):
+            if e.man.get("mcp"):
+                try:
+                    name, entry = e.server(s, p)
+                    out[name] = entry
+                except ValueError:
+                    pass
+        return out
 
-    def prompt(self, s):
-        return VAULT_PROMPT.format(project=s.vault_project) if getattr(s, "vault_project", None) else ""
+    def prompts(self, s):
+        out = []
+        for e, p in self.active(s):
+            try:
+                out.append(e.prompt(s, p))
+            except ValueError:
+                pass
+        return [x for x in out if x]
 
     def claude_allow(self, s):
-        if not getattr(s, "vault_project", None):
-            return []
-        return ["mcp__vault__" + t for t in ("vault_search", "vault_read", "vault_list", "exp_new", "exp_update",
-                                              "doc_new", "log_add", "inbox_add")]
+        return [t for e, _ in self.active(s) for t in e.allow()]
 
     def codex_args(self, s):
-        """The MCP server; the instruction goes into the one developer_instructions (see extension_args)."""
-        if not getattr(s, "vault_project", None):
-            return []
-        e = self.server_entry(s)
-        return ["-c", "mcp_servers.vault.command=%s" % json.dumps(e["command"]),
-                "-c", "mcp_servers.vault.args=%s" % json.dumps(e["args"]),
-                "-c", "mcp_servers.vault.default_tools_approval_mode=\"approve\""]
+        out = []
+        for name, entry in self.servers(s).items():
+            out += ["-c", "mcp_servers.%s.command=%s" % (name, json.dumps(entry["command"])),
+                    "-c", "mcp_servers.%s.args=%s" % (name, json.dumps(entry["args"])),
+                    "-c", "mcp_servers.%s.default_tools_approval_mode=\"approve\"" % name]
+        return out
 
-
-    def run(self, args, done, timeout=60, stdin=None):
-        """vault-linker --json <args> in the background (stdin: text for `write`); done(parsed JSON, error text)."""
+    def run(self, eid, args, done, timeout=60, stdin=None):
+        """<the extension's cli> <args> in the background; done(parsed JSON, error text). Only first words the
+        manifest allows (cli_ok)."""
         import subprocess
-        lk, vp = self.linker(), self.vault_path()
-        if not lk or not vp:
-            done(None, tr("这台机器上没有知识库（vault-linker 未配置）"))
+        e = self.items.get(eid)
+        if e is None or not e.on():
+            done(None, tr("这台机器上没有扩展 %s", eid) if e is None else e.error)
             return
+        if not args or args[0] not in (e.man.get("cli_ok") or ()) or not e.man.get("cli"):
+            done(None, tr("扩展不允许这个操作"))
+            return
+        cmd = e.cli() + list(args)
 
         def work():
             try:
-                r = subprocess.run([lk, "--vault", vp, "--json"] + args, capture_output=True, timeout=timeout,
-                                   input=stdin.encode("utf-8") if stdin is not None else b"", cwd=os.path.expanduser("~"))
+                r = subprocess.run(cmd, capture_output=True, timeout=timeout, cwd=os.path.expanduser("~"),
+                                   input=stdin.encode("utf-8") if stdin is not None else b"")
                 try:
                     out = json.loads(r.stdout.decode("utf-8", "replace") or "{}")
                 except ValueError:
                     out = {"error": clip(r.stderr.decode("utf-8", "replace").strip() or "exit %s" % r.returncode, 300)}
                 err = out.get("error") if isinstance(out, dict) else None
-            except (OSError, subprocess.SubprocessError) as e:
-                out, err = None, clip(str(e), 300)
+            except (OSError, subprocess.SubprocessError) as e2:
+                out, err = None, clip(str(e2), 300)
             self.d.bg_done.append((done, out, err))
         self.d.background(work)
 
 
-def extension_args(s, memory, vault):
-    """claude / codex argv for AMem + the vault together: one --mcp-config with both servers and one
-    --append-system-prompt (claude), one developer_instructions (codex). Either may be off."""
-    prompts = [x for x in (memory.prompt(s.memory_project) if getattr(s, "memory_project", None) else "",
-                           vault.prompt(s)) if x]
+def extension_args(s, memory, exts):
+    """claude / codex argv for AMem + the extensions together: one --mcp-config with every server and one
+    --append-system-prompt (claude), one developer_instructions (codex). Any may be off."""
+    prompts = [x for x in [memory.prompt(s.memory_project) if getattr(s, "memory_project", None) else ""] +
+               exts.prompts(s) if x]
     if s.kind == "claude":
         servers = dict({"amem": memory.server_entry(s.memory_project)} if getattr(s, "memory_project", None) else {},
-                       **vault.servers(s))
+                       **exts.servers(s))
         out = ["--mcp-config", json.dumps({"mcpServers": servers})] if servers else []
         return out + (["--append-system-prompt", "\n\n".join(prompts)] if prompts else [])
     if s.kind == "codex":
-        out = memory.codex_servers(s) + vault.codex_args(s)
+        out = memory.codex_servers(s) + exts.codex_args(s)
         return out + (["-c", "developer_instructions=%s" % json.dumps("\n\n".join(prompts), ensure_ascii=False)]
                       if prompts else [])
     return []
@@ -3293,7 +3418,7 @@ class Daemon:
         self.models_wait = {}          # same key -> callbacks waiting for the running lookup
         self.bg_done = []              # (callback, result, error) from worker threads, run in tick()
         self.memory = Memory(self)     # optional AMem integration (configured by the hub)
-        self.vault = Vault(self)       # optional vault-linker integration (configured by the hub)
+        self.ext = Extensions(self)    # optional extensions (vault-linker, ...), configured by the hub
 
     # --- plumbing
     def listen(self):
@@ -3998,20 +4123,29 @@ class Daemon:
                 if m.get("lang") in ("zh", "en") and m["lang"] != LANG:
                     LANG = m["lang"]
                     self.save_state()
-            elif op == "vault_config":
-                self.vault.configure(m.get("cfg") or {})
-                self.send(c, {"t": "vault_status", "req": req, "on": self.vault.on(),
-                              "linker": bool(self.vault.linker()), "vault": bool(self.vault.vault_path())})
-            elif op == "vault":
-                # the hub's vault ops on the machine that holds the vault: project init / publish / log / list / ...
-                args = m.get("args")
-                if not (isinstance(args, list) and args and all(isinstance(x, str) for x in args)
-                        and args[0] in VAULT_CLI_OK):
-                    self.send(c, {"t": "error", "req": req, "msg": tr("无效的知识库操作")})
+            elif op == "ext_config":
+                # the extensions this machine runs: {id: {dir, settings}} (see Extensions.configure)
+                self.ext.configure(m.get("cfg") or {})
+                self.send(c, {"t": "ext_status", "req": req, "ext": self.ext.status()})
+            elif op == "ext_probe":
+                # "what is in this folder?": the manifest, for the hub's 添加扩展
+                try:
+                    folder, man = ext_load(str(m.get("dir") or ""))
+                    self.send(c, {"t": "ext_probe", "req": req, "dir": folder,
+                                  "man": {k: man.get(k) for k in ("id", "name", "version", "description", "settings",
+                                                                  "requires", "sessions")}})
+                except ValueError as e:
+                    self.send(c, {"t": "error", "req": req, "msg": str(e)})
+            elif op == "ext":
+                # an extension's command line, on the machine that has it (what it allows: the manifest's cli_ok)
+                eid, args = m.get("id"), m.get("args")
+                if not (isinstance(eid, str) and isinstance(args, list) and args
+                        and all(isinstance(x, str) for x in args)):
+                    self.send(c, {"t": "error", "req": req, "msg": tr("无效的扩展操作")})
                 else:
-                    self.vault.run(args, lambda res, err, c=c, req=req: self.send(
-                        c, {"t": "error", "req": req, "msg": err} if err else {"t": "vault", "req": req, "data": res}),
-                        timeout=180 if args[:2] == ["project", "publish"] else 60,
+                    self.ext.run(eid, args, lambda res, err, c=c, req=req: self.send(
+                        c, {"t": "error", "req": req, "msg": err} if err else {"t": "ext", "req": req, "data": res}),
+                        timeout=min(600, max(5, int(m.get("timeout") or 60))),
                         stdin=m.get("input") if isinstance(m.get("input"), str) else None)
             elif op == "memory_config":
                 self.memory.configure(m.get("cfg") or {},

@@ -696,6 +696,7 @@ function onMsg(m) {
         }
       }
       S.keys = m.keys || []; S.balance = m.balance || null; S.hub = m.hub || null; S.options = m.options || null; S.haveState = true;
+      S.ext = Array.isArray(m.extensions) ? m.extensions : [];
       checkBuild(S.hub && S.hub.web);
       renderHome();
       if (S.view) renderView();
@@ -763,9 +764,11 @@ function onMsg(m) {
       break;
     }
     case 'vault_view': onVault(m); break;
+    case 'ext_ok': onExtOk(m); break;
     case 'error':
       if (m.op === 'models' && m.kind) { onModels(m, true); break; }
       if (m.op === 'vault_view') { onVaultErr(m); break; }
+      if (/^ext_/.test(m.op || '')) { EXT.busy = false; $('#ext-add-btn').disabled = false; toast(T('扩展'), m.msg, null, 'error'); break; }
       if ($('#dlg-new').open && !m.sid) { newBusy(false); $('#new-err').textContent = m.msg; }
       else if (ADOPT.busy && $('#dlg-adopt').open && !m.sid) { adoptFail(m.msg); }
       else if (MC.busy && $('#dlg-machine').open) { mcFail(m.msg); }
@@ -3391,6 +3394,7 @@ async function renderSettings() {
 // ---- settings sub-pages: the main list links to pages that slide in from the right
 const THEME_NAMES = { auto: T('跟随系统'), light: T('浅色'), dark: T('深色'), solarized: 'Solarized' };
 function renderSettingsNav() {
+  renderExtPage();
   $('#nav-look-sub').textContent = THEME_NAMES[themePref()] + T(' · 终端字号 ') + S.fontSize;
   const w = $$('#set-widgets input[type=checkbox]'); const won = w.filter((x) => x.checked).length;
   $('#nav-widgets-sub').textContent = w.length ? T('已开启 ') + won + ' / ' + w.length : '';
@@ -3426,6 +3430,73 @@ function renderKeyPage() {
   };
 }
 for (const el of $$('#kb-modes [data-kb]')) el.onclick = () => send({ op: 'key_balance', mode: el.dataset.kb, exclude: kbState().exclude });
+// ---- extensions (Settings → 扩展): what config.json "extensions" lists, with each machine's verdict
+const EXT = { open: {}, busy: false };
+function extList() { return (S.ext || []); }
+function renderExtPage() {
+  const list = extList();
+  $('#nav-ext-sub').textContent = list.length ? list.filter((e) => e.enabled && e.on).length + ' / ' + list.length + T(' 个已启用') : '';
+  const sel = $('#ext-m'); const cur = sel.value;
+  setHTML(sel, S.machines.map((mc) => '<option value="' + esc(mc.id) + '">' + esc(mc.id + ' · ' + mc.name) + '</option>').join(''));
+  if (cur && S.byId[cur]) sel.value = cur;
+  const h = list.map((e) => {
+    const st = !e.enabled ? T('已关闭') : e.on ? T('已启用') : T('不可用') + (e.error ? '：' + e.error : '');
+    const sch = e.schema || {}; const open = EXT.open[e.id];
+    let x = '<div class="group ext-card" data-ext="' + esc(e.id) + '">' +
+      '<div class="cell"><span class="cell-ic" style="background:' + (e.enabled && e.on ? '#8E5CF7' : '#8E8E93') + '" aria-hidden="true">' + ic('plus-sq') + '</span>' +
+      '<span class="grow">' + esc(e.name || e.id) + (e.version ? ' <span class="sub" style="display:inline">' + esc(e.version) + '</span>' : '') +
+      '<div class="sub' + (e.enabled && !e.on ? ' bad' : '') + '">' + esc(st) + ' · ' + esc(e.machine || '') + '</div></span>' +
+      '<span class="switch"><input type="checkbox" role="switch" data-ext-on aria-label="' + esc(T('启用') + ' ' + (e.name || e.id)) + '"' + (e.enabled ? ' checked' : '') + '><i></i></span></div>';
+    if (e.description) x += '<div class="cell-note">' + esc(e.description) + '</div>';
+    x += '<button type="button" class="cell" data-ext-more aria-expanded="' + (open ? 'true' : 'false') + '"><span class="grow">' + T('设置') + '</span><svg class="ic chev" aria-hidden="true" style="transform:rotate(' + (open ? 90 : 0) + 'deg)"><use href="#i-chev"/></svg></button>';
+    if (open) {
+      for (const [k, spec] of Object.entries(sch)) {
+        const v = (e.settings || {})[k]; const id = 'ext-' + e.id + '-' + k;
+        x += spec && spec.type === 'boolean'
+          ? '<div class="cell"><span class="grow">' + esc(T(spec.label || k)) + '</span><span class="switch"><input type="checkbox" role="switch" id="' + esc(id) + '" data-ext-set="' + esc(k) + '"' + (v ? ' checked' : '') + ' aria-label="' + esc(T(spec.label || k)) + '"><i></i></span></div>'
+          : '<div class="cell stack"><label class="lbl" for="' + esc(id) + '">' + esc(T((spec && spec.label) || k)) + (spec && spec.required ? ' *' : '') + '</label>' +
+            '<input id="' + esc(id) + '" data-ext-set="' + esc(k) + '"' + (spec && (spec.type === 'path') ? ' class="mono"' : '') + ' value="' + esc(v == null ? '' : v) + '" autocapitalize="off" autocorrect="off" spellcheck="false"></div>';
+      }
+      x += '<div class="cell-note mono">' + esc(e.dir) + '</div>' +
+        '<div class="cell"><button type="button" class="btn sm primary" data-ext-save>' + T('保存设置') + '</button><span class="grow"></span>' +
+        '<button type="button" class="btn sm danger" data-ext-rm>' + T('移除') + '</button></div>';
+    }
+    return x + '</div>';
+  }).join('');
+  setHTML($('#set-ext'), list.length ? h : '<div class="group"><div class="cell"><span class="grow sub">' + T('还没有扩展') + '</span></div></div>');
+  for (const card of $$('[data-ext]', $('#set-ext'))) {
+    const eid = card.dataset.ext;
+    $('[data-ext-on]', card).onchange = (ev) => extSend({ op: 'ext_update', id: eid, enabled: ev.target.checked });
+    $('[data-ext-more]', card).onclick = () => { EXT.open[eid] = !EXT.open[eid]; renderExtPage(); };
+    const save = $('[data-ext-save]', card);
+    if (save) save.onclick = () => {
+      const st = {};
+      for (const el of $$('[data-ext-set]', card)) st[el.dataset.extSet] = el.type === 'checkbox' ? el.checked : el.value.trim();
+      extSend({ op: 'ext_update', id: eid, settings: st });
+    };
+    const rm = $('[data-ext-rm]', card);
+    if (rm) rm.onclick = async () => {
+      if (!(await confirmSheet(T('移除这个扩展？'), T('只是从 Glimpse 里移除，扩展的文件夹和数据不会动。'), T('移除')))) return;
+      extSend({ op: 'ext_remove', id: eid });
+    };
+  }
+}
+function extSend(o) {
+  if (EXT.busy) return;
+  if (!send(o)) { toast(T('未连接'), T('稍后再试'), null, 'error'); return; }
+  EXT.busy = true; $('#ext-add-btn').disabled = true;
+}
+function onExtOk(m) {
+  EXT.busy = false; $('#ext-add-btn').disabled = false;
+  if (m.op === 'ext_add') { $('#ext-dir').value = ''; toast(T('已添加扩展'), T('打开开关并填好设置后生效'), null, 'done'); }
+  else if (m.op === 'ext_remove') toast(T('已移除扩展'), '', null, 'done');
+  else toast(T('已保存'), T('新开或重启的会话会带上'), null, 'done');
+}
+$('#ext-add').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const dir = $('#ext-dir').value.trim(); if (!dir) { $('#ext-dir').focus(); return; }
+  extSend({ op: 'ext_add', m: $('#ext-m').value, dir });
+});
 function settingsPage(name, back) {
   const d = $('#dlg-settings'); const cur = $('.spage:not([hidden])', d); const next = $('.spage[data-page="' + name + '"]', d);
   if (!next || cur === next) return;
@@ -3932,6 +4003,7 @@ $('#acct-revoke-others').onclick = async () => {
 function refreshOpenSheets() {
   if ($('#dlg-settings').open) {
     renderSettingsMachines(); renderKeyPage(); renderSettingsNav();
+    if (!$('#set-ext').contains(document.activeElement)) renderExtPage();     // not while typing a setting
     $('#set-hubver').textContent = S.hub && S.hub.version ? S.hub.version : '—';
   }
   if ($('#dlg-new').open) {

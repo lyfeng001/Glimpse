@@ -560,6 +560,7 @@
     </div>
     <div class="group" style="margin-top:var(--s4)">
       <button type="button" class="cell" data-spage="machines"><span class="cell-ic" style="background:#0A84FF" aria-hidden="true"><svg class="ic"><use href="#i-server"/></svg></span><span class="grow">机器<div class="sub" id="nav-machines-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
+      <button type="button" class="cell" data-spage="ext" id="nav-ext"><span class="cell-ic" style="background:#8E5CF7" aria-hidden="true"><svg class="ic"><use href="#i-plus-sq"/></svg></span><span class="grow">扩展<div class="sub" id="nav-ext-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
       <button type="button" class="cell" data-spage="mem" id="nav-mem" hidden><span class="cell-ic" style="background:#8E5CF7" aria-hidden="true"><svg class="ic"><use href="#i-sparkle"/></svg></span><span class="grow">记忆<div class="sub" id="nav-mem-sub"></div></span><svg class="ic chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
     </div>
     <div class="group" style="margin-top:var(--s4)">
@@ -626,6 +627,17 @@
       <button type="button" class="cell" id="btn-add-machine"><span class="cell-ic" aria-hidden="true"><svg class="ic"><use href="#i-plus"/></svg></span><span class="grow" style="color:var(--accent-text)">添加机器</span></button>
       <button type="button" class="cell" id="btn-clean"><span class="cell-ic" style="background:#5C636E" aria-hidden="true"><svg class="ic"><use href="#i-broom"/></svg></span><span class="grow">清理已结束的会话<div class="sub" id="btn-clean-sub"></div></span></button>
     </div>
+  </div>
+  <div class="spage" data-page="ext" data-title="扩展" hidden>
+    <div id="set-ext"></div>
+    <div class="g-h">添加扩展</div>
+    <form class="group" id="ext-add" novalidate>
+      <div class="cell"><span class="lbl" id="ext-m-lbl">机器</span><select id="ext-m" aria-labelledby="ext-m-lbl"></select></div>
+      <div class="cell stack"><label class="lbl" for="ext-dir">扩展所在的文件夹（里面有 extension.json）</label>
+        <input id="ext-dir" class="mono" placeholder="~/Documents/spiritai/paper-radar" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
+      <button type="submit" class="cell" id="ext-add-btn"><span class="cell-ic" aria-hidden="true"><svg class="ic"><use href="#i-plus"/></svg></span><span class="grow" style="color:var(--accent-text)">添加</span></button>
+    </form>
+    <p class="g-f">扩展是放在单独仓库里的工具（知识库、论文雷达等）。添加后默认关闭：打开开关、填好设置才会生效。扩展只能运行它清单里列出的命令；它的 MCP 工具和说明会加到它适用的 Claude Code / Codex 会话里，新开或重启的会话才会带上。</p>
   </div>
   <div class="spage" data-page="mem" data-title="记忆" hidden>
     <div class="group" id="set-mem"></div>

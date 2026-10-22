@@ -1026,8 +1026,9 @@ VAULT_LINKER = os.path.expanduser("~/Documents/spiritai/vault-linker/vault-linke
 
 @pytest.mark.skipif(not os.access(VAULT_LINKER, os.X_OK), reason="vault-linker not checked out next to Glimpse")
 def test_project_workflow(hub_mod, tmp_path, monkeypatch):
-    """project_workflow: project init on the vault machine through the agent's op vault (the real vault-linker, a
-    throwaway vault); refused on other machines and without a vault; the vault paths go to the vault machine only."""
+    """project_workflow: project init on the vault machine through the agent's op ext (the real vault-linker and its
+    extension.json, a throwaway vault); refused on other machines and without a vault; the vault extension goes to
+    its machine only; Settings → 扩展 adds (from the folder's manifest), turns on, configures and removes it."""
     import subprocess
     C, server = hub_mod
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "agent"))
@@ -1041,22 +1042,28 @@ def test_project_workflow(hub_mod, tmp_path, monkeypatch):
     proj.mkdir()
 
     class Agent:
-        """A machine whose calls run the real agent Vault.run (synchronously)."""
-        def __init__(self, mid):
-            self.id, self.sent = mid, []
-            self.v = A.Vault(type("D", (), {"bg_done": [], "background": staticmethod(lambda f: f())})())
+        """A machine whose calls run the real agent Extensions (synchronously)."""
+        def __init__(self, mid, local=False):
+            self.id, self.sent, self.cfg = mid, [], {"type": "local" if local else "ssh"}
+            self.v = A.Extensions(type("D", (), {"bg_done": [], "background": staticmethod(lambda f: f())})())
 
         async def call(self, obj, timeout=None):
             self.sent.append(obj)
-            if obj["op"] == "vault_config":
+            if obj["op"] == "ext_config":
                 self.v.configure(obj["cfg"])
-                return {"t": "vault_status", "on": self.v.on()}
-            out = {}
-            self.v.run(obj["args"], lambda r, e: out.update({"t": "error", "msg": e} if e else {"t": "vault", "data": r}),
-                       stdin=obj.get("input"))
-            fn, res, err = self.v.d.bg_done.pop()
-            fn(res, err)
-            return out
+                return {"t": "ext_status", "ext": self.v.status()}
+            if obj["op"] == "ext_probe":
+                folder, man = A.ext_load(obj["dir"])
+                return {"t": "ext_probe", "dir": folder, "man": man}
+            if obj["op"] == "ext":
+                out = {}
+                self.v.run(obj["id"], obj["args"], lambda r, e: out.update({"t": "error", "msg": e} if e else {"t": "ext", "data": r}),
+                           stdin=obj.get("input"), timeout=obj.get("timeout", 60))
+                while self.v.d.bg_done:                    # refusals answer at once, CLI runs come back here
+                    fn, res, err = self.v.d.bg_done.pop()
+                    fn(res, err)
+                return out
+            return {"t": "error", "msg": "unknown op"}
 
     class P:
         def __init__(self):
@@ -1067,25 +1074,35 @@ def test_project_workflow(hub_mod, tmp_path, monkeypatch):
 
     async def run():
         hub = server.Hub(C.load())
-        local, other = Agent("M1"), Agent("M9")
+        local, other = Agent("M1", True), Agent("M9")
         hub.machines = {"M1": local, "M9": other}
         hub.cfg["machines"] = [{"id": "M1", "type": "local"}, {"id": "M9", "type": "ssh", "host": "x"}]
         assert server.local_machine_id(hub.cfg) == "M1"
         p = P()
         with pytest.raises(ValueError):                      # no vault configured yet
             await hub.project_workflow(p, local, {"cwd": str(proj)})
-        hub.cfg["vault"] = {"linker": VAULT_LINKER, "path": str(vault)}
-        await hub.vault_config(local)
-        await hub.vault_config(other)
-        assert local.sent[-1]["cfg"]["path"] == str(vault) and other.sent[-1]["cfg"] == {}
-        assert local.vault and not getattr(other, "vault", False)
+        hub.cfg["extensions"] = []
+        await hub.ext_op(p, "ext_add", {"m": "M1", "dir": os.path.dirname(VAULT_LINKER)})
+        e = hub.ext_entry("vault-linker")
+        assert e and e["enabled"] is False and e["machine"] == "" and "path" in e["schema"] and p.out[-1]["t"] == "ext_ok"
+        with pytest.raises(ValueError):                      # added, but still off
+            await hub.project_workflow(p, local, {"cwd": str(proj)})
+        with pytest.raises(ValueError):                      # the same one twice
+            await hub.ext_op(p, "ext_add", {"m": "M1", "dir": os.path.dirname(VAULT_LINKER)})
+        await hub.ext_op(p, "ext_update", {"id": "vault-linker", "enabled": True, "settings": {"path": str(vault), "nope": 1}})
+        assert e["settings"]["path"] == str(vault) and "nope" not in e["settings"]
+        await hub.ext_config(other)
+        assert local.sent[-1]["cfg"]["vault-linker"]["settings"]["path"] == str(vault) and other.sent[-1]["cfg"] == {}
+        assert local.vault and not getattr(other, "vault", False) and hub.vault_on()
+        v = hub.ext_view()[0]
+        assert v["id"] == "vault-linker" and v["on"] and v["machine"] == "M1" and v["version"]
         with pytest.raises(ValueError):                      # not the vault machine
             await hub.project_workflow(p, other, {"cwd": str(proj)})
         await hub.project_workflow(p, local, {"cwd": str(proj), "sid": "abc123"})
         r = p.out[-1]
         assert r["t"] == "project_workflow" and r["init"]["id"] == "newproj" and r["init"]["git_init"]
         assert (proj / ".vault-linker.json").exists() and (vault / "projects" / "newproj" / "project.md").exists()
-        assert A.vault_link(str(proj)) == ("newproj", os.path.realpath(str(proj)))
+        assert A.ext_marker(str(proj), [".vault-linker.json"]) == ("newproj", os.path.realpath(str(proj)))
         with pytest.raises(ValueError) as e:                  # vault-linker's own refusals come through
             await hub.project_workflow(p, local, {"cwd": str(tmp_path / "missing")})
         assert "no such folder" in str(e.value)
@@ -1114,6 +1131,13 @@ def test_project_workflow(hub_mod, tmp_path, monkeypatch):
                     {"action": "nope"}, {"action": "read"}, {"action": "write", "path": "notes/t/x.png", "text": "x"}):
             assert (await view(**bad))["t"] == "error", bad
         assert (await view(action="sync"))["data"]["pushed"] is False
+        # the agent refuses first words the manifest does not allow, whatever the hub sends
+        with pytest.raises(ValueError):
+            await hub.ext_cli("vault-linker", ["mcp"])
+        await hub.ext_op(p, "ext_update", {"id": "vault-linker", "enabled": False})
+        assert not hub.vault_on() and local.sent[-1]["cfg"] == {}
+        await hub.ext_op(p, "ext_remove", {"id": "vault-linker"})
+        assert hub.ext_entries() == []
     asyncio.run(run())
 
 

@@ -33,10 +33,10 @@ DEFAULTS = {
     # store: the vault ("" = data/memory in the project on this computer, ~/.glimpse/data/memory on ssh machines);
     # budget: vault size limit, oldest tool output / tool calls are compacted away beyond it
     "memory": {"enabled": False, "python": "", "store": "", "budget": "20G", "keep_days": 30},
-    # vault-linker (project workflow + knowledge base), optional: "linker" = path of the vault-linker launcher on
-    # the hub computer, "path" = the vault; "machine" = the machine id that holds it (default: the local one),
-    # "owner" = GitHub account for new project repositories
-    "vault": {"linker": "", "path": "", "machine": "", "owner": "lyfeng001"},
+    # extensions (optional tools in their own repositories, each a folder with an extension.json): per entry
+    # {"id", "dir": the folder on that machine, "machine": "" = this computer, "enabled", "settings": {...}}.
+    # Settings → 扩展 adds / configures them. vault-linker (the project workflow + 知识库) is one.
+    "extensions": [],
     # choices offered by the new-session sheet and the "controls" widget (lists replace, not merge)
     "options": {
         "claude": {"models": ["default", "opus", "sonnet", "haiku", "fable", "opusplan"],
@@ -83,6 +83,20 @@ def _merge(base, over):
     return out
 
 
+def _migrate(cfg):
+    """Older config.json: "vault": {linker, path, machine, owner} becomes the vault-linker extension entry."""
+    v = cfg.pop("vault", None)
+    if not isinstance(v, dict):
+        return v is not None
+    exts = cfg.setdefault("extensions", [])
+    if v.get("linker") and v.get("path") and not any(isinstance(e, dict) and e.get("id") == "vault-linker" for e in exts):
+        linker = os.path.expanduser(v["linker"])
+        exts.append({"id": "vault-linker", "dir": os.path.dirname(os.path.realpath(linker)) if os.path.exists(linker)
+                     else os.path.dirname(linker), "machine": v.get("machine") or "", "enabled": True,
+                     "settings": {"path": v["path"], "owner": v.get("owner") or "lyfeng001"}})
+    return True
+
+
 def load():
     if not os.path.exists(CONFIG):
         src = EXAMPLE if os.path.exists(EXAMPLE) else None
@@ -90,7 +104,10 @@ def load():
         write_secret(CONFIG, text)
     with open(CONFIG) as f:
         cfg = json.load(f)
+    migrated = _migrate(cfg)
     cfg = _merge(DEFAULTS, cfg)
+    if migrated:
+        save(cfg)
     os.makedirs(DATA, mode=0o700, exist_ok=True)
     os.chmod(DATA, 0o700)
     return cfg

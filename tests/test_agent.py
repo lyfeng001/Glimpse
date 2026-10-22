@@ -3,6 +3,8 @@ import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agent"))
 import glimpse_agent as A  # noqa: E402
 
@@ -1412,53 +1414,121 @@ def test_daemon_language_op_and_persistence(tmp_path):
         A.LANG = old
 
 
-def test_vault_workflow_session_args(tmp_path):
-    """A session in a registered project gets the vault MCP server + instruction, merged with AMem's into ONE
+def _ext_dir(tmp_path, man=None):
+    """A vault-linker-like extension folder: a launcher and its extension.json (the real manifest's shape)."""
+    d = tmp_path / "ext"
+    d.mkdir()
+    (d / "vault-linker").write_text("#!/bin/sh\n")
+    (d / "vault-linker").chmod(0o755)
+    (d / "extension.json").write_text(json.dumps(man or {
+        "manifest": 1, "id": "vault-linker", "name": "知识库", "version": "9.9",
+        "settings": {"path": {"type": "path", "required": True}, "owner": {"type": "string", "default": "me"}},
+        "check_paths": ["{path}/.vault-linker"], "cli": ["{dir}/vault-linker", "--vault", "{path}", "--json"],
+        "cli_ok": ["read"], "sessions": {"kinds": ["claude", "codex"], "scope": "project",
+                                         "marker": [".vault-linker.json", ".git/.vault-linker.json"]},
+        "mcp": {"name": "vault", "command": "{dir}/vault-linker",
+                "args": ["--vault", "{path}", "mcp", "--project", "{project}", "--who", "{sid}"],
+                "tools": ["vault_search", "exp_update"]},
+        "prompt": "vault project {project}: exp_new before"}))
+    return d
+
+
+def test_extension_session_args(tmp_path):
+    """A session in a registered project gets the extension's MCP server + instruction, merged with AMem's into ONE
     --mcp-config and ONE --append-system-prompt (claude) / ONE developer_instructions (codex); elsewhere nothing."""
-    linker = tmp_path / "vault-linker"
-    linker.write_text("#!/bin/sh\n")
-    linker.chmod(0o755)
+    ext = _ext_dir(tmp_path)
     vault = tmp_path / "vault"
     (vault / ".vault-linker").mkdir(parents=True)
     proj = tmp_path / "proj"
     (proj / "src" / "deep").mkdir(parents=True)
     (proj / ".vault-linker.json").write_text(json.dumps({"id": "proj", "vault": str(vault)}))
-    assert A.vault_link(str(proj / "src" / "deep")) == ("proj", os.path.realpath(str(proj)))
-    assert A.vault_link(str(tmp_path)) is None
+    marks = [".vault-linker.json", ".git/.vault-linker.json"]
+    assert A.ext_marker(str(proj / "src" / "deep"), marks) == ("proj", os.path.realpath(str(proj)))
+    assert A.ext_marker(str(tmp_path), marks) is None
     d, s = _session("claude")
     s.cwd = str(proj / "src")
-    v = A.Vault(d)
-    v.attach(s)
-    assert s.vault_project is None                                # not configured: off
-    v.configure({"linker": str(linker), "path": str(vault), "junk": 1})
-    v.attach(s)
-    assert s.vault_project == "proj" and v.on()
+    X = A.Extensions(d)
+    X.attach(s)
+    assert s.ext == {} and s.vault_project is None                # nothing configured: off
+    X.configure({"vault-linker": {"dir": str(ext), "settings": {}}})
+    assert X.status()["vault-linker"]["on"] is False and "path" in X.status()["vault-linker"]["error"]
+    X.configure({"vault-linker": {"dir": str(ext), "settings": {"path": str(tmp_path / "nope")}}})
+    assert X.status()["vault-linker"]["on"] is False               # check_paths: not a vault
+    X.configure({"vault-linker": {"dir": str(ext), "settings": {"path": str(vault), "junk": 1}}})
+    st = X.status()["vault-linker"]
+    assert st["on"] and st["version"] == "9.9" and st["name"] == "知识库"
+    X.attach(s)
+    assert s.ext == {"vault-linker": "proj"} and s.vault_project == "proj"
     mem = A.Memory(d)
     mem.cfg = dict(A.MEMORY_DEFAULT, enabled=True, python="/opt/py")
     s.memory_project = "proj"
-    args = A.extension_args(s, mem, v)
+    args = A.extension_args(s, mem, X)
     assert args.count("--mcp-config") == 1 and args.count("--append-system-prompt") == 1
     servers = json.loads(args[args.index("--mcp-config") + 1])["mcpServers"]
-    assert set(servers) == {"amem", "vault"} and servers["vault"]["command"] == str(linker)
+    launcher = os.path.join(os.path.realpath(str(ext)), "vault-linker")
+    assert set(servers) == {"amem", "vault"} and servers["vault"]["command"] == launcher
     assert servers["vault"]["args"] == ["--vault", str(vault), "mcp", "--project", "proj", "--who", s.sid]
     prompt = args[args.index("--append-system-prompt") + 1]
-    assert "AMem" in prompt and "exp_new" in prompt
-    assert "mcp__vault__exp_update" in v.claude_allow(s)
+    assert "AMem" in prompt and "vault project proj: exp_new" in prompt
+    assert X.claude_allow(s) == ["mcp__vault__vault_search", "mcp__vault__exp_update"]
     _, cx = _session("codex")
     cx.cwd, cx.memory_project = str(proj), "proj"
-    v.attach(cx)
-    ca = A.extension_args(cx, mem, v)
+    X.attach(cx)
+    ca = A.extension_args(cx, mem, X)
     assert sum(1 for x in ca if x.startswith("developer_instructions=")) == 1
     assert any(x.startswith("mcp_servers.vault.command=") for x in ca) and any(x.startswith("mcp_servers.amem.") for x in ca)
-    s.memory_project = None                                       # vault alone
-    args = A.extension_args(s, mem, v)
+    s.memory_project = None                                       # the extension alone
+    args = A.extension_args(s, mem, X)
     assert set(json.loads(args[args.index("--mcp-config") + 1])["mcpServers"]) == {"vault"}
-    s.vault_project = None                                        # neither: nothing added
-    assert A.extension_args(s, mem, v) == []
+    s.ext = {}                                                    # neither: nothing added
+    assert A.extension_args(s, mem, X) == []
     _, sh = _session("shell")
     sh.cwd = str(proj)
-    v.attach(sh)
-    assert sh.vault_project is None
+    X.attach(sh)
+    assert sh.ext == {}
+    _, out = _session("claude")
+    out.cwd = str(tmp_path)                                       # not a project: scope "project" skips it
+    X.attach(out)
+    assert out.ext == {}
+
+
+def test_extension_manifest_checks_and_cli(tmp_path):
+    """Bad manifests are refused with a reason; the CLI runs only the first words cli_ok allows; a typo in a
+    placeholder shows up as an error instead of a wrong path; scope "all" reaches every AI session."""
+    with pytest.raises(ValueError):
+        A.ext_load(str(tmp_path / "missing"))
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    for man in ({"manifest": 2, "id": "x"}, {"manifest": 1, "id": "Bad Id"},
+                {"manifest": 1, "id": "x", "mcp": {"name": "a b", "command": "c"}}):
+        (bad / "extension.json").write_text(json.dumps(man))
+        with pytest.raises(ValueError):
+            A.ext_load(str(bad))
+    d = tmp_path / "every"
+    d.mkdir()
+    (d / "tool").write_text("#!/bin/sh\necho '{\"args\": \"'\"$*\"'\"}'\n")
+    (d / "tool").chmod(0o755)
+    (d / "extension.json").write_text(json.dumps({
+        "manifest": 1, "id": "every", "cli": ["{dir}/tool", "--json"], "cli_ok": ["ok"],
+        "sessions": {"scope": "all"}, "prompt": "hi {sid} {typo}"}))
+    dm, s = _session("codex")
+    dm.bg_done = []
+    dm.background = lambda f: f()
+    X = A.Extensions(dm)
+    X.configure({"every": {"dir": str(d)}, "gone": {"dir": str(tmp_path / "nowhere")}})
+    assert X.status()["every"]["on"] and X.status()["gone"]["on"] is False
+    X.attach(s)
+    assert s.ext == {"every": ""}
+    assert X.prompts(s) == []                                    # {typo}: left out, not a broken instruction
+    got = []
+    X.run("every", ["ok", "x"], lambda r, e: got.append((r, e)))
+    fn, res, err = dm.bg_done.pop()
+    fn(res, err)
+    assert got[-1] == ({"args": "--json ok x"}, None)
+    X.run("every", ["rm", "-rf"], lambda r, e: got.append((r, e)))
+    assert got[-1][0] is None and got[-1][1]                       # not in cli_ok: refused before running
+    X.run("gone", ["ok"], lambda r, e: got.append((r, e)))
+    assert got[-1][0] is None
 
 
 def test_transient_error_classification():

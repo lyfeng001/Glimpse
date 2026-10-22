@@ -1015,3 +1015,10 @@ dialog.sheet.tall { min-height: min(560px, calc(var(--app-h) - var(--safe-t) - 1
   background: var(--surface); color: var(--text); font-size: 13.5px; line-height: 1.55; resize: vertical; }
 .kb-edit-bar { display: flex; align-items: center; gap: var(--s2); }
 .kb-edit-bar .sub { flex: 1; min-width: 0; font-size: 12.5px; color: var(--text-2); }
+
+/* Settings → 扩展 */
+.ext-card + .ext-card { margin-top: var(--s4); }
+.ext-card .cell.stack input { font-size: 15px; }
+.ext-card .cell.stack input.mono { font-size: 13px; }
+.ext-card .cell-note.mono { font-size: 11.5px; word-break: break-all; padding-top: 8px; }
+#ext-dir { font-size: 13px; }

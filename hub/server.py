@@ -132,8 +132,12 @@ EN = {
     "当前密码不正确": "The current password is wrong",
     "Glimpse 测试通知": "Glimpse test notification",
     "通知已经可以正常工作": "Notifications work",
-    "知识库未配置（config.json 的 vault）": "No vault configured (vault in config.json)",
-    "知识库操作失败": "Vault operation failed",
+    "知识库未配置（设置 → 扩展）": "No vault configured (Settings → Extensions)",
+    "扩展 %s 没有启用": "Extension %s is not turned on",
+    "扩展操作失败": "Extension request failed",
+    "扩展 %s 已经添加过了": "Extension %s was already added",
+    "没有这个扩展": "No such extension",
+    "无效的知识库操作": "Invalid vault request",
     "无效的目录": "Invalid folder",
     "项目工作流目前只支持知识库所在的机器（%s）": "The project workflow works only on the vault's machine for now (%s)",
 }
@@ -151,6 +155,7 @@ CERT_RENEW = 12 * 3600
 HOST_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
 ARG_RE = re.compile(r"^[A-Za-z0-9_.:/\[\]@+=-]{1,120}$")   # model / effort / mode values that go on argv
 RESUME_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+EXT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 MEMORY_ACTIONS = ("overview", "memories", "context", "sessions", "search", "compact", "budget")
 CONTROL_ACTIONS = ("mode", "model", "effort", "goal", "approval", "sandbox")
 MENU_KEYS = ("esc", "s")
@@ -680,7 +685,7 @@ class Hub:
 
     def state(self):
         return {"t": "state", "hub": {"version": VERSION, "web": WEB_BUILD, "lang": self.lang()}, "keys": self.keys_view(), "balance": self.balance_view(),
-                "options": self.options(),
+                "options": self.options(), "extensions": self.ext_view(),
                 "machines": [self.machines[k].info(self.presets_view(self.machines[k])) for k in self.order]}
 
     def on_machine_state(self, m):
@@ -717,7 +722,7 @@ class Hub:
             for p in list(self.phones):
                 p.send({"t": "resync", "m": m.id})
             asyncio.ensure_future(self.memory_config(m))
-            asyncio.ensure_future(self.vault_config(m))
+            asyncio.ensure_future(self.ext_config(m))
             self.send_lang(m)
             return
         if t in ("out", "chat"):
@@ -862,6 +867,12 @@ class Hub:
         if op == "vault_view":
             await self.vault_view(p, msg)
             return
+        if op in ("ext_add", "ext_update", "ext_remove"):
+            try:
+                await self.ext_op(p, op, msg)
+            except (ValueError, ConnectionError, asyncio.TimeoutError) as e:
+                p.send({"t": "error", "op": op, "msg": str(e) or tr("超时")})
+            return
         if op in ("machine_test", "machine_add", "machine_update", "machine_remove"):
             try:
                 await self.machine_op(p, op, msg)
@@ -980,42 +991,123 @@ class Hub:
             m.memory = {k: v for k, v in r.items() if k not in ("t", "req", "store")}
             self.state_dirty.set()
 
-    # --- vault-linker: the project workflow and the knowledge base (the vault lives on one machine, the hub's own)
-    def vault_machine(self):
-        """The machine that holds the vault (vault.machine, else the local one), or None."""
-        v = self.cfg.get("vault") or {}
-        mid = v.get("machine") or local_machine_id(self.cfg)
+    # --- extensions (config "extensions": [{id, dir, machine, enabled, settings}]): each runs on one machine, whose
+    # agent reads its extension.json; the hub only routes (session args are the agent's job, see agent Extensions)
+    def ext_entries(self):
+        return [e for e in self.cfg.get("extensions") or [] if isinstance(e, dict) and isinstance(e.get("id"), str)
+                and EXT_ID_RE.match(e["id"]) and isinstance(e.get("dir"), str)]
+
+    def ext_entry(self, eid):
+        return next((e for e in self.ext_entries() if e["id"] == eid), None)
+
+    def ext_machine(self, e):
+        mid = (e or {}).get("machine") or local_machine_id(self.cfg)
         return self.machines.get(mid) if mid else None
 
-    def vault_on(self):
-        v = self.cfg.get("vault") or {}
-        return bool(v.get("linker") and v.get("path"))
+    def ext_on(self, eid):
+        """Enabled, and its machine says it is usable."""
+        e = self.ext_entry(eid)
+        m = self.ext_machine(e) if e and e.get("enabled", True) else None
+        return bool(m and ((getattr(m, "ext", None) or {}).get(eid) or {}).get("on"))
 
-    async def vault_config(self, m):
-        """Only the vault machine gets the paths: elsewhere workflow sessions run without the vault tools."""
-        v = self.cfg.get("vault") or {}
-        vm = self.vault_machine()
-        cfg = {"linker": v.get("linker") or "", "path": v.get("path") or ""} if vm is m and self.vault_on() else {}
+    async def ext_config(self, m):
+        """Tell a machine which extensions it runs (its folder and settings); it answers with their status."""
+        cfg = {e["id"]: {"dir": e["dir"], "settings": e.get("settings") if isinstance(e.get("settings"), dict) else {}}
+               for e in self.ext_entries() if e.get("enabled", True) and self.ext_machine(e) is m}
         try:
-            r = await m.call({"op": "vault_config", "cfg": cfg}, timeout=20)
+            r = await m.call({"op": "ext_config", "cfg": cfg}, timeout=20)
         except (ConnectionError, asyncio.TimeoutError):
             return
-        if r.get("t") == "vault_status":
-            m.vault = bool(r.get("on"))
+        if r.get("t") == "ext_status":
+            m.ext = r.get("ext") if isinstance(r.get("ext"), dict) else {}
+            m.vault = bool((m.ext.get("vault-linker") or {}).get("on"))
             self.state_dirty.set()
+
+    async def ext_cli(self, eid, args, timeout=90, stdin=None):
+        """<extension cli> <args> on its machine -> its JSON (ValueError with the message on failure)."""
+        e = self.ext_entry(eid)
+        m = self.ext_machine(e) if e and e.get("enabled", True) else None
+        if m is None:
+            raise ValueError(tr("扩展 %s 没有启用", eid))
+        req = {"op": "ext", "id": eid, "args": list(args), "timeout": timeout}
+        if stdin is not None:
+            req["input"] = stdin
+        r = await m.call(req, timeout=timeout + 10)
+        if r.get("t") != "ext":
+            raise ValueError(agent_error(r, tr("扩展操作失败")))
+        return r.get("data") or {}
+
+    def ext_view(self):
+        """Settings → 扩展: every configured extension, its machine and what that machine says about it."""
+        out = []
+        for e in self.ext_entries():
+            m = self.ext_machine(e)
+            st = ((getattr(m, "ext", None) or {}).get(e["id"]) or {}) if m else {}
+            out.append({"id": e["id"], "dir": e["dir"], "machine": m.id if m else e.get("machine") or "",
+                        "enabled": e.get("enabled", True) is not False, "settings": e.get("settings") or {},
+                        "name": st.get("name") or e.get("name") or e["id"], "version": st.get("version"),
+                        "on": bool(st.get("on")), "error": st.get("error"), "schema": e.get("schema") or {},
+                        "description": e.get("description") or ""})
+        return out
+
+    async def ext_op(self, p, op, msg):
+        """Settings → 扩展: add (probe the folder on that machine first), update (on / off, settings), remove."""
+        exts = self.cfg.setdefault("extensions", [])
+        if op == "ext_add":
+            m = self.machines.get(msg.get("m")) if isinstance(msg.get("m"), str) else None
+            d = msg.get("dir")
+            if m is None or not isinstance(d, str) or not d.strip() or len(d) > 1024:
+                raise ValueError(tr("无效的目录"))
+            r = await m.call({"op": "ext_probe", "dir": d.strip()}, timeout=20)
+            if r.get("t") != "ext_probe":
+                raise ValueError(agent_error(r, tr("扩展操作失败")))
+            man = r.get("man") or {}
+            eid = man.get("id")
+            if not isinstance(eid, str) or not EXT_ID_RE.match(eid):
+                raise ValueError(tr("扩展操作失败"))
+            if self.ext_entry(eid):
+                raise ValueError(tr("扩展 %s 已经添加过了", eid))
+            sch = man.get("settings") if isinstance(man.get("settings"), dict) else {}
+            exts.append({"id": eid, "dir": r.get("dir") or d.strip(), "machine": m.id if m.cfg.get("type") != "local" else "",
+                         "enabled": False, "name": man.get("name"), "description": man.get("description"),
+                         "schema": sch, "settings": {k: (v or {}).get("default", "") for k, v in sch.items()}})
+            target = m
+        else:
+            e = self.ext_entry(msg.get("id") if isinstance(msg.get("id"), str) else "")
+            if e is None:
+                raise ValueError(tr("没有这个扩展"))
+            target = self.ext_machine(e)
+            if op == "ext_remove":
+                exts.remove(e)
+            else:
+                if isinstance(msg.get("enabled"), bool):
+                    e["enabled"] = msg["enabled"]
+                st = msg.get("settings")
+                if isinstance(st, dict):
+                    keys = set((e.get("schema") or {}).keys()) | set((e.get("settings") or {}).keys())
+                    for k, v in st.items():
+                        if k in keys and isinstance(v, (str, int, float, bool)) and len(str(v)) <= 1024:
+                            e.setdefault("settings", {})[k] = v
+        C.save(self.cfg)
+        if target is not None:
+            await self.ext_config(target)
+        self.state_dirty.set()
+        p.send({"t": "ext_ok", "op": op})
+
+    # --- vault-linker (an extension): the project workflow and the knowledge base
+    def vault_machine(self):
+        """The machine that holds the vault, or None."""
+        e = self.ext_entry("vault-linker")
+        return self.ext_machine(e) if e else None
+
+    def vault_on(self):
+        return self.ext_on("vault-linker")
 
     async def vault_cli(self, args, timeout=90, stdin=None):
         """vault-linker <args> on the vault machine -> its JSON (ValueError with the message on failure)."""
-        vm = self.vault_machine()
-        if not self.vault_on() or vm is None:
-            raise ValueError(tr("知识库未配置（config.json 的 vault）"))
-        req = {"op": "vault", "args": list(args)}
-        if stdin is not None:
-            req["input"] = stdin
-        r = await vm.call(req, timeout=timeout)
-        if r.get("t") != "vault":
-            raise ValueError(agent_error(r, tr("知识库操作失败")))
-        return r.get("data") or {}
+        if not self.ext_entry("vault-linker"):
+            raise ValueError(tr("知识库未配置（设置 → 扩展）"))
+        return await self.ext_cli("vault-linker", args, timeout=timeout, stdin=stdin)
 
     async def workflow_setup(self, m, cwd, publish=False):
         """project init on the vault machine (standard layout, git init, registered in the vault), then optionally
@@ -1570,7 +1662,7 @@ class Hub:
                     continue
                 p.last_seen = time.time()
                 if data.get("op") in ("create", "restart", "models", "machine_test", "machine_add", "machine_update",
-                                      "machine_remove", "vault_view"):
+                                      "machine_remove", "vault_view", "ext_add", "ext_update", "ext_remove"):
                     asyncio.ensure_future(self.phone_op(p, data))
                 else:
                     await self.phone_op(p, data)

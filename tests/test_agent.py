@@ -1684,6 +1684,31 @@ def test_memory_query_validation():
     assert ran[1][:3] == ["budget", "--max-bytes", "20G"]
 
 
+def test_memory_query_waits_for_the_probe():
+    """Right after an agent (re)start the hub re-sends the memory settings and the phone asks for the overview at
+    once: the query waits for the probe instead of failing with "AMem 还没准备好"; a failed probe answers the
+    waiting query with its reason."""
+    d, s = _session("claude")
+    mem = A.Memory(d)
+    probes, ran, out = [], [], []
+    mem.exec_py = lambda args, done, fail=None, timeout=60: probes.append(done)
+    mem.run = lambda args, done, timeout=60: ran.append(args) or done({"ok": args[0]}, None)
+    mem.configure({"enabled": True, "python": "/opt/py"})
+    assert mem.probing
+    mem.query({"action": "overview"}, lambda r, e: out.append((r, e)))
+    assert out == [] and len(mem.waiting) == 1                 # not "not ready": waiting
+    probes.pop()('{"version": "0.4.0", "projects": {}}', None)
+    assert out == [({"ok": "vault"}, None)] and mem.waiting == [] and not mem.probing
+    # reconnect: probing again; this time the probe fails
+    mem.configure({"enabled": True, "python": "/opt/py"})
+    mem.query({"action": "overview"}, lambda r, e: out.append((r, e)))
+    probes.pop()(None, "AMem 不可用")
+    assert out[-1] == (None, "AMem 不可用") and mem.version is None
+    mem.configure({"enabled": False})
+    mem.query({"action": "overview"}, lambda r, e: out.append((r, e)))
+    assert "未开启" in out[-1][1]
+
+
 def test_daemon_saves_and_restores_live_sessions(tmp_path, monkeypatch):
     d = A.Daemon("@unused", str(tmp_path))
     live = A.Session(d, "a1b2c3", "codex", "codex · x", str(tmp_path), ["codex", "--no-daemon"], 100, 30)

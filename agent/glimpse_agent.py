@@ -2638,6 +2638,7 @@ class Memory:
         self.version = None            # AMem version once the probe succeeded
         self.error = None
         self.probing = False
+        self.waiting = []              # queries that arrived while the probe ran: answered when it is done
         self.running = set()           # projects with a capture in flight
         self.again = set()             # ... and a turn that finished meanwhile
         self.bound = {}                # project -> root registered with `amem init`
@@ -2658,9 +2659,13 @@ class Memory:
                 "keep_days": self.cfg.get("keep_days")}
 
     def configure(self, cfg, done=None):
+        """Settings from the hub (sent on every connect): probe AMem again. Queries meanwhile wait for the
+        probe instead of failing with "not ready" (the phone asks as soon as the machine is back)."""
         self.cfg = dict(MEMORY_DEFAULT, **{k: v for k, v in (cfg or {}).items() if k in MEMORY_DEFAULT})
-        self.version, self.error = None, None
+        self.error = None
         if not self.cfg["enabled"]:
+            self.version = None
+            self.answer_waiting()
             if done:
                 done()
             return
@@ -2668,7 +2673,7 @@ class Memory:
         def probed(res, err):
             self.probing = False
             if err:
-                self.error = err
+                self.version, self.error = None, err
             else:
                 info = json.loads(res)
                 self.set_roots(info.get("projects"))
@@ -2676,10 +2681,16 @@ class Memory:
                 b = str(self.cfg.get("budget") or "0")
                 self.run(["budget", "--max-bytes", b, "--keep-days", str(int(self.cfg.get("keep_days") or 30))],
                          lambda r, e: setattr(self, "error", e) if e else None)
+            self.answer_waiting()
             if done:
                 done()
         self.probing = True
         self.exec_py(["-c", MEMORY_PROBE, self.store()], probed, tr("AMem 不可用（需要 Python 3.11+ 且安装 agent-memory-local[mcp]）"))
+
+    def answer_waiting(self):
+        q, self.waiting = self.waiting, []
+        for m, done in q:
+            self.query(m, done)
 
     def configure_now(self, cfg):
         """Blocking variant of configure() (daemon start, before any session is restored)."""
@@ -2813,6 +2824,9 @@ class Memory:
     def query(self, m, done):
         if not self.cfg.get("enabled"):
             done(None, tr("记忆功能未开启（config.json 里的 memory.enabled）"))
+            return
+        if self.probing and len(self.waiting) < 20:
+            self.waiting.append((m, done))       # answered by answer_waiting() once the probe is back
             return
         if not self.version:
             done(None, self.error or tr("AMem 还没准备好"))

@@ -655,6 +655,16 @@ button.cell:active, label.cell:active { background: var(--fill-press); }
 .cell input[type=text], .cell input[type=password], .cell input:not([type]), .cell select, .cell input[type=number] {
   flex: 1; min-width: 0; border: 0; background: transparent; outline: none; font-size: 16px; color: var(--text); text-align: right; padding: 10px 0; }
 .cell input::placeholder { color: var(--text-3); }
+/* time pickers and multi-line fields follow the theme too (the browser's own colours ignore Solarized) */
+.cell input[type=time] { border: 0; background: transparent; outline: none; font-size: 16px; color: var(--text);
+  padding: 10px 0; color-scheme: inherit; }
+.cell input[type=time]::-webkit-datetime-edit-fields-wrapper { color: var(--text); }
+.cell input[type=time]::-webkit-calendar-picker-indicator { opacity: .6; }
+.sc-prompt, #paste-text { width: 100%; min-height: 120px; padding: 10px 12px; border: .5px solid var(--line-2);
+  border-radius: var(--r-md); background: var(--fill); color: var(--text); font-size: 15px; line-height: 1.5;
+  resize: vertical; outline: none; }
+.sc-prompt::placeholder, #paste-text::placeholder { color: var(--text-3); }
+.sc-prompt:focus-visible, #paste-text:focus-visible { border-color: var(--accent-text); outline: none; }
 .cell.stack { flex-direction: column; align-items: stretch; gap: 2px; padding-top: 10px; padding-bottom: 10px; }
 .cell.stack .lbl { font-size: 13px; color: var(--text-2); min-width: 0; }
 .cell.stack input { text-align: left !important; padding: 4px 0 !important; }

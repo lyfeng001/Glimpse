@@ -1511,6 +1511,12 @@ def test_extension_session_args(tmp_path):
     ca = A.extension_args(cx, mem, X)
     assert sum(1 for x in ca if x.startswith("developer_instructions=")) == 1
     assert any(x.startswith("mcp_servers.vault.command=") for x in ca) and any(x.startswith("mcp_servers.amem.") for x in ca)
+    assert not any("tool_timeout_sec" in x for x in ca)          # codex's own default unless the manifest asks
+    X.items["vault-linker"].man["mcp"]["timeout"] = 300
+    assert "mcp_servers.vault.tool_timeout_sec=300" in A.extension_args(cx, mem, X)
+    X.items["vault-linker"].man["mcp"]["timeout"] = "300; rm -rf"  # not a number: ignored
+    assert not any("tool_timeout_sec" in x for x in A.extension_args(cx, mem, X))
+    del X.items["vault-linker"].man["mcp"]["timeout"]
     s.memory_project = None                                       # the extension alone
     args = A.extension_args(s, mem, X)
     assert set(json.loads(args[args.index("--mcp-config") + 1])["mcpServers"]) == {"vault"}

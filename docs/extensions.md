@@ -37,7 +37,7 @@ which machine, on / off and the settings (config.json `extensions`).
 | `cli` | the command line the hub may run, printing one JSON object (`{"error": ...}` on failure) |
 | `cli_ok` | the only first words allowed after `cli`; anything else is refused on the machine itself |
 | `sessions` | which sessions get `mcp` and `prompt`: `kinds` (default claude, codex); `scope` `all` or `project` (a `marker` file holding `{"id": ...}` in the session's folder or above, up to `~`) |
-| `mcp` | the MCP server those sessions start with; `tools` are allowed without asking in Claude Code |
+| `mcp` | the MCP server those sessions start with; `tools` are allowed without asking in Claude Code; `timeout` (seconds, optional) raises Codex's 60 s limit per tool call |
 | `prompt` | the instruction those sessions start with |
 
 Placeholders: `{dir}` (the extension's folder), any settings key, and per session `{project}`, `{sid}`, `{cwd}`. An

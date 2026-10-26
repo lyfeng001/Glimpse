@@ -2531,6 +2531,11 @@ class Extensions:
             out += ["-c", "mcp_servers.%s.command=%s" % (name, json.dumps(entry["command"])),
                     "-c", "mcp_servers.%s.args=%s" % (name, json.dumps(entry["args"])),
                     "-c", "mcp_servers.%s.default_tools_approval_mode=\"approve\"" % name]
+            # a tool that may take longer than codex's 60 s (the manifest's mcp.timeout, seconds)
+            t = next((e.man["mcp"].get("timeout") for e, _ in self.active(s)
+                      if (e.man.get("mcp") or {}).get("name") == name), None)
+            if isinstance(t, int) and not isinstance(t, bool) and 0 < t <= 3600:
+                out += ["-c", "mcp_servers.%s.tool_timeout_sec=%d" % (name, t)]
         return out
 
     def run(self, eid, args, done, timeout=60, stdin=None):

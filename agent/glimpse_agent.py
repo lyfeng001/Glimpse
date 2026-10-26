@@ -2311,10 +2311,10 @@ def continue_text():
     return AUTO_CONTINUE_TEXT.get(LANG, AUTO_CONTINUE_TEXT["zh"])
 # auto-continue has no retry limit: a transient error is retried until a turn completes or the user steps in (types
 # something, or switches it off). The wait grows to the last delay and stays there; the user is told at the
-# AUTO_CONTINUE_NOTIFY-th error in a row and then every AUTO_CONTINUE_NOTIFY_EVERY more (about hourly at 5 min).
-AUTO_CONTINUE_DELAYS = (15, 30, 60, 120, 240, 300)   # seconds before each retry; the last one repeats
+# AUTO_CONTINUE_NOTIFY-th error in a row and then every AUTO_CONTINUE_NOTIFY_EVERY more (about hourly at 30 s).
+AUTO_CONTINUE_DELAYS = (15, 30)   # seconds before each retry; the last one repeats
 AUTO_CONTINUE_NOTIFY = 5
-AUTO_CONTINUE_NOTIFY_EVERY = 12
+AUTO_CONTINUE_NOTIFY_EVERY = 120
 
 
 def is_transient_error(text):

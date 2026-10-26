@@ -132,6 +132,8 @@ gli hub                    # 前台运行，首次启动会自动用 tailscale c
 scripts/install_launchd.sh       # 可选（macOS）：开机自启，挂了自动拉起
 ```
 
+开机自启：用自己的账号运行 `scripts/install_launchd.sh`，不要加 `sudo`（登录项属于你的用户，root 写的不会被加载）。它会先停掉你手动启动的 hub，之后由 launchd 运行。`scripts/install_launchd.sh status` 查看状态，重启用 `launchctl kickstart -k gui/$(id -u)/dev.glimpse.hub`。日志照旧写在 `data/hub.log`；launchd 自己的输出（比如启动就崩）在 `~/Library/Logs/glimpse-hub.log`。开机时如果 Tailscale 还没连上，hub 先在 127.0.0.1 上服务，等 Tailscale 地址出现后自动加上。
+
 ### 4. 在手机上打开
 
 1. 打开 Tailscale App 并保持连接。

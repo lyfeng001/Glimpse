@@ -1418,6 +1418,48 @@ def test_least_used_picks_key_for_new_sessions(hub_mod):
     assert h.balance_view() == {"mode": "least_used", "exclude": [], "usage": False}
 
 
+def test_listen_retries_until_the_address_is_there(hub_mod, monkeypatch):
+    """Started at login, the hub can come up before Tailscale: "auto" has no IP yet, or the IP can't be bound yet.
+    It serves what it can and keeps trying the rest (it used to skip them for good: 127.0.0.1 only)."""
+    import socket
+    C, server = hub_mod
+    server.RUNTIME.clear()
+    monkeypatch.setattr(server, "detect_tailscale", lambda: (None, None))
+    cfg = {"hub": {"listen": [{"host": "auto", "port": 8443}, {"host": "127.0.0.1", "port": 8443}]}}
+    listen, _ = server.resolve_hub(cfg)
+    assert listen == [{"host": "127.0.0.1", "port": 8443}]
+    assert server.RUNTIME["later"] == [{"host": None, "port": 8443}]
+    server.RUNTIME.clear()
+    monkeypatch.setattr(server, "RELISTEN_EVERY", 0.05)
+
+    async def run():
+        runner = server.web.AppRunner(server.web.Application())
+        await runner.setup()
+        busy = socket.socket()
+        busy.bind(("127.0.0.1", 0))
+        busy.listen(1)
+        port = busy.getsockname()[1]
+        try:
+            assert not await server.listen_site(runner, {"host": "127.0.0.1", "port": port}, None, None)
+            ip = []                                   # "auto": the IP shows up a little later
+            monkeypatch.setattr(server, "detect_tailscale", lambda: (ip[0] if ip else None, None))
+            task = asyncio.ensure_future(server.relisten(
+                runner, [{"host": "127.0.0.1", "port": port}, {"host": None, "port": 0}], None, None))
+            await asyncio.sleep(0.2)
+            assert len(runner.sites) == 0             # still taken / still unknown
+            busy.close()
+            ip.append("127.0.0.1")
+            for _ in range(40):
+                if task.done():
+                    break
+                await asyncio.sleep(0.05)
+            assert task.done() and len(runner.sites) == 2
+        finally:
+            busy.close()
+            await runner.cleanup()
+    asyncio.run(run())
+
+
 def test_schedule_cron_and_due():
     import datetime as D
     import schedule as SC

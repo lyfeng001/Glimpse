@@ -134,6 +134,13 @@ gli hub                    # foreground; the first start fetches an HTTPS certif
 scripts/install_launchd.sh       # optional (macOS): start at login and restart if it dies
 ```
 
+The login agent: run `scripts/install_launchd.sh` as yourself, not with `sudo` (a login agent belongs to your user;
+one written by root is never loaded). It stops a hub you started by hand and runs it through launchd from then on.
+`scripts/install_launchd.sh status` shows whether it runs; restart it with
+`launchctl kickstart -k gui/$(id -u)/dev.glimpse.hub`. The hub writes `data/hub.log` as before; launchd's own
+output (a crash at start) goes to `~/Library/Logs/glimpse-hub.log`. If Tailscale is not up yet at login, the hub
+serves on 127.0.0.1 first and adds the Tailscale address as soon as it is there.
+
 ### 4. Open it on the phone
 
 1. Open the Tailscale app and stay connected.

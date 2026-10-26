@@ -158,6 +158,7 @@ CODE_CHECK_EVERY = 10        # s; how often the agent source on disk is checked 
 FS_ACTIONS = ("list", "read", "git", "diff", "write", "create", "mkdir")
 FS_TEXT_LIMIT = 2 * 1024 * 1024   # characters in a saved / new file (the agent checks the encoded size too)
 CERT_RETRY = 600             # s between certificate attempts while serving without one
+RELISTEN_EVERY = 15          # s between tries of a listen address that could not be bound at start (Tailscale down)
 CERT_RENEW = 12 * 3600
 HOST_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
 ARG_RE = re.compile(r"^[A-Za-z0-9_.:/\[\]@+=-]{1,120}$")   # model / effort / mode values that go on argv
@@ -1959,18 +1960,20 @@ def resolve_hub(cfg):
     ip = dns = None
     if name == "auto" or any(x.get("host") in ("auto", "", None) for x in listen):
         ip, dns = detect_tailscale()
-    out = []
+    out, later = [], []
     for x in listen:
         if x.get("host") in ("auto", "", None):
             if not ip:
-                log.warning("hub.listen host \"auto\": tailscale IP not found, skipping")
+                # right after login Tailscale may not be up yet: serve() keeps asking (relisten)
+                log.warning("hub.listen host \"auto\": tailscale IP not found yet, trying again every %d s", RELISTEN_EVERY)
+                later.append({"host": None, "port": x.get("port", 8443)})
                 continue
             x["host"] = ip
         if x not in out:
             out.append(x)
     if name == "auto":
         name = dns or ""
-    RUNTIME.update(listen=out, hostname=name)
+    RUNTIME.update(listen=out, hostname=name, later=later)
     return out, name
 
 
@@ -2026,18 +2029,16 @@ async def serve(cfg, hub):
     except (OSError, ssl.SSLError) as e:
         log.warning("127.0.0.1 certificate unusable (%s): run gli local-cert again", e)
         local = None
-    sites = 0
+    sites, pending = 0, []
     for ls in resolve_hub(cfg)[0]:
-        sctx = site_context(ls["host"], ctx, local)
-        try:
-            await web.TCPSite(runner, ls["host"], ls["port"], ssl_context=sctx).start()
+        if await listen_site(runner, ls, ctx, local):
             sites += 1
-            log.info("listening on %s://%s:%s%s", "https" if sctx else "http", ls["host"], ls["port"],
-                     " (127.0.0.1 certificate)" if sctx is local and local is not None else "")
-        except OSError as e:
-            log.error("cannot listen on %s:%s: %s", ls["host"], ls["port"], e)
+        else:
+            pending.append(ls)
     if not sites:
         raise SystemExit("no listen address available")
+    pending += RUNTIME.get("later") or []
+    again = asyncio.ensure_future(relisten(runner, pending, ctx, local)) if pending else None
     log.info("open on the phone: %s", login_url(cfg, mask=True))
     caf = None
     if cfg["hub"].get("caffeinate", True) and sys.platform == "darwin":
@@ -2057,9 +2058,47 @@ async def serve(cfg, hub):
                 log.warning("certificate obtained, restarting")
                 raise SystemExit(0)
     finally:
+        if again:
+            again.cancel()
         if caf:
             caf.terminate()
         await runner.cleanup()
+
+
+async def listen_site(runner, ls, ctx, local, quiet=False):
+    """Serve on one address; False (logged unless quiet) when it can't be bound now."""
+    sctx = site_context(ls["host"], ctx, local)
+    site = web.TCPSite(runner, ls["host"], ls["port"], ssl_context=sctx)
+    try:
+        await site.start()
+    except OSError as e:
+        # aiohttp registers the site before binding: take it off again, or every retry would leave one behind
+        try:
+            await site.stop()
+        except RuntimeError:
+            pass
+        if not quiet:
+            log.error("cannot listen on %s:%s: %s", ls["host"], ls["port"], e)
+        return False
+    log.info("listening on %s://%s:%s%s", "https" if sctx else "http", ls["host"], ls["port"],
+             " (127.0.0.1 certificate)" if sctx is local and local is not None else "")
+    return True
+
+
+async def relisten(runner, pending, ctx, local):
+    """Addresses that could not be bound at start, tried again until they are. Started at login, the hub can come up
+    before Tailscale has its IP (the bind fails with "Can't assign requested address"); the phone reaches the hub
+    over Tailscale, so it must not stay on 127.0.0.1 only. host None: "auto", Tailscale's IP not known yet."""
+    if pending:
+        log.info("will keep trying to listen on %s", ", ".join("%s:%s" % (x["host"] or "tailscale", x["port"]) for x in pending))
+    while pending:
+        await asyncio.sleep(RELISTEN_EVERY)
+        left = []
+        for ls in pending:
+            host = ls["host"] or detect_tailscale()[0]
+            if not host or not await listen_site(runner, dict(ls, host=host), ctx, local, quiet=True):
+                left.append(ls)
+        pending = left
 
 
 def main():
@@ -2070,9 +2109,13 @@ def main():
     ap.add_argument("--revoke", metavar="ID", help="log out a device (ID from --devices, or 'all')")
     ap.add_argument("--new-url", metavar="PATH", help="print a link that opens the new-session form for PATH")
     ap.add_argument("-v", "--verbose", action="store_true")
+    # launchd: the hub writes data/hub.log itself. launchd can't be given that file (it lives in ~/Documents, and a
+    # file there that launchd did not create makes the job fail with exit 78); its own output goes to ~/Library/Logs
+    ap.add_argument("--log", metavar="FILE", help="append the log to FILE instead of stderr")
     a = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+                        **({"filename": a.log} if a.log else {}))
     cfg = C.load()
     if a.print_url:
         print(login_url(cfg))

@@ -813,6 +813,7 @@ function cardHTML(mc, s) {
   if (s.pending) flag = '<div class="c-flag question">' + ic('shield', 'sm') + ('<span class="grow">' + T('待授权：')) + esc(s.pending.tool) + ' · ' + esc(s.pending.summary || '') + '</span></div>';
   else if (s.question) flag = '<div class="c-flag question">' + ic('help', 'sm') + ('<span class="grow">' + T('提问')) +
     (s.question.questions ? T('（') + (s.question.review ? T('待提交') : ((s.question.qi || 0) + 1) + '/' + s.question.questions.length) + T('）') : '') + T('：') + esc(s.question.question) + '</span></div>';
+  else if (s.side) flag = '<div class="c-flag side">' + ic('chat', 'sm') + '<span class="grow">' + (s.side === 'side' ? T('旁支对话中（/btw），回复只在终端') : T('旁支对话还开着')) + '</span></div>';
   else if (s.attention === 'error') flag = '<div class="c-flag error">' + ic('alert', 'sm') + '<span class="grow">' + esc(s.detail || T('出错')) + '</span></div>';
   else if (s.attention === 'done') flag = '<div class="c-flag done">' + ic('check-c', 'sm') + ('<span class="grow">' + T('已完成') + '</span></div>');
   else if (s.attention === 'question') flag = '<div class="c-flag question">' + ic('help', 'sm') + ('<span class="grow">' + T('需要你回复') + '</span></div>');
@@ -1231,6 +1232,9 @@ function renderView() {
   if (s.status === 'waiting' && !s.pending && !s.question) setBanner('waiting', 'alert', s.detail || T('等待你回复'), T('在下方用快捷键（1/2/3、↑↓、⏎、Esc）或输入框回复，也可切到终端查看'));
   else if (s.status === 'error') setBanner('error', 'x-c', T('出错') + (s.exit_code != null ? T('（退出码 ') + s.exit_code + T('）') : ''), s.detail || '', T('更换 Key'), openRestart);
   else if (s.status === 'exited') setBanner('exited', 'power', T('进程已退出') + (s.exit_code != null ? T('（退出码 ') + s.exit_code + T('）') : ''), s.detail || '', s.kind !== 'shell' ? T('重启') : null, openRestart);
+  // codex /btw: an ephemeral fork whose messages go to no rollout, so the chat and the status cannot follow it
+  else if (s.side === 'side') setBanner('side', 'chat', T('codex 旁支对话（/btw）进行中'), T('旁支的回复不写入会话记录，聊天里看不到，请在终端查看。按 Ctrl+C 回到主对话（旁支的内容会丢失）。'), S.mode !== 'term' ? T('切到终端') : null, () => { setMode('term'); renderView(); });
+  else if (s.side === 'main') setBanner('side', 'chat', T('旁支对话还开着'), T('终端里现在是主对话；按 ⌃/ 切回旁支，在旁支里按 Ctrl+C 关闭它。'));
   else setBanner(null);
   if (s.attention && document.visibilityState === 'visible') send({ op: 'ack', m: v.m, sid: v.sid });
   renderCard();

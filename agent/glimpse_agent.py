@@ -358,6 +358,23 @@ class Screen:
                 return "default"
         return None
 
+    def codex_side(self):
+        """codex's side conversation (/btw, /side: an ephemeral fork whose messages go to no rollout) from its footer:
+        "side" (on screen), "main" (still open, the main thread on screen), "" (none open), None (no footer visible,
+        e.g. a popup or "tab to queue message" replaced it: keep what was known)."""
+        lines = [ln for ln in self.lines() if ln.strip()]
+        foot = lines[-1] if lines else ""          # the footer: the last line
+        # "Side from main thread · ⌃/ to switch · ⌃c to close" (cut short on a narrow terminal); the empty composer
+        # of a side conversation says "Ask a follow-up question" instead of "Ask Codex to do anything"
+        if re.search(r"\bSide from \w", foot) or "⌃c to close" in foot or \
+                any(ln.lstrip().startswith("› Ask a follow-up question") for ln in lines[-6:]):
+            return "side"
+        if "⌃/ for side" in foot:
+            return "main"
+        if "for shortcuts" in foot:
+            return ""
+        return None
+
     def menu(self):
         return parse_menu(self.lines())
 
@@ -1331,6 +1348,7 @@ class Session:
         self.overrides = {}            # codex launch overrides: model / effort / approval / sandbox
         self.cx_mode = {}              # codex settings from the rollout turn_context
         self.cmode = None              # claude permission mode read from the footer
+        self.cx_side = None            # codex side conversation (/btw) open: "side" / "main" on screen (Screen.codex_side)
         self.hook_mode = None          # claude permission_mode reported by hooks (fallback)
         self.effort = None             # claude effort level from the transcript
         self.screen = Screen(cols, rows) if kind in ("claude", "codex") else None
@@ -1382,7 +1400,7 @@ class Session:
                 "key": self.key, "restarts": self.restarts, "auto_continue": self.auto_continue, "ac_count": self.ac_count, "mode": self.mode(), "overrides": dict(self.overrides),
                 "memory": self.memory_project, "vault": getattr(self, "vault_project", None),
                 "hot_key": bool(self.key_file) and self.fd is not None,
-                "menu": self.menu}
+                "menu": self.menu, "side": self.cx_side}
 
     def touch(self):
         self.dirty = True
@@ -1528,6 +1546,7 @@ class Session:
         self.spawned_at = now()
         self.resumed_at = self.spawned_at if resume and self.agent_session_id else None
         self.cmode = None
+        self.cx_side = None
         self.menu = None
         if self.screen is not None:
             self.screen = Screen(self.cols, self.rows)
@@ -1752,12 +1771,37 @@ class Session:
         if self.screen is None or not self.screen_dirty:
             return
         self.screen_dirty = False
+        if self.kind == "codex":
+            self.check_side()
+            return
         if self.kind != "claude":
             return
         m = self.screen.claude_mode()
         if m is not None and m != self.cmode:
             self.cmode = m
             self.touch()
+
+    def check_side(self):
+        """codex's /btw (/side) side conversation, from the footer. Its messages are written to no rollout, so the
+        chat would go silent and the status would stay at the main thread's: say so in the chat when one opens and
+        when it closes."""
+        side = self.screen.codex_side()
+        if side is None:
+            return                     # footer hidden (popup, "tab to queue message"): keep what was known
+        side = side or None
+        if side == self.cx_side:
+            return
+        was, self.cx_side = self.cx_side, side
+        self.touch()
+        if bool(was) == bool(side):
+            return                     # switched between the side and the main view: the side is still open
+        if side:
+            text = tr("—— 进入了 codex 的旁支对话（/btw）：这里的消息不写入会话记录，聊天里看不到回复，请在终端查看。按 Ctrl+C 回到主对话（旁支的内容会丢失）——")
+        else:
+            text = tr("—— 旁支对话已关闭，回到主对话 ——")
+        it = self.add_chat("system", text)
+        if it:
+            self.d.send_subs(self, {"t": "chat", "sid": self.sid, "items": [it]})
 
     def check_menu(self, t=None):
         """Parse the screen for an interactive picker once output paused for MENU_SETTLE."""
@@ -1885,6 +1929,12 @@ class Session:
             self.ac_pending = False
             if self.fd is None or not self.auto_continue or self.status == "running":
                 return              # process gone, switched off, or someone already continued it
+            if self.cx_side == "side":
+                # a /btw side conversation is on screen: "继续" would go there, not to the main thread. Try again
+                # once it is closed (or switched away from)
+                self.ac_pending = True
+                self.d.later(AUTO_CONTINUE_DELAYS[-1], fire)
+                return
             self.d.type_text(self, continue_text())
             self.set_status("running", "", None)
         self.d.later(delay, fire)
@@ -2239,6 +2289,11 @@ EN.update({
     "出错停止": "Stopped with an error",
     "已中断": "Interrupted",
     "—— 新对话 ——": "—— New conversation ——",
+    "—— 进入了 codex 的旁支对话（/btw）：这里的消息不写入会话记录，聊天里看不到回复，请在终端查看。按 Ctrl+C 回到主对话（旁支的内容会丢失）——":
+        "—— Entered a codex side conversation (/btw): its messages are not saved to the conversation, so its replies "
+        "do not show in the chat; read them in the terminal. Ctrl+C returns to the main thread (the side conversation "
+        "is lost) ——",
+    "—— 旁支对话已关闭，回到主对话 ——": "—— Side conversation closed, back to the main thread ——",
     "有问题需要回答": "Has a question for you",
     "出错停止: %s": "Stopped with an error: %s",
     "AMem 不可用（需要 Python 3.11+ 且安装 agent-memory-local[mcp]）":

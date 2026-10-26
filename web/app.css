@@ -267,6 +267,8 @@ code, pre, kbd { font-family: var(--mono); }
 .c-flag.question { color: var(--c-wait); background: color-mix(in srgb, var(--c-wait) 12%, transparent); }
 .c-flag.error { color: var(--c-err); background: color-mix(in srgb, var(--c-err) 11%, transparent); }
 .c-flag.done { color: var(--c-ok); background: color-mix(in srgb, var(--c-ok) 11%, transparent); }
+.c-flag.side { color: var(--text); background: color-mix(in srgb, var(--c-run) 11%, transparent); }
+.c-flag.side .ic { color: var(--c-run); }
 .c-flag .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .empty-m { margin: 0 var(--s4); padding: 18px var(--s4); border-radius: var(--r-lg); border: 1.5px dashed var(--line-2); color: var(--text-2);
   font-size: 14px; display: flex; align-items: center; justify-content: space-between; gap: var(--s3); }
@@ -463,6 +465,8 @@ button.f-row:active, button.f-row:hover { background: var(--fill); }
 .banner.waiting { color: var(--c-wait); background: color-mix(in srgb, var(--c-wait) 13%, transparent); }
 .banner.error { color: var(--c-err); background: color-mix(in srgb, var(--c-err) 12%, transparent); }
 .banner.exited { color: var(--text-2); background: var(--fill); }
+.banner.side { color: var(--text); background: color-mix(in srgb, var(--c-run) 12%, transparent); }
+.banner.side .ic { color: var(--c-run); }
 .banner .grow { flex: 1; min-width: 0; }
 .banner b { display: block; font-weight: 600; }
 .banner .btn.sm { flex: none; align-self: center; }

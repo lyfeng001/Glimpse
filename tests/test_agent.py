@@ -1627,6 +1627,54 @@ def test_auto_continue_retries_transient_only():
     assert s.maybe_auto_continue(overload) is False
 
 
+def test_codex_side_conversation_from_footer():
+    """codex /btw (/side) opens an ephemeral fork whose messages go to no rollout: the chat would go silent and the
+    status stay at the main thread's. Glimpse reads it from codex's footer (texts as codex 0.164 draws them), says so
+    in the chat once when it opens and once when it closes, and auto-continue does not type into it."""
+    d, s = _session("codex")
+    sent = []
+    d.send_subs = lambda ss, obj: sent.append(obj)
+
+    def show(*lines):
+        s.screen = A.Screen(140, 10)
+        s.screen.feed("\r\n".join(lines).encode())
+        s.screen_dirty = True
+        s.check_mode()
+    main = ("› Ask Codex to do anything", "", "  GPT-6-Astra max · ~/x",
+            "  ? for shortcuts                                                ⚠ 1 warning · f2 to view")
+    side = ("› Ask a follow-up question", "", "  GPT-6-Astra max · ~/x · Agent",
+            "  ? for shortcuts    Side from main thread · ⌃/ to switch · ⌃c to close    ⚠ 1 warning · f2 to view")
+    show(*main)
+    assert s.cx_side is None and not sent
+    show(*side)
+    assert s.cx_side == "side" and s.info()["side"] == "side"
+    assert "/btw" in sent[-1]["items"][0]["text"]
+    n = len(sent)
+    # ⌃/ shows the main thread while the side conversation stays open: no new chat line
+    show("› Ask Codex to do anything", "", "  GPT-6-Astra max · ~/x · Main [default]",
+         "  ? for shortcuts                                          ⌃/ for side    ⚠ 1 warning · f2 to view")
+    assert s.cx_side == "main" and len(sent) == n
+    show("› half typed", "", "  GPT-6-Astra max · ~/x", "  tab to queue message")   # hint replaced: keep what was known
+    assert s.cx_side == "main"
+    # a narrow terminal cuts the footer short
+    show("› Ask a follow-up question", "", "  GPT-6-Astra max · Agent", "  Side from main thread · ⌃/ to switc  ⚠ 1 warning")
+    assert s.cx_side == "side" and len(sent) == n
+    # auto-continue does not type "继续" into the side conversation; it tries again later
+    s.fd, s.auto_continue = 99, True
+    timers, typed = [], []
+    d.later = lambda delay, fn: timers.append((delay, fn))
+    d.type_text = lambda ss, t: typed.append(t)
+    assert s.maybe_auto_continue("stream disconnected before completion: Our servers are currently overloaded.") is True
+    timers[-1][1]()
+    assert typed == [] and s.ac_pending and len(timers) == 2
+    show(*main)                                                  # Ctrl+C closed it: back on the main thread
+    assert s.cx_side is None and "回到主对话" in sent[-1]["items"][0]["text"]
+    timers[-1][1]()
+    assert typed == ["继续"]
+    # a reply that merely mentions the words is not the footer
+    show("• the footer says Side from main thread · ⌃c to close", "", *main[2:])
+    assert s.cx_side is None
+
 
 def test_memory_project_id_and_launch_args(tmp_path):
     import subprocess

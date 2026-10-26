@@ -42,7 +42,7 @@ Glimpse 让手机变成这些会话的遥控器。手机上看到的就是它们
 - **一键授权**：Claude Code 请求权限时，手机上会出现授权卡片，可以直接点允许、总是允许、拒绝或者交给终端处理。底层走官方的 `PermissionRequest` hook，不靠模拟按键。
 - **回答提问**：`AskUserQuestion` 的选项会显示成按钮；一次问多个问题时逐题显示进度，可以上一题 / 下一题，最后确认提交。
 - **推送通知**：本轮完成、出错停止、需要授权或回答问题、进程退出时，通过标准 Web Push 发通知。正在看 Glimpse 的那台设备只显示应用内横幅，其他设备照常推送（电脑上的窗口只有在当前激活时才算“正在看”）。
-- **自动继续**（默认关闭，在“会话操作”里按会话开启）：一轮因临时错误停下时（`stream disconnected`、`overloaded`、`Service temporarily unavailable`、`Incomplete response … max_output_tokens`、`Connection failed: error sending request`、5xx 等），Glimpse 会退避后自动发送“继续”（15 秒、30 秒、60 秒、120 秒、240 秒，连续最多 5 次）。余额不足、Key 无效、上下文已满这类需要你处理的错误不会重试，照常通知。
+- **自动继续**（默认关闭，在“会话操作”里按会话开启）：一轮因临时错误停下时（`stream disconnected`、`overloaded`、`Service temporarily unavailable`、`Incomplete response … max_output_tokens`、`Connection failed: error sending request`、5xx 等），Glimpse 会退避后自动发送“继续”（15 秒、30 秒、60 秒、120 秒、240 秒，之后每 5 分钟一次）。没有次数上限：一直重试到 AI 正常回复完一次、你自己发了消息、或者你关掉它为止；连着出错到第 5 次（之后大约每小时一次）会通知你“还在自动继续”。余额不足、Key 无效、上下文已满这类需要你处理的错误不会重试，照常通知。
 - **不重启切换 Key**：Claude Code 通过 `apiKeyHelper`、Codex（使用自定义 provider 时）通过 provider 的 `auth.command`，从每个会话单独的 `0600` 文件读取 Key。会话正常时换 Key（比如均衡）只改这个文件，不用重启。Key 已经出错（余额不足、被拒绝）时则重启并恢复对话：Claude Code 一条消息的所有重试都用这条消息开始时的 Key，原地换 Key 要到下下条消息才生效。其他会话仍然是重启并恢复对话。
 - **Key 均衡（可选，默认关闭）**：设置 → Key。“没余额时自动换”：会话的 Key 余额不足或被拒绝时，自动换成另一个可用的 Key 并继续。“按用量分配”：另外按 7 天额度让所有 Key 的消耗节奏一致：每个 Key 的可持续速率 = 剩余额度 ÷ 距 7 天窗口重置的时间，实际速率由相邻两次用量查询算出；新会话放到加入后负载率（实际速率 ÷ 可持续速率）最低的 Key；一轮结束时，如果把会话换到另一个 Key 能让两者中较高的负载率下降 20% 以上就换（同一会话 30 分钟内最多一次）。5 小时额度不参与，用完时由“没余额时自动换”处理。需要配置 `keys.usage_url`，否则按会话数平均分配。可以排除不想被自动选中的 Key。
 - **更换 Key 并重启**：Key 余额用完时，可以在手机上换一个 Key，结束旧进程后重新启动并恢复原对话（`claude --resume` / `codex resume`）。

@@ -2526,7 +2526,7 @@ function fillMore() {
     : T('建 git 仓库、登记到知识库，然后重启并接上原对话');
   if (ai) {
     $('#act-ac').checked = !!s.auto_continue;
-    $('#act-ac-sub').textContent = s.auto_continue ? (s.ac_count ? T('已连着出错并自动继续 %a 次（到 5 次就停下通知你；AI 正常回复完一次后从 0 算起）', { a: s.ac_count }) : T('已开启：遇到临时错误会自动发送“继续”'))
+    $('#act-ac-sub').textContent = s.auto_continue ? (s.ac_count ? T('已连着出错并自动继续 %a 次（会一直重试；AI 正常回复完一次或你发了消息后从 0 算起）', { a: s.ac_count }) : T('已开启：遇到临时错误会自动发送“继续”'))
       : T('服务器过载、流中断、输出被截断时自动发送“继续”；Key 余额不足等仍会通知你');
   }
   const running = s && s.status !== 'exited' && s.status !== 'error';

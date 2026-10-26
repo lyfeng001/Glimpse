@@ -1598,14 +1598,27 @@ def test_auto_continue_retries_transient_only():
     # no balance: never retried, the user has to act
     s.status = "error"
     assert s.maybe_auto_continue("Key余额不足，无法完成当前操作") is False
-    # backoff grows on consecutive failures, then gives up
-    for _ in range(2, A.AUTO_CONTINUE_MAX + 1):
+    # no limit: the backoff grows to the last delay and stays there; the user is told at the 5th error in a row and
+    # then every 12 more, but it keeps retrying
+    events = []
+    s.event = lambda kind, title, body: events.append((kind, title))
+    for _ in range(2, 31):
         s.status = "error"
         assert s.maybe_auto_continue(overload) is True
         timers[-1][1]()
+    assert s.ac_count == 30
+    assert [t[0] for t in timers] == list(A.AUTO_CONTINUE_DELAYS) + [A.AUTO_CONTINUE_DELAYS[-1]] * (30 - len(A.AUTO_CONTINUE_DELAYS))
+    assert [k for k, _ in events] == ["retry"] * 3 and "17" in events[1][1]        # at 5, 17, 29
+    assert all(t == "继续" for t in typed) and len(typed) == 30
+    # someone typed: the count starts over (the next error waits 15 s again)
+    s.user_input()
+    assert s.ac_count == 0
     s.status = "error"
-    assert s.maybe_auto_continue(overload) is False and s.ac_count == A.AUTO_CONTINUE_MAX
-    assert [t[0] for t in timers] == list(A.AUTO_CONTINUE_DELAYS)
+    assert s.maybe_auto_continue(overload) is True and timers[-1][0] == 15
+    # a finished turn starts it over too; switched off, nothing is retried
+    s.ac_pending = False
+    s.auto_continue = False
+    assert s.maybe_auto_continue(overload) is False
 
 
 

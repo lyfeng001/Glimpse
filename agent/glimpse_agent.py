@@ -1571,6 +1571,7 @@ class Session:
         self.d.pty_write(self, data)
 
     def user_input(self):
+        self.ac_count = 0              # someone stepped in: auto-continue's error count starts over
         if self.attention:
             self.attention = None
             self.touch()
@@ -1865,17 +1866,18 @@ class Session:
         Returns True when a retry was scheduled (the caller then skips the error status / push)."""
         if not self.auto_continue or self.kind not in ("claude", "codex") or self.fd is None or self.ac_pending:
             return False
-        if not is_transient_error(err) or self.ac_count >= AUTO_CONTINUE_MAX:
-            if self.ac_count >= AUTO_CONTINUE_MAX:
-                self.event("error", tr("自动发了 %d 次“继续”都还是出错，已停下，请看一下", AUTO_CONTINUE_MAX), err)
+        if not is_transient_error(err):
             return False
         delay = AUTO_CONTINUE_DELAYS[min(self.ac_count, len(AUTO_CONTINUE_DELAYS) - 1)]
         self.ac_count += 1
         self.ac_pending = True
         n = self.ac_count
-        self.set_status("waiting", tr("临时错误，%d 秒后自动继续（第 %d/%d 次）", delay, n, AUTO_CONTINUE_MAX), None)
-        it = self.add_chat("system", tr("—— %s：%d 秒后自动发送“%s”（已连着出错 %d 次，到 %d 次就停下通知你；AI 正常回复完一次后从 0 算起）——",
-                                        clip(err, 120), delay, continue_text(), n, AUTO_CONTINUE_MAX))
+        self.set_status("waiting", tr("临时错误，%d 秒后自动继续（已连着出错 %d 次）", delay, n), None)
+        it = self.add_chat("system", tr("—— %s：%d 秒后自动发送“%s”（已连着出错 %d 次；会一直重试，AI 正常回复完一次或你发了消息后从 0 算起）——",
+                                        clip(err, 120), delay, continue_text(), n))
+        if n == AUTO_CONTINUE_NOTIFY or n > AUTO_CONTINUE_NOTIFY and (n - AUTO_CONTINUE_NOTIFY) % AUTO_CONTINUE_NOTIFY_EVERY == 0:
+            # still retrying, not stopped: say so now and then, so a long outage does not go unnoticed
+            self.event("retry", tr("已连着出错 %d 次，还在自动继续", n), err)
         if it:
             self.d.send_subs(self, {"t": "chat", "sid": self.sid, "items": [it]})
 
@@ -2229,12 +2231,11 @@ EN.update({
     "—— 无法恢复原对话，已开始新对话 ——": "—— Couldn't resume the conversation; a new one started ——",
     "进程异常退出 (code %s)": "The process exited abnormally (code %s)",
     "进程已退出": "The process exited",
-    "自动发了 %d 次“继续”都还是出错，已停下，请看一下":
-        "Sent “continue” %d times and it still fails; stopped, please take a look",
-    "临时错误，%d 秒后自动继续（第 %d/%d 次）": "Temporary error, continuing in %d s (%d/%d)",
-    "—— %s：%d 秒后自动发送“%s”（已连着出错 %d 次，到 %d 次就停下通知你；AI 正常回复完一次后从 0 算起）——":
-        "—— %s: in %d s it sends “%s” (%d errors in a row; it stops and notifies you at %d; back to 0 after the AI "
-        "finishes a reply) ——",
+    "已连着出错 %d 次，还在自动继续": "%d errors in a row, still auto-continuing",
+    "临时错误，%d 秒后自动继续（已连着出错 %d 次）": "Temporary error, continuing in %d s (%d errors in a row)",
+    "—— %s：%d 秒后自动发送“%s”（已连着出错 %d 次；会一直重试，AI 正常回复完一次或你发了消息后从 0 算起）——":
+        "—— %s: in %d s it sends “%s” (%d errors in a row; it keeps retrying, back to 0 after the AI finishes a "
+        "reply or you send a message) ——",
     "出错停止": "Stopped with an error",
     "已中断": "Interrupted",
     "—— 新对话 ——": "—— New conversation ——",
@@ -2308,8 +2309,12 @@ AUTO_CONTINUE_TEXT = {"zh": "继续", "en": "continue"}   # what auto-continue t
 
 def continue_text():
     return AUTO_CONTINUE_TEXT.get(LANG, AUTO_CONTINUE_TEXT["zh"])
-AUTO_CONTINUE_MAX = 5            # consecutive retries per session before giving up and notifying
-AUTO_CONTINUE_DELAYS = (15, 30, 60, 120, 240)   # seconds before each retry
+# auto-continue has no retry limit: a transient error is retried until a turn completes or the user steps in (types
+# something, or switches it off). The wait grows to the last delay and stays there; the user is told at the
+# AUTO_CONTINUE_NOTIFY-th error in a row and then every AUTO_CONTINUE_NOTIFY_EVERY more (about hourly at 5 min).
+AUTO_CONTINUE_DELAYS = (15, 30, 60, 120, 240, 300)   # seconds before each retry; the last one repeats
+AUTO_CONTINUE_NOTIFY = 5
+AUTO_CONTINUE_NOTIFY_EVERY = 12
 
 
 def is_transient_error(text):

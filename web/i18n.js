@@ -234,6 +234,7 @@ const EN = {
 "可多选": "Multiple choice",
 "其他": "Other",
 "在下方输入框回复": "Reply in the input box below",
+"输入你的回答，发送后提交给 Codex": "Type your answer; sending it submits it to Codex",
 "上一题": "Previous",
 "选好了": "Done",
 "下一题": "Next",

@@ -2299,7 +2299,7 @@ function renderCard() {
         q.options.map((o, i) => '<button type="button" class="opt" data-q="' + (i + 1) + '" data-ql="' + esc(o.label) + '"><span class="n">' + (i + 1) + '</span><span class="grow"><div class="ol">' +
           esc(o.label) + '</div>' + (o.description ? '<div class="od">' + esc(o.description) + '</div>' : '') + '</span></button>').join('') +
         ('<button type="button" class="opt other" data-q="other"><span class="n">…</span><span class="grow"><div class="ol">' + T('其他') + '</div><div class="od">' + T('在下方输入框回复') + '</div></span></button>') +
-        '</div>' + (qs ? '<div class="a-btns q-nav"><button type="button" class="btn" data-qk="left"' + (qi === 0 ? ' disabled' : '') + '>' + ic('back') + (T('上一题') + '</button>') +
+        '</div>' + (qs && !q.codex ? '<div class="a-btns q-nav"><button type="button" class="btn" data-qk="left"' + (qi === 0 ? ' disabled' : '') + '>' + ic('back') + (T('上一题') + '</button>') +
           '<button type="button" class="btn" data-qk="right">' + (q.multi ? T('选好了 · ') : '') + T('下一题') + ic('chev') + '</button></div>' : '') + '</section>';
     }
   } else if (s && s.menu && S.mode === 'chat' && Array.isArray(s.menu.options) && s.menu.options.length) {
@@ -2335,6 +2335,14 @@ function renderCard() {
   for (const b of $$('[data-a]', host)) b.onclick = () => approve(b.dataset.a);
   for (const b of $$('[data-amini]', host)) b.onclick = () => setMode('chat');
   for (const b of $$('[data-q]', host)) b.onclick = () => {
+    if (s.question && s.question.codex) {
+      // codex async question: the agent opens it (⇧←) and picks the option; "Other" answers with the typed text
+      if (b.dataset.q === 'other') { v.qOther = true; $('#input').placeholder = T('输入你的回答，发送后提交给 Codex'); $('#input').focus(); return; }
+      $('#input').placeholder = T('发送消息到该会话'); v.qOther = false;
+      if (!send({ op: 'answer', m: v.m, sid: v.sid, index: +b.dataset.q - 1 })) { toast(T('未连接'), T('稍后再试'), null, 'error'); return; }
+      v.cardSig = null; host.innerHTML = '';
+      return;
+    }
     if (b.dataset.q === 'other') { $('#input').focus(); return; }
     sendBytes(enc.encode(b.dataset.q));
     if (b.dataset.ql && v.qAns && !s.question.multi) v.qAns[s.question.qi || 0] = b.dataset.ql;   // for the summary
@@ -2490,6 +2498,15 @@ $('#composer').addEventListener('submit', (e) => {
   const v = S.view; if (!v) return;
   const text = input.value;
   if (!text.trim()) { sendBytes(enc.encode('\r')); return; }
+  const s = session(v.m, v.sid);
+  if (v.qOther && s && s.question && s.question.codex) {
+    // "Other" on a codex question: the typed text is its answer (codex: the Other number, the text, Enter)
+    v.qOther = false; input.placeholder = T('发送消息到该会话');
+    if (!send({ op: 'answer', m: v.m, sid: v.sid, text })) { toast(T('未连接'), T('稍后再试'), null, 'error'); return; }
+    v.cardSig = null; $('#v-card').innerHTML = '';
+    input.value = ''; autoGrow(); draftSave();
+    return;
+  }
   const o = { op: 'text', m: v.m, sid: v.sid, text };
   if (wsConfirmed()) send(o);
   else {

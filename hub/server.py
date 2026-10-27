@@ -116,6 +116,7 @@ EN = {
     "无效的操作": "Invalid operation",
     "无效的值: %s": "Invalid value: %s",
     "会话不存在": "No such session",
+    "无效的回答": "Invalid answer",
     "无效的选项": "Invalid option",
     "无效的按键": "Invalid key",
     "超时": "Timed out",
@@ -913,7 +914,7 @@ class Hub:
             if t == "ok":
                 # confirmations the phone waits for; other ops ("in", "resize", ...) stay silent
                 name = {"approve": "approved", "control": "control_ok", "delete": "delete_ok",
-                        "menu": "menu_ok"}.get(info.get("op"))
+                        "menu": "menu_ok", "answer": "answer_ok"}.get(info.get("op"))
                 if name:
                     p.send({"t": name, "m": m.id, "sid": info.get("sid")})
                 return
@@ -1120,6 +1121,19 @@ class Hub:
                     self.forward(p, m, {"op": "menu", "sid": sid, "key": key})
                 else:
                     raise ValueError(tr("无效的按键"))
+            elif op == "answer":
+                # a codex async question on the card: an option (index) or a typed answer (text)
+                index, text = msg.get("index"), msg.get("text")
+                if not sid:
+                    raise ValueError(tr("会话不存在"))
+                if text is not None:
+                    if not isinstance(text, str) or not text.strip() or len(text) > 2000:
+                        raise ValueError(tr("无效的回答"))
+                    self.forward(p, m, {"op": "answer", "sid": sid, "text": text})
+                elif isinstance(index, int) and not isinstance(index, bool) and 0 <= index <= 30:
+                    self.forward(p, m, {"op": "answer", "sid": sid, "index": index})
+                else:
+                    raise ValueError(tr("无效的选项"))
             elif op == "models":
                 await self.models(p, m, msg)
             elif op == "memory":

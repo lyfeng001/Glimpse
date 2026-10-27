@@ -1676,6 +1676,56 @@ def test_codex_side_conversation_from_footer():
     assert s.cx_side is None
 
 
+def test_codex_async_question_card():
+    """codex 0.164 asks with request_user_input_async while its turn keeps running (lines as in a real rollout):
+    the question card and a question event; answering types ⇧← then the option's digit (or Other, the text, Enter);
+    the answer in the rollout ("> title") or the turn's end clears it."""
+    d, s = _session("codex")
+    events = []
+    s.event = lambda kind, title, body="": events.append((kind, body))
+    s.fd = 99
+    typed, timers = [], []
+    s.write = lambda data: typed.append(data)
+    d.later = lambda t, fn: timers.append(fn)
+    title = "Which conditions are you closer to?"
+    args = {"questions": [{"title": title, "options": ["Sim only", "Strong GPUs"]}]}
+    call = {"type": "response_item", "payload": {"type": "function_call", "name": "request_user_input_async",
+                                                 "arguments": json.dumps(args), "call_id": "c1"}}
+    assert A.codex_questions(call)[0]["question"] == title
+    assert A.codex_questions({"type": "event_msg", "payload": {}}) is None
+    s.codex_question_line(call, [])
+    q = s.question
+    assert q["codex"] and q["question"] == title and [o["label"] for o in q["options"]] == ["Sim only", "Strong GPUs"]
+    assert s.status == "waiting" and events == [("question", title)]
+    # an option: ⇧← opens codex's picker, then its digit
+    s.answer_codex_question(1)
+    for fn in timers:
+        fn()
+    assert typed == [b"\x1b[1;2D", b"2"]
+    with pytest.raises(RuntimeError):
+        s.answer_codex_question(2)                     # no third option
+    # the answer in the rollout, as codex records it: shown as "> question" + the answer, and the card goes away
+    reply = {"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "UserMessage", "content": [
+        {"type": "text", "text": "<send_user_message_question_reply>\n" + json.dumps(
+            [{"answer": "Strong GPUs", "question": title, "questionItemId": "x"}]) +
+         "\n</send_user_message_question_reply>"}]}}}
+    rows = A.parse_codex_line(reply)
+    assert rows == [("user", "> " + title + "\n\nStrong GPUs", {})]
+    s.codex_question_line(reply, rows)
+    assert s.question is None and s.status == "running"
+    # asked again; this time "Other" with a typed answer (Other = the number after the options)
+    s.codex_question_line(call, [])
+    typed.clear(); timers.clear()
+    s.answer_codex_question(text="Sim first, then real robots")
+    for fn in timers:
+        fn()
+    assert typed == [b"\x1b[1;2D", b"3", b"Sim first, then real robots", b"\r"]
+    s.codex_question_line({"type": "event_msg", "payload": {"type": "task_complete"}}, [("@done", "", {})])
+    assert s.question is None and s.cx_questions == []
+    with pytest.raises(RuntimeError):
+        s.answer_codex_question(0)
+
+
 def test_memory_project_id_and_launch_args(tmp_path):
     import subprocess
     repo = tmp_path / "work" / "checkout"

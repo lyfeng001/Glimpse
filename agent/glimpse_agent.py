@@ -87,6 +87,7 @@ CODEX_EFFORT_LABELS = {"xhigh": "extra high"}           # phone value -> label i
 CODEX_PERMISSION_PRESETS = {"read only": ("on-request", "read-only"), "ask for approval": ("on-request", "workspace-write"),
                             "approve for me": (None, "workspace-write"), "full access": ("never", "danger-full-access")}
 SHIFT_TAB = b"\x1b[Z"
+CODEX_OPEN_QUESTION = b"\x1b[1;2D"    # ⇧←: codex 0.164 opens its pending async question ("⇧← to answer")
 # op "models": what the pickers on the phone offer
 CLAUDE_MODEL_LIST = (("default", "Default"), ("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku"),
                      ("fable", "Fable"), ("opusplan", "Opus Plan"))
@@ -794,6 +795,48 @@ def prepare_claude_argv(argv, sid, sdir, env_extra=None, approval_wait=600, allo
 
 # --------------------------------------------------------------------------- codex rollout
 
+def codex_questions(d):
+    """A codex rollout line with a request_user_input_async call -> its questions as the phone shows them
+    ([{question, header, options, multi}]); None for any other line. codex 0.164 asks this way while its turn keeps
+    running: "? N questions · ⇧← to answer" in the queued area, and ⇧← opens a picker (digits pick, the last
+    number is "Other")."""
+    if d.get("type") != "response_item":
+        return None
+    p = d.get("payload") or {}
+    if p.get("type") != "function_call" or p.get("name") != "request_user_input_async":
+        return None
+    try:
+        a = json.loads(p.get("arguments") or "{}")
+    except ValueError:
+        return None
+    out = []
+    for q in (a.get("questions") if isinstance(a, dict) else None) or []:
+        if not isinstance(q, dict) or not str(q.get("title") or "").strip():
+            continue
+        opts = [o for o in q.get("options") or [] if isinstance(o, str) and o.strip()][:9]
+        out.append({"question": clip(q["title"].strip(), 600), "header": "", "multi": False,
+                    "options": [{"label": clip(o.strip(), 200), "description": ""} for o in opts]})
+    return out or None
+
+
+QREPLY_RE = re.compile(r"^<send_user_message_question_reply>\s*(.*?)\s*</send_user_message_question_reply>$", re.S)
+
+
+def codex_question_reply(txt):
+    """The user message codex records for answered async questions (<send_user_message_question_reply>[{"answer",
+    "question", ...}]) -> "> question\\n\\nanswer" for each, as the TUI shows it; any other text unchanged."""
+    m = QREPLY_RE.match(txt or "")
+    if not m:
+        return txt
+    try:
+        items = json.loads(m.group(1))
+    except ValueError:
+        return txt
+    out = ["> %s\n\n%s" % (str(x.get("question") or "").strip(), str(x.get("answer") or "").strip())
+           for x in items if isinstance(x, dict)] if isinstance(items, list) else []
+    return "\n\n".join(out) or txt
+
+
 def parse_codex_line(d):
     """One codex rollout JSON object -> list of (role, text, extra) plus optional ("@done"/"@error", text)."""
     if d.get("type") != "event_msg":
@@ -805,6 +848,7 @@ def parse_codex_line(d):
         t = it.get("type")
         if t == "UserMessage":
             txt = "\n".join(c.get("text", "") for c in it.get("content") or [] if isinstance(c, dict))
+            txt = codex_question_reply(txt.strip())
             return [("user", txt.strip(), {})] if txt.strip() else []
         if t == "AgentMessage":
             c = it.get("content")
@@ -1349,6 +1393,8 @@ class Session:
         self.cx_mode = {}              # codex settings from the rollout turn_context
         self.cmode = None              # claude permission mode read from the footer
         self.cx_side = None            # codex side conversation (/btw) open: "side" / "main" on screen (Screen.codex_side)
+        self.cx_questions = []         # codex async questions (request_user_input_async) of the running turn
+        self.cx_answered = []
         self.hook_mode = None          # claude permission_mode reported by hooks (fallback)
         self.effort = None             # claude effort level from the transcript
         self.screen = Screen(cols, rows) if kind in ("claude", "codex") else None
@@ -2029,6 +2075,74 @@ class Session:
             self.d.send_subs(self, {"t": "chat", "sid": self.sid, "items": new})
             self.touch()
 
+    def codex_question_line(self, d, rows):
+        """codex's async questions (request_user_input_async) from the rollout: shown as the question card (and the
+        question event, so the desktop and the phone are told), until they are answered (a user message quoting the
+        question: "> <title>") or the turn ends (codex drops unanswered ones then)."""
+        qs = codex_questions(d)
+        if qs:
+            self.cx_questions = qs
+            self.cx_answered = [False] * len(qs)
+            self.show_codex_question()
+            self.event("question", tr("需要你确认"), qs[0]["question"])
+            return
+        if not self.cx_questions:
+            return
+        for role, text, _ in rows:
+            if role == "user" and text.startswith(">"):
+                # one reply may answer several questions: each "> question" block
+                for blk in re.split(r"\n\n(?=> )", text):
+                    head = blk[1:].split("\n", 1)[0].strip()
+                    for i, q in enumerate(self.cx_questions):
+                        if not self.cx_answered[i] and head and q["question"].startswith(head[:60]):
+                            self.cx_answered[i] = True
+                            break
+            elif role in ("@done", "@error", "@aborted"):
+                self.cx_answered = [True] * len(self.cx_questions)
+        self.show_codex_question()
+
+    def show_codex_question(self):
+        """self.question = the first unanswered codex question (top-level fields), or None once all are."""
+        left = [i for i, a in enumerate(self.cx_answered) if not a]
+        if not left:
+            self.cx_questions, self.cx_answered = [], []
+            if self.question and self.question.get("codex"):
+                self.question = None
+                if self.status == "waiting":
+                    self.set_status("running", "", None)
+                self.touch()
+            return
+        i = left[0]
+        q = dict(self.cx_questions[i], codex=True, qi=i, answered=list(self.cx_answered))
+        if len(self.cx_questions) > 1:
+            q["questions"] = self.cx_questions
+        if q != self.question:
+            self.question = q
+            self.set_status("waiting", clip(q["question"], 200), "question")
+
+    def answer_codex_question(self, index=None, text=None):
+        """Answer the codex question on the card: ⇧← opens codex's picker on the first unanswered one; a digit picks
+        an option, or the last number ("Other") then the text and Enter. -> the keys typed (after the first)."""
+        q = self.question
+        if self.fd is None or not q or not q.get("codex"):
+            raise RuntimeError(tr("当前没有问题"))
+        n = len(q.get("options") or [])
+        if text is not None:
+            text = str(text).replace("\r", " ").replace("\n", " ").strip()
+            if not text or len(text) > 2000:
+                raise RuntimeError(tr("无效的回答"))
+            keys = [CODEX_OPEN_QUESTION, str(n + 1).encode(), text.encode(), b"\r"]
+        else:
+            if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < n:
+                raise RuntimeError(tr("无效的选项"))
+            keys = [CODEX_OPEN_QUESTION, str(index + 1).encode()]
+        self.user_input()
+        self.write(keys[0])
+        for k, data in enumerate(keys[1:], 1):
+            # codex opens the picker on the next frame: each key after a short pause
+            self.d.later(0.35 * k, lambda data=data: self.fd is not None and self.write(data))
+        return keys
+
     def is_history(self, d):
         """A transcript line written before this process started (claude replays the resumed file)."""
         t = iso_ts(d.get("timestamp"))
@@ -2060,6 +2174,8 @@ class Session:
             if self.tail_kind == "codex" and d.get("type") == "event_msg" and not old and \
                     (d.get("payload") or {}).get("type") == "task_started":
                 self.set_status("running", "", None)
+            if self.tail_kind == "codex" and not old:
+                self.codex_question_line(d, rows)
             for role, text, extra in rows:
                 if old and role.startswith("@"):
                     continue          # history replay: chat and usage only, no status changes / events
@@ -2345,6 +2461,8 @@ EN.update({
     "菜单里没有这个选项（%s）": "The menu has no such option (%s)",
     "会话正忙，等这一轮结束再改": "The session is busy; change it after this turn",
     "当前没有菜单": "No menu right now",
+    "当前没有问题": "No question right now",
+    "无效的回答": "Invalid answer",
     "无效的按键": "Invalid key",
     "无效的选项": "Invalid option",
     "无效的类型 %r": "Invalid type %r",
@@ -4351,6 +4469,10 @@ class Daemon:
                 self.control(s, m.get("action"), m.get("value"), controlled)
             elif op == "menu":
                 self.menu_op(s, m.get("index"), m.get("key"))
+                self.send(c, {"t": "ok", "req": req, "sid": sid})
+            elif op == "answer":
+                # codex async question: ⇧← opens it, then the option's digit (or "Other" and the text)
+                s.answer_codex_question(m.get("index"), m.get("text"))
                 self.send(c, {"t": "ok", "req": req, "sid": sid})
             elif op == "fs":
                 self.fs_op(c, req, s, m.get("action"), m.get("path") or "", bool(m.get("force")), m.get("text"), m.get("sig"))
